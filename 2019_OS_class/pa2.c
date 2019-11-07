@@ -286,7 +286,31 @@ struct scheduler srtf_scheduler = {
  * Round-robin scheduler
  ***********************************************************************/
 static struct process *rr_schedule(void) {
+	struct process *now = NULL, *last = NULL, *curr = NULL;
 
+	if (!current || current->status == PROCESS_WAIT) goto pick_next;
+	else if (!list_empty(&readyqueue)) {
+		if (current->age < current->lifespan) {
+			curr = current;
+			INIT_LIST_HEAD(&curr->list);
+			list_add_tail(&curr->list, &readyqueue);
+		}
+
+		now = list_first_entry(&readyqueue, struct process, list);
+		list_del_init(&now->list);
+		return now;
+	}
+	else { // == if(list_empty(&readyqueue))
+		if (current->age < current->lifespan) return current;
+		return NULL;
+	}
+
+pick_next:
+	if (!list_empty(&readyqueue)) {
+		now = list_first_entry(&readyqueue, struct process, list);
+		list_del_init(&now->list);
+		return now;
+	}
 	return NULL;
 }
 
@@ -294,6 +318,8 @@ struct scheduler rr_scheduler = {
 	.name = "Round-Robin",
 	.acquire = fcfs_acquire, /* Use the default FCFS acquire() */
 	.release = fcfs_release, /* Use the default FCFS release() */
+	.initialize = fifo_initialize,
+	.finalize = fifo_finalize,
 	.schedule = rr_schedule,	/* Obviously, you should implement rr_schedule() and attach it here */
 };
 
