@@ -109,8 +109,7 @@ void fcfs_release(int resource_id)
 
 	/* Let's wake up ONE waiter (if exists) that came first */
 	if (!list_empty(&r->waitqueue)) {
-		struct process *waiter =
-				list_first_entry(&r->waitqueue, struct process, list);
+		struct process *waiter = list_first_entry(&r->waitqueue, struct process, list);
 
 		/**
 		 * Ensure the waiter  is in the wait status
@@ -327,8 +326,79 @@ struct scheduler rr_scheduler = {
 /***********************************************************************
  * Priority scheduler
  ***********************************************************************/
+bool prio_acquire(int resource_id) {
+	struct resource *r = resources + resource_id;
+
+	if (!r->owner) {
+		r->owner = current;
+		return true;
+	}
+
+	current->status = PROCESS_WAIT;
+
+	list_add_tail(&current->list, &r->waitqueue);
+
+	return false;
+}
+
+void prio_release(int resource_id) {
+	struct resource *r = resources + resource_id;
+
+	assert(r->owner == current);
+
+	r->owner = NULL;
+
+	if (!list_empty(&r->waitqueue)) {
+		struct process *waiter = list_first_entry(&r->waitqueue, struct process, list);
+		
+		assert(waiter->status == PROCESS_WAIT);
+
+		list_del_init(&waiter->list);
+
+		waiter->status = PROCESS_READY;
+		list_add_tail(&waiter->list, &readyqueue);
+		
+		
+	}
+}
+
+static struct process *prio_schedule(void) {
+	struct process *now = NULL, *last = NULL, *curr = NULL;
+	struct process *tmp1, *tmp2;
+
+	if (!list_empty(&readyqueue)) {
+		if (current && (current->age < current->lifespan) && (current->status != PROCESS_WAIT)) {
+			curr = current;
+			INIT_LIST_HEAD(&curr->list);
+			list_add_tail(&curr->list, &readyqueue);
+		}
+		now = list_first_entry(&readyqueue, struct process, list);
+		last = list_last_entry(&readyqueue, struct process, list);
+
+		list_for_each_entry_safe(tmp1, tmp2, &readyqueue, list) {
+			if (tmp1->prio > now->prio) {
+				now = tmp1;
+			}
+
+			if (tmp1 == last) {
+				list_del_init(&now->list);
+				return now;
+			}
+		}
+	}
+	else { // == if(list_empty(&readyqueue))
+		if (current->age < current->lifespan) return current;
+		return NULL;
+	}
+}
+
 struct scheduler prio_scheduler = {
 	.name = "Priority",
+	.acquire = prio_acquire,
+	.release = prio_release,
+	.initialize = fifo_initialize,
+	.finalize = fifo_finalize,
+	.schedule = prio_schedule,
 	/**
 	 * Implement your own acqure/release function to make priority
 	 * scheduler correct.
@@ -340,8 +410,53 @@ struct scheduler prio_scheduler = {
 /***********************************************************************
  * Priority scheduler with priority inheritance protocol
  ***********************************************************************/
+bool pip_acquire(int resource_id) {
+	struct resource *r = resources + resource_id;
+
+	if (!r->owner) {
+		r->owner = current;
+		return true;
+	}
+
+	current->status = PROCESS_WAIT;
+
+	list_add_tail(&current->list, &r->waitqueue);
+
+	return false;
+}
+
+void pip_release(int resource_id) {
+	struct resource *r = resources + resource_id;
+
+	assert(r->owner == current);
+
+	r->owner = NULL;
+
+	if (!list_empty(&r->waitqueue)) {
+		struct process *waiter = list_first_entry(&r->waitqueue, struct process, list);
+		//struct process *first = list_first_entry(&r->waitqueue, struct process, list);
+
+		assert(waiter->status == PROCESS_WAIT);
+
+		list_del_init(&waiter->list);
+
+		waiter->status = PROCESS_READY;
+
+		list_add_tail(&waiter->list, &readyqueue);
+	}
+}
+
+static struct process *pip_schedule(void) {
+
+
+}
 struct scheduler pip_scheduler = {
 	.name = "Priority + Priority Inheritance Protocol",
+	.acquire = pip_acquire,
+	.release = pip_release,
+	.initialize = fifo_initialize,
+	.finalize = fifo_finalize,
+	.schedule = pip_schedule,
 	/**
 	 * Implement your own acqure/release function too to make priority
 	 * scheduler correct.
