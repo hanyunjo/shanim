@@ -412,44 +412,80 @@ struct scheduler prio_scheduler = {
  ***********************************************************************/
 bool pip_acquire(int resource_id) {
 	struct resource *r = resources + resource_id;
+	struct process *now = NULL, *last = NULL;
+	struct process *tmp1, *tmp2;
 
-	if (!r->owner) {
+	if (!r->owner) {	// if owner is not existence
 		r->owner = current;
 		return true;
 	}
+	
+	if (r->owner->pid != current->pid) {
+		current->prio = r->owner->prio_orig;
+		r->owner->prio = current->prio_orig;
 
-	current->status = PROCESS_WAIT;
-
-	list_add_tail(&current->list, &r->waitqueue);
-
-	return false;
+		current->status = PROCESS_WAIT;
+		list_add_tail(&current->list, &r->waitqueue);
+		return false;
+	}
+	
+	return true;
 }
 
 void pip_release(int resource_id) {
 	struct resource *r = resources + resource_id;
+	struct process *now = NULL, *last = NULL;
+	struct process *tmp1, *tmp2;
 
 	assert(r->owner == current);
 
+	r->owner->prio = r->owner->prio_orig;
 	r->owner = NULL;
 
 	if (!list_empty(&r->waitqueue)) {
-		struct process *waiter = list_first_entry(&r->waitqueue, struct process, list);
-		//struct process *first = list_first_entry(&r->waitqueue, struct process, list);
+		list_for_each_entry_safe(tmp1, tmp2, &r->waitqueue, list) {
+			list_del_init(&tmp1->list);
+			list_add_tail(&tmp1->list, &readyqueue);
+		}
 
-		assert(waiter->status == PROCESS_WAIT);
-
-		list_del_init(&waiter->list);
-
-		waiter->status = PROCESS_READY;
-
-		list_add_tail(&waiter->list, &readyqueue);
+	}
+	if (!list_empty(&readyqueue)) {
+		list_for_each_entry_safe(tmp1, tmp2, &readyqueue, list) {
+			tmp1->prio = tmp1->prio_orig;
+			tmp1->status = PROCESS_READY;
+		}
 	}
 }
 
 static struct process *pip_schedule(void) {
+	struct process *now = NULL, *last = NULL, *curr = NULL;
+	struct process *tmp1, *tmp2;
 
+	if (!list_empty(&readyqueue)) {
+		if (current && (current->age < current->lifespan) && (current->status != PROCESS_WAIT)) {
+			curr = current;
+			INIT_LIST_HEAD(&curr->list);
+			list_add_tail(&curr->list, &readyqueue);
+		}
+		now = list_first_entry(&readyqueue, struct process, list);
+		last = list_last_entry(&readyqueue, struct process, list);
+
+		list_for_each_entry_safe(tmp1, tmp2, &readyqueue, list) {
+			if (tmp1->prio > now->prio)	now = tmp1;
+
+			if (tmp1 == last) {
+				list_del_init(&now->list);
+				return now;
+			}
+		}
+	}
+	else { // == if(list_empty(&readyqueue))
+		if (current->age < current->lifespan) return current;
+		return NULL;
+	}
 
 }
+
 struct scheduler pip_scheduler = {
 	.name = "Priority + Priority Inheritance Protocol",
 	.acquire = pip_acquire,
