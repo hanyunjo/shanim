@@ -54,7 +54,11 @@ error_val   = zeros(m, 1);
 % ---------------------- Sample Solution ----------------------
 
 
-
+for i = 1:m;
+	error_train = 1 / 2 / m * sum((X(1:i, :) * theta - y(1:i)) .^ 2); 
+	
+	error_val = 1 / 2 / m * sum((Xval(1:i, :) * theta - yval(1:i)) .^ 2);
+end;
 
 
 
