@@ -62,22 +62,48 @@ Theta2_grad = zeros(size(Theta2));
 %               and Theta2_grad from Part 2.
 %
 
+X = [ones(m,1) X]; 
+a1 = X;  % 5000 * 401
+
+z2 = a1 * Theta1'; % 5000 * 25
+a2 = [ones(m, 1), sigmoid(z2)]; % 5000 * 26
+
+z3 = a2 * Theta2'; % 5000 * 10
+a3 = sigmoid(z3); % 5000 * 10
+h = a3;  
+
+y_ma = zeros(m, max(y));
+for i = 1:m;
+	y_ma(i, y(i)) = 1;
+end;	% 5000 * 10
+
+Theta1_real = Theta1(:,2:end); % 25 * 400
+Theta2_real = Theta2(:,2:end); % 10 * 25
+
+J = 1 / m * sum(sum( -y_ma .* log(h) - (1 - y_ma) .* log(1 - h)), 2) + (lambda / 2 / m) * (sum(sum(Theta1_real .^ 2), 2) + sum(sum(Theta2_real .^ 2), 2));
 
 
+% Bakcpropagation -----------------------------------------------
 
 
+for t = 1:m;
+	a_1 = X(t,:); % 1 * 401
 
+	z_2 = a_1 * Theta1'; % 1 * 25
+	a_2 = [1 sigmoid(z_2)]; % 1 * 26
 
+	z_3 = a_2 * Theta2';
+	a_3 = sigmoid(z_3); % 1 * 10
 
+	delta3 = a_3 - y_ma(t,:); % 1 * 10
+	delta2 = delta3 * Theta2_real .* sigmoidGradient(z_2); % 1 * 25
 
+	Theta2_grad = Theta2_grad + delta3' * a_2; % 10 * 26
+	Theta1_grad = Theta1_grad + delta2' * a_1; %  25 * 401
+end;
 
-
-
-
-
-
-
-
+Theta2_grad = Theta2_grad / m + (lambda / m) * [zeros(size(Theta2), 1) Theta2_real];
+Theta1_grad = Theta1_grad / m + (lambda / m) * [zeros(size(Theta1),1) Theta1_real];
 
 
 % -------------------------------------------------------------
