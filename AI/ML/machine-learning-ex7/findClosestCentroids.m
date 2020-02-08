@@ -22,8 +22,10 @@ idx = zeros(size(X,1), 1);
 %
 
 
-
-
+for i = 1:size(X,1);
+	[val ind] = min( sum((centroids - X(i,:)) .^ 2, 2) );
+	idx(i) = ind;
+end;
 
 
 
