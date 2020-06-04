@@ -81,7 +81,7 @@ int main(){
 
         returnsem(semid);        
     }
-
+/*
     if(shmdt(memory) == -1){
         printf("failed shmdt func\n");
         exit(1);
@@ -98,6 +98,6 @@ int main(){
         printf("failed remove sem\n");
         exit(0);
     }
-
+*/
     return 0;
 }
