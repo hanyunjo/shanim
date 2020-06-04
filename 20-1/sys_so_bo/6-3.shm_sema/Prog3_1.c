@@ -9,7 +9,6 @@
 
 typedef struct {
     char text[7];
-    int semid;
 } shm_sem;
 
 void getsem(int semid){
@@ -37,7 +36,7 @@ void returnsem(int semid){
 }
 
 int main(){
-    int shmid, count;
+    int shmid, count, semid;
     void *memory = (void *)0;
     shm_sem *sha;
     union semun{
@@ -61,26 +60,26 @@ int main(){
     sha = (shm_sem *)memory;
 
     // semaphore
-    if((sha->semid = semget((key_t)9432, 1, IPC_CREAT|0666)) == -1){
+    if((semid = semget((key_t)9432, 1, IPC_CREAT|0666)) == -1){
         printf("failed semget func\n");
         exit(1);
     }
     
     arg.val = 1;
-    if(semctl(sha->semid, 0, SETVAL, arg) == -1){
+    if(semctl(semid, 0, SETVAL, arg) == -1){
         printf("failed semctl1 func\n");
         exit(1);
     }
 
     // function
     for(count = 0; count < 10; count++){
-        getsem(sha->semid);
+        getsem(semid);
         
         strcpy(sha->text, "Sema");
         sleep(1);
         printf("A : %s\n", sha->text);
 
-        returnsem(sha->semid);
+        returnsem(semid);
     }
 
     if(shmdt(memory) == -1){

@@ -22,12 +22,11 @@ int main(){
     }
 
     text = (char *)memory;
-    strcpy(text, "System");
 
     for(count = 0; count < 10; count++){
-        printf("A : %s\n", text);
         strcpy(text, "System");
         sleep(1);
+        printf("A : %s\n", text);
     }
 
     return 0;
