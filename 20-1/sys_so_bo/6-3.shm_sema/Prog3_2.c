@@ -93,7 +93,7 @@ int main(){
         return 0;
     }
 
-    if(semctl(sha->semid, 0, IPC_RMID, 0) == -1)
+    if(semctl(semid, 0, IPC_RMID, 0) == -1)
     {
         printf("failed remove sem\n");
         exit(0);
