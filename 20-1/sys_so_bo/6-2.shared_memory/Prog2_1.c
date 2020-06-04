@@ -8,12 +8,10 @@
 
 int main(){
     int shmid, count;
-    key_t key = 1735;
-    size_t size = 10;
     void *memory = (void *)0;
     char *text;
 
-    if((shmid = shmget(key, size, IPC_CREAT|0666)) == -1){
+    if((shmid = shmget((key_t)1735, sizeof(char)*10, IPC_CREAT|0666)) == -1){
         printf("failed shmget func\n");
         exit(1);
     }
@@ -24,10 +22,11 @@ int main(){
     }
 
     text = (char *)memory;
+    strcpy(text, "System");
 
     for(count = 0; count < 10; count++){
-        strcpy(text, "System");
         printf("A : %s\n", text);
+        strcpy(text, "System");
         sleep(1);
     }
 
