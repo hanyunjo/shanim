@@ -9,17 +9,42 @@
 
 typedef struct {
     char text[7];
-    int semid;
-    struct sembuf getbuf;
-    struct sembuf rebuf;
+    int semid;    
 } shm_sem;
+
+void getsem(int semid){
+    struct sembuf getbuf;
+
+    getbuf.sem_num = 0;
+    getbuf.sem_op = -1;
+    getbuf.sem_flg = SEM_UNDO;
+    if((semop(semid, &getbuf, 1)) == -1){
+        printf("failed get sem\n");
+        exit(1);
+    }
+}
+
+void returnsem(int semid){
+    struct sembuf rebuf;
+
+    rebuf.sem_num = 0;
+    rebuf.sem_op = 1;
+    rebuf.sem_flg = SEM_UNDO;
+    if((semop(semid, &rebuf, 1)) == -1){
+        printf("failed return sem\n");
+        exit(1);
+    }
+}
 
 int main(){
     int shmid, count;
     void *memory = (void *)0;
-    //char *text;
     shm_sem *sha;
-    //struct sembuf semb;
+    union semun{
+        int                  val;
+        struct   semid_ds   *buf;
+        unsigned short int  *arrary;
+    }  arg;
 
     // shared memory
     if((shmid = shmget((key_t)1735, sizeof(shm_sem), IPC_CREAT|0666)) == -1){
@@ -41,32 +66,21 @@ int main(){
         exit(1);
     }
 
-    if(semctl(sha->semid, 0, SETVAL, 1) == -1){
+    arg.val = 1;
+    if(semctl(sha->semid, 0, SETVAL, arg) == -1){
         printf("failed semctl1 func\n");
         exit(1);
     }
 
     // function
     for(count = 0; count < 10; count++){
-        sha->getbuf.sem_num = 0;
-        sha->getbuf.sem_op = -1;
-        sha->getbuf.sem_flg = SEM_UNDO;
-        if((semop(sha->semid, &sha->getbuf, 1)) == -1){
-            printf("failed get sem\n");
-            exit(1);
-        }
+        getsem(sha->semid);
         
         strcpy(sha->text, "Prog");
         sleep(1);
         printf("B : %s, %d\n", sha->text, count);
 
-        sha->rebuf.sem_num = 0;
-        sha->rebuf.sem_op = 1;
-        sha->rebuf.sem_flg = SEM_UNDO;
-        if((semop(sha->semid, &sha->rebuf, 1)) == -1){
-            printf("failed return sem\n");
-            exit(1);
-        }
+        returnsem(sha->semid);        
     }
 
     if(shmdt(memory) == -1){
