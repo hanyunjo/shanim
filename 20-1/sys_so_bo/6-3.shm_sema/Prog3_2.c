@@ -65,11 +65,6 @@ int main(){
         exit(1);
     }
 
-    arg.val = 1;
-    if(semctl(semid, 0, SETVAL, arg) == -1){
-        printf("failed semctl1 func\n");
-        exit(1);
-    }
 
     // function
     for(count = 0; count < 10; count++){
@@ -77,27 +72,10 @@ int main(){
         
         strcpy(sha->text, "Prog");
         sleep(1);
-        printf("B : %s, %d\n", sha->text, count);
+        printf("B : %s\n", sha->text);
 
         returnsem(semid);        
     }
-/*
-    if(shmdt(memory) == -1){
-        printf("failed shmdt func\n");
-        exit(1);
-    }
 
-    if(shmctl(shmid, IPC_RMID, 0) == -1)
-    {
-        printf("failed remove shm\n");
-        return 0;
-    }
-
-    if(semctl(semid, 0, IPC_RMID, 0) == -1)
-    {
-        printf("failed remove sem\n");
-        exit(0);
-    }
-*/
     return 0;
 }

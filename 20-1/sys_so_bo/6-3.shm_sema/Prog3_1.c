@@ -81,11 +81,6 @@ int main(){
 
         returnsem(semid);
     }
-/*
-    if(shmdt(memory) == -1){
-        printf("failed shmdt func\n");
-        exit(1);
-    }
-*/
+
     return 0;
 }
