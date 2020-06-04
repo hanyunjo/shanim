@@ -24,8 +24,8 @@ int main(){
     text = (char *)memory;
 
     for(count = 0; count < 10; count++){
-        sleep(1);
         strcpy(text, "Prgo");
+        sleep(1);
         printf("B : %s\n", text);
     }
 
