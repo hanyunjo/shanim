@@ -11,6 +11,11 @@ int main(){
     int shmid, count, semid;
     void *memory = (void *)0;
     char *text;
+    union semun{
+        int val;
+        struct semid_ds *buf;
+        unsigned short int *array;
+    } arg;
 
     struct sembuf semb;
 
@@ -33,11 +38,7 @@ int main(){
         printf("failed semget func\n");
         exit(1);
     }
-
-    if(semctl(semid, 0, SETVAL, 1) == -1){
-        printf("failed semctl func\n");
-        exit(1);
-    }
+    arg.val = 1;
 
     for(count = 0; count < 10; count++){
         semb.sem_op = -1;
@@ -53,6 +54,11 @@ int main(){
             printf("failed set 1\n");
             exit(1);
         }
+    }
+
+    if(semctl(semid, 0, SETVAL, arg) == -1){
+        printf("failed semctl func\n");
+        exit(1);
     }
 
     return 0;
