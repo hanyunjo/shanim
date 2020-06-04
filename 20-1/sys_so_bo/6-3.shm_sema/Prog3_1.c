@@ -9,11 +9,12 @@
 
 typedef struct {
     char text[7];
+    int semid;
     struct sembuf semb;
 } shm_sem;
 
 int main(){
-    int shmid, count, semid;
+    int shmid, count;
     void *memory = (void *)0;
     //char *text;
     shm_sem *sha;
@@ -33,24 +34,29 @@ int main(){
     //text = (char *)memory;
     sha = (shm_sem *)memory;
 
+
+
     // semaphore
     sha->semb.sem_flg = SEM_UNDO;
     sha->semb.sem_num = 0;
 
-    if((semid = semget((key_t)9432, 1, IPC_CREAT|0666)) == -1){
+    if((sha->semid = semget((key_t)9432, 1, IPC_CREAT|0666)) == -1){
         printf("failed semget func\n");
         exit(1);
     }
 
-    if(semctl(semid, 0, SETVAL, 1) == -1){
+    if(semctl(sha->semid, 0, SETVAL, 1) == -1){
         printf("failed semctl1 func\n");
         exit(1);
     }
 
+
+
+
     // function
     for(count = 0; count < 10; count++){
         sha->semb.sem_op = -1;
-        if((semop(semid, &sha->semb, 1)) == -1){
+        if((semop(sha->semid, &sha->semb, 1)) == -1){
             printf("failed get sem\n");
             exit(1);
         }
@@ -60,8 +66,8 @@ int main(){
         printf("A : %s\n", sha->text);
 
         sha->semb.sem_op = 1;
-        if((semop(semid, &sha->semb, 1)) == -1){
-            printf("failed get sem\n");
+        if((semop(sha->semid, &sha->semb, 1)) == -1){
+            printf("failed return sem\n");
             exit(1);
         }
     }
@@ -70,6 +76,6 @@ int main(){
         printf("failed shmdt func\n");
         exit(1);
     }
-    
+
     return 0;
 }
