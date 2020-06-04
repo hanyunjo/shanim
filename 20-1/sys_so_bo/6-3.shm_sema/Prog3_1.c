@@ -10,7 +10,8 @@
 typedef struct {
     char text[7];
     int semid;
-    struct sembuf semb;
+    struct sembuf getbuf;
+    struct sembuf rebuf;
 } shm_sem;
 
 int main(){
@@ -37,9 +38,6 @@ int main(){
 
 
     // semaphore
-    sha->semb.sem_flg = SEM_UNDO;
-    sha->semb.sem_num = 0;
-
     if((sha->semid = semget((key_t)9432, 1, IPC_CREAT|0666)) == -1){
         printf("failed semget func\n");
         exit(1);
@@ -55,8 +53,10 @@ int main(){
 
     // function
     for(count = 0; count < 10; count++){
-        sha->semb.sem_op = -1;
-        if((semop(sha->semid, &sha->semb, 1)) == -1){
+        sha->getbuf.sem_num = 0;
+        sha->getbuf.sem_op = -1;
+        sha->getbuf.sem_flg = SEM_UNDO;
+        if((semop(sha->semid, &sha->getbuf, 1)) == -1){
             printf("failed get sem\n");
             exit(1);
         }
@@ -65,8 +65,10 @@ int main(){
         sleep(1);
         printf("A : %s\n", sha->text);
 
-        sha->semb.sem_op = 1;
-        if((semop(sha->semid, &sha->semb, 1)) == -1){
+        sha->rebuf.sem_num = 0;
+        sha->rebuf.sem_op = 1;
+        sha->rebuf.sem_flg = SEM_UNDO;
+        if((semop(sha->semid, &sha->rebuf, 1)) == -1){
             printf("failed return sem\n");
             exit(1);
         }

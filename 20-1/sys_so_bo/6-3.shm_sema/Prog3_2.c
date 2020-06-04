@@ -10,7 +10,8 @@
 typedef struct {
     char text[7];
     int semid;
-    struct sembuf semb;
+    struct sembuf getbuf;
+    struct sembuf rebuf;
 } shm_sem;
 
 int main(){
@@ -35,9 +36,6 @@ int main(){
     sha = (shm_sem *)memory;
 
     // semaphore
-    sha->semb.sem_flg = SEM_UNDO;
-    sha->semb.sem_num = 0;
-
     if((sha->semid = semget((key_t)9432, 1, IPC_CREAT|0666)) == -1){
         printf("failed semget func\n");
         exit(1);
@@ -50,18 +48,22 @@ int main(){
 
     // function
     for(count = 0; count < 10; count++){
-        sha->semb.sem_op = -1;
-        if((semop(sha->semid, &sha->semb, 1)) == -1){
+        sha->getbuf.sem_num = 0;
+        sha->getbuf.sem_op = -1;
+        sha->getbuf.sem_flg = SEM_UNDO;
+        if((semop(sha->semid, &sha->getbuf, 1)) == -1){
             printf("failed get sem\n");
             exit(1);
         }
         
         strcpy(sha->text, "Prog");
         sleep(1);
-        printf("B : %s, count\n", sha->text);
+        printf("B : %s, %d\n", sha->text, count);
 
-        sha->semb.sem_op = 1;
-        if((semop(sha->semid, &sha->semb, 1)) == -1){
+        sha->rebuf.sem_num = 0;
+        sha->rebuf.sem_op = 1;
+        sha->rebuf.sem_flg = SEM_UNDO;
+        if((semop(sha->semid, &sha->rebuf, 1)) == -1){
             printf("failed return sem\n");
             exit(1);
         }
@@ -78,7 +80,7 @@ int main(){
         return 0;
     }
 
-    if(semctl(semid, 0, IPC_RMID, 0) == -1)
+    if(semctl(sha->semid, 0, IPC_RMID, 0) == -1)
     {
         printf("failed remove sem\n");
         exit(0);
