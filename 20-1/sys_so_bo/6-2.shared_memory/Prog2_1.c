@@ -24,8 +24,8 @@ int main(){
     text = (char *)memory;
 
     for(count = 0; count < 10; count++){
-        strcpy(text, "System");
         sleep(1);
+        strcpy(text, "System");
         printf("A : %s\n", text);
     }
 

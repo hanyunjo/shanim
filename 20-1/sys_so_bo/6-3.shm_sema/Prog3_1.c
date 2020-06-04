@@ -75,8 +75,8 @@ int main(){
     for(count = 0; count < 10; count++){
         getsem(semid);
         
-        strcpy(sha->text, "Sema");
         sleep(1);
+        strcpy(sha->text, "Sema");
         printf("A : %s\n", sha->text);
 
         returnsem(semid);
