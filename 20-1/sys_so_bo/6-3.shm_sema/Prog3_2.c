@@ -7,8 +7,6 @@
 #include <sys/shm.h>
 #include <sys/sem.h>
 
-
-
 int main(){
     int shmid, count, semid;
     void *memory = (void *)0;
