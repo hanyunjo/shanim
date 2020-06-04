@@ -70,8 +70,8 @@ int main(){
     for(count = 0; count < 10; count++){
         getsem(semid);
         
-        sleep(1);
         strcpy(sha->text, "Prog");
+        sleep(1);
         printf("B : %s\n", sha->text);
 
         returnsem(semid);        
