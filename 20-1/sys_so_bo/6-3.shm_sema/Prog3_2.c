@@ -72,7 +72,6 @@ int main(){
     // function
     for(count = 0; count < 10; count++){
         //getsem(semid);
-
         semb.sem_op = -1;
         if((semop(semid, &semb, 1)) == -1){
             printf("failed get sem\n");
