@@ -33,5 +33,9 @@ int main(){
         printf("shmdt failed\n");
     }
 
+    if(shmctl(shmid, IPC_RMID, NULL) == -1){
+        printf("shmctl failed\n");
+    }
+
     return 0;
 }
