@@ -68,7 +68,8 @@ int main(){
             printf("failed semctl1 func\n");
             exit(1);
         }
-    }    
+    }
+    else semid = semget((key_t)9432, 1, IPC_CREAT|0666)
     
     sha->a = 0;
     sha->b = 0;
