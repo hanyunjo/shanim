@@ -71,10 +71,12 @@ int main(){
     sha->b = 0;
     arg.val = 1;
 
-    sha->a = 1;
-    if(semctl(semid, 0, SETVAL, arg) == -1){
-        printf("failed semctl1 func\n");
-        exit(1);
+    if(sha->b == 0){
+        sha->a = 1;
+        if(semctl(semid, 0, SETVAL, arg) == -1){
+            printf("failed semctl1 func\n");
+            exit(1);
+        }
     }
 
     // function

@@ -72,6 +72,7 @@ int main(){
     arg.val = 1;
 
     if(sha->a == 0){
+        sha->b = 1;
         if(semctl(semid, 0, SETVAL, arg) == -1){
             printf("failed semctl1 func\n");
             exit(1);
