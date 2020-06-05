@@ -9,6 +9,8 @@
 
 typedef struct {
     char text[7];
+    int a;
+    int b;
 } shm_sem;
 
 void getsem(int semid){
