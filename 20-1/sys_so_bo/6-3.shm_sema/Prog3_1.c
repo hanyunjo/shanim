@@ -88,8 +88,8 @@ int main(){
         returnsem(semid);
     }
 
-    if((sha->a == 2 && sha->b == 0) || (sha->a == 2 && sha->b == 2))){
-        if(shmdt(memory)) == -1){
+    if((sha->a == 2 && sha->b == 0) || (sha->a == 2 && sha->b == 2)){
+        if(shmdt(memory) == -1){
             printf("shmdt failed\n");
         }
 
