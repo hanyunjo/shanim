@@ -9,6 +9,8 @@
 
 typedef struct {
     char text[7];
+    int a;
+    int b;
 } shm_sem;
 
 void getsem(int semid){
@@ -70,16 +72,35 @@ int main(){
         printf("failed semctl1 func\n");
         exit(1);
     }
-
+    sha->a = 0;
+    sha->b = 0;
     // function
     for(count = 0; count < 10; count++){
         getsem(semid);
         
+        sha->a = 1;
         strcpy(sha->text, "Sema");
         sleep(1);
         printf("A : %s\n", sha->text);
 
+        if(count == 9) sha->a = 2;
+
         returnsem(semid);
+    }
+
+    if((sha->a == 2 && sha->b == 0) || (sha->a == 2 && sha->b == 2))){
+        if(shmdt(memory)) == -1){
+            printf("shmdt failed\n");
+        }
+
+        if(shmctl(shmid, IPC_RMID, NULL) == -1){
+            printf("shmctl failed\n");
+        }
+
+        if(semctl(semid, 0, IPC_RMID, 0) == -1){
+            printf("semctl failed\n");
+            exit(1);
+        }
     }
 
     return 0;

@@ -65,16 +65,36 @@ int main(){
         exit(1);
     }
 
-
+    sha->a = 0;
+    sha->b = 0;
     // function
     for(count = 0; count < 10; count++){
         getsem(semid);
         
+        sha->b = 1;
         strcpy(sha->text, "Prog");
         sleep(1);
         printf("B : %s\n", sha->text);
 
+        if(count == 9) sha->b = 2;
+
         returnsem(semid);        
+    }
+
+    if((sha->a == 0 && sha->b == 2) || (sha->a == 2 && sha->b == 2))){
+        if(shmdt(memory)) == -1){
+            printf("shmdt failed\n");
+        }
+
+        if(shmctl(shmid, IPC_RMID, NULL) == -1){
+            printf("shmctl failed\n");
+            exit(1);
+        }
+
+        if(semctl(semid, 0, IPC_RMID, 1) == -1){
+            printf("semctl failed\n");
+            exit(1);
+        }
     }
 
     return 0;
