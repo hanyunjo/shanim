@@ -27,7 +27,7 @@ int main(){
         exit(1);
     }
 
-    sha = (char *)memory;
+    sha = (shm_sem *)memory;
 
     sha->a = 0;
     sha->b = 0;
