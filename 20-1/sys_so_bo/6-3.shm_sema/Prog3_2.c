@@ -7,6 +7,12 @@
 #include <sys/shm.h>
 #include <sys/sem.h>
 
+/*
+shmdt, semctl을 통해서 제거 및 제어를 잘해줘야 문제가 발생하지 않는다.
+semaphore를 했는데도 제대로 작동하지 않았었는데,
+ 그 때는 shmdt, semctl를 잘 해주지 않았기 때문이다.
+*/
+
 typedef struct {
     char text[7];
     int a;
