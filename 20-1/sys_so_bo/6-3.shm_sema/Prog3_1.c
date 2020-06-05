@@ -62,20 +62,16 @@ int main(){
     sha = (shm_sem *)memory;
 
     // semaphore
-    if((semid = semget((key_t)9432, 1, IPC_CREAT|0666)) == -1){
-        printf("failed semget func\n");
-        exit(1);
-    }
-
-    if(semctl(semid, 0, SETVAL, arg) == -1){
-        printf("failed semctl1 func\n")
-        exit(1);
-    }
-    
+    if((semid = semget((key_t)9432, 1, IPC_CREAT|IPC_EXCL|0666)) != -1){
+        arg.val = 1;
+        if(semctl(semid, 0, SETVAL, arg) == -1){
+            printf("failed semctl1 func\n");
+            exit(1);
+        }
+    }    
     
     sha->a = 0;
     sha->b = 0;
-    arg.val = 1;
 
     // function
     for(count = 0; count < 10; count++){
