@@ -29,5 +29,9 @@ int main(){
         printf("A : %s\n", text);
     }
 
+    if(shmdt(memory) == -1){
+        printf("shmdt failed\n");
+    }
+
     return 0;
 }
