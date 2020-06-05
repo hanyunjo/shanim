@@ -69,11 +69,19 @@ int main(){
 
     sha->a = 0;
     sha->b = 0;
+    arg.val = 1;
+
+    if(sha->a == 0){
+        if(semctl(semid, 0, SETVAL, arg) == -1){
+            printf("failed semctl1 func\n");
+            exit(1);
+        }
+    }
+
     // function
     for(count = 0; count < 10; count++){
         getsem(semid);
         
-        sha->b = 1;
         strcpy(sha->text, "Prog");
         sleep(1);
         printf("B : %s\n", sha->text);

@@ -67,18 +67,20 @@ int main(){
         exit(1);
     }
     
+    sha->a = 0;
+    sha->b = 0;
     arg.val = 1;
+
+    sha->a = 1;
     if(semctl(semid, 0, SETVAL, arg) == -1){
         printf("failed semctl1 func\n");
         exit(1);
     }
-    sha->a = 0;
-    sha->b = 0;
+
     // function
     for(count = 0; count < 10; count++){
         getsem(semid);
         
-        sha->a = 1;
         strcpy(sha->text, "Sema");
         sleep(1);
         printf("A : %s\n", sha->text);
