@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <fcntl.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <pthread.h>
 
@@ -38,7 +39,7 @@ void *function(void *i){
     }
 
     tmp = 0;
-    if(i == 1){
+    if(num == 1){
         if(get_r_lock(fd) == -1){
             printf("file read_lock error\n");
             exit(1);
@@ -49,7 +50,7 @@ void *function(void *i){
             else result[tmp] = 0;
         }
     }
-    else if(i == 2){
+    else if(num == 2){
         sleep(1);
         if(get_w_lock(fd) == -1){
             printf("file write_lock error\n");
