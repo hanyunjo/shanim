@@ -10,14 +10,14 @@ int result[10];
 int get_w_lock(int fd);
 int get_r_lock(int fd);
 int unlock(int fd);
-void function(int i);
+void *function(void *i);
 
 int main(){
 
     pthread_t tid1, tid2;
 
-    pthread_create(&tid1, NULL, function, 1);
-    pthread_create(&tid2, NULL, function, 2);
+    pthread_create(&tid1, NULL, function, (void *)1);
+    pthread_create(&tid2, NULL, function, (void *)2);
 
     pthread_join(tid1, NULL);
     pthread_join(tid2, NULL);
@@ -25,10 +25,12 @@ int main(){
     return 0;
 }
 
-void function(int i){
-    int fd, tmp;
+void *function(void *i){
+    int fd, *num, tmp;
     char *name;
     int fir, sec, thir;
+
+    num = (int *)i;
 
     if((fd = open("data.txt", O_CREAT|O_RDWR)) == -1){
         printf("file open error\n");
