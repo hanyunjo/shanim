@@ -27,11 +27,11 @@ int main(){
 }
 
 void *function(void *i){
-    int fd, *num, tmp;
+    int fd, num, tmp;
     char *name;
     int fir, sec, thir;
 
-    num = (int *)i;
+    num = *(int *)i;
 
     if((fd = open("data.txt", O_CREAT|O_RDWR)) == -1){
         printf("file open error\n");
