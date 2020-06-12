@@ -55,7 +55,7 @@ void input_func(){
 }
 
 int travel(pq *que){
-    int i, j, minlen, last, inpath[16] = { 0, };
+    int i, j, minlen, last, inpath[16] = { 0, }, tmp_num = 1;
     node tmp, u, root;
 
     for(i = 0; i < 16; i++) tmp.path[i] = 0;
@@ -67,20 +67,21 @@ int travel(pq *que){
 
     while(!empty(que)){
         root = delete_root(que);
-printf("%d %d\n", root.level, root.bound);
-for(i = 0; i < que->size; i++) printf("%d ", que->arr[i].bound);
-printf("\n");
+
         if(root.bound < minlen){
             u.level = root.level + 1;
             for(i = 1; i <= root.level; i++){
                 if(root.path[i] != 0) inpath[root.path[i]] = 1;
             }
-//printf("%d %d %d %d\n",root.path[1],root.path[2],root.path[3],root.path[4]);
-//printf("%d %d %d %d\n", inpath[1], inpath[2], inpath[3], inpath[4]);
-            for(i = 2; (i <= num_vertex) && !inpath[i]; i++){
-                for(j = 0; j < 16; j++) u.path[j] = root.path[j];
+            //printf("%d %d %d %d %d\n",root.path[1],root.path[2],root.path[3],root.path[4], root.path[5]);
+            //printf("%d %d %d %d %d\n", inpath[1], inpath[2], inpath[3], inpath[4], inpath[5]);
+                
+            for(i = 2; i <= num_vertex; i++){
+                if(inpath[i] == 1) continue;
+
+                for(j = 0; j < 17; j++) u.path[j] = root.path[j];
                 u.path[u.level] = i;
-//printf("%d %d\n",u.level, num_vertex - 1);
+                
                 if(u.level == num_vertex - 1){
                     for(j = 1; j <= num_vertex; j++){
                        if(inpath[j] == 0) last = j;
@@ -98,7 +99,11 @@ printf("\n");
                     if(u.bound < minlen) add(que, &u);
                 }
             }
-        }
+        }/*
+        printf("%d %d %d / ", tmp_num++, root.level, root.bound);
+        for(i = 0; i < que->size; i++) printf("%d ", que->arr[i].bound);
+        printf("\n");*/
+        for(i = 2; i < 16; i++) inpath[i] = 0;
     }
     return minlen;
 }
