@@ -1,7 +1,7 @@
 #include <stdio.h>
 
 #define min(a, b) ((a < b) ? a : b)
-#define que_size 1024
+#define que_size 20000
 
 int num_vertex, result[17];
 int edge[16][16] ={ 0, };
@@ -55,10 +55,10 @@ void input_func(){
 }
 
 int travel(pq *que){
-    int i, j, minlen, last, inpath[16] = { 0, }, tmp_num = 1;
+    int i, j, minlen, last, inpath[16] = { 0, };
     node tmp, u, root;
 
-    for(i = 0; i < 16; i++) tmp.path[i] = 0;
+    for(i = 0; i < 17; i++) tmp.path[i] = 0;
     tmp.path[1] = 1;
     tmp.level = 1;
     tmp.bound = bound_func(tmp);
@@ -70,18 +70,17 @@ int travel(pq *que){
 
         if(root.bound < minlen){
             u.level = root.level + 1;
+        
             for(i = 1; i <= root.level; i++){
                 if(root.path[i] != 0) inpath[root.path[i]] = 1;
             }
-            //printf("%d %d %d %d %d\n",root.path[1],root.path[2],root.path[3],root.path[4], root.path[5]);
-            //printf("%d %d %d %d %d\n", inpath[1], inpath[2], inpath[3], inpath[4], inpath[5]);
-                
+
             for(i = 2; i <= num_vertex; i++){
                 if(inpath[i] == 1) continue;
-
+                
                 for(j = 0; j < 17; j++) u.path[j] = root.path[j];
                 u.path[u.level] = i;
-                
+                inpath[i] = 1;
                 if(u.level == num_vertex - 1){
                     for(j = 1; j <= num_vertex; j++){
                        if(inpath[j] == 0) last = j;
@@ -95,14 +94,11 @@ int travel(pq *que){
                 }
                 else{
                     u.bound = bound_func(u);
-                    //printf("%d %d %d\n", u.path[1], u.path[2], u.bound);
                     if(u.bound < minlen) add(que, &u);
                 }
+                inpath[i] = 0;
             }
-        }/*
-        printf("%d %d %d / ", tmp_num++, root.level, root.bound);
-        for(i = 0; i < que->size; i++) printf("%d ", que->arr[i].bound);
-        printf("\n");*/
+        }
         for(i = 2; i < 16; i++) inpath[i] = 0;
     }
     return minlen;
@@ -125,8 +121,8 @@ int length_func(node v){
 
 int bound_func(node v){
     int i, j, result = 0, real_min;
-    int nonpath[16]; // path에 존재하지 않는다.
-    for(j = 1; j < 16; j++) nonpath[j] = 1;
+    int nonpath[16]; // 1 mean : path에 존재하지 않는다.
+    for(j = 0; j < 16; j++) nonpath[j] = 1;
 
     // path에 존재하는 결정된 edge값 result에 더하기
     for(j = 1; j < v.level; j++){ 
@@ -143,14 +139,14 @@ int bound_func(node v){
         if(nonpath[j] == 0) continue;
         else if(j == v.path[v.level]){ // path의 마지막 노드
             for(i = 1; i <= num_vertex; i++){
-                if((nonpath[i] != 0) && (j != i))
+                if((nonpath[i] == 1) && (j != i))
                     real_min = min(real_min, edge[j][i]);
             }
         }
         else{ // path에 존재하지 않는 노드
             real_min = edge[j][1];
             for(i = 1; i <= num_vertex; i++){
-                if((nonpath[i] != 0) && (j != i) && (v.path[v.level] != i))
+                if((nonpath[i] != 0) && (j != i) && (i != v.path[v.level]))
                     real_min = min(real_min, edge[j][i]);
             }
         }
