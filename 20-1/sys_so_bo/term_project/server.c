@@ -1,9 +1,9 @@
 #include <stdio.h>
 #include <netdb.h>
+#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <pthread.h>
 #include <arpa/inet.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -11,34 +11,40 @@
 #include <sys/ipc.h>
 #include <sys/shm.h>
 #include <sys/sem.h>
-#include <openssl/bio.h>
-#include <openssl/ssl.h>
-#include <openssl/err.h>
-#include <openssl/sha.h>
+#include <signal.h>
 
 #define Buf_len 128
 #define Listen_que 3
-
-void check_cipher(int client_fd);
-int get_privacy_and_check_database(int client_fd);
-void send_question(int client_fd);
-void send_append_question(int client_fd);
-int check_database(char privacy[]);
-void getsem(int semid);
-void returnsem(int semid);
 
 typedef struct {
     int remain_num;
 } shm_mem;
 
+int check_cipher(int client_fd);
+char *get_privacy(int client_fd);
+int check_database(char *hash);
+void send_question(int client_fd, char *hash);
+void send_append_question(int client_fd, char *hash);
+char *studying(char *hash);
+void close_child(int sema_id, shm_mem *shared);
+
+void getsem(int semid);
+void returnsem(int semid);
+
+int get_w_lock(int fd);
+int get_r_lock(int fd);
+int unlock(int fd);
+
 int main(){
     char buf[Buf_len];
-    int len, i, mess_len, check_num;
+    int len, i, mess_len, check_num, chk_ci;
     int in_database;
+    char *hash_value, *result;
     //socket
     struct sockaddr_in server_addr, client_addr, peer_addr;
     //fork
-    pid_t client_pid[100] = { 0, };
+    pid_t client_pid[100];
+    for(i = 0; i < 100; i++) client_pid[i] = -1;
     int pid_num;
     //IO
     int shm_id, sema_id;
@@ -51,44 +57,8 @@ int main(){
     }  arg;
     //file
     int server_fd, client_fd;
-
-    //Openssl
-    SSL_CTX *ctx;
-    SSL *ssl;
-    X509 *cli_cert;
-    char *str;
-    char ssl_buf[4096];
-    int err;
-    SSL_METHOD *method;
-
-    // Init ssl++++++++++++++++++++
-    SSL_load_error_strings();
-    SSLeay_add_ssl_algorithms();
-    method = SSLv23_server_method();
-    ctx = SSL_CTX_new(method);
-
-    if(!ctx) {
-        printf("failed to creat SSL_CTX\n");
-        exit(2);
-    }
-
-    // set certiciate file
-    if(SSL_CTX_use_certificate_file(ctx, CERTF, SSL_FILETYPE_PEM) <= 0) {      // 인증서를 파일로 부터 로딩할때 사용함.
-        ERR_print_errors_fp(stderr);
-        exit(1);
-    }
-   
-    // set private key
-    if(SSL_CTX_use_PrivateKey_file(ctx, KEYF, SSL_FILETYPE_PEM) <= 0) {
-        ERR_print_errors_fp(stderr);
-        exit(1);
-    }
-   
-    // check private key
-    if(!SSL_CTX_check_private_key(ctx)) {
-        printf("Private key does not correct\n");
-        exit(1);
-    }
+    //siganl
+    sigset_t sigwait;
 
     // socket()++++++++++++++++
     if((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == -1){
@@ -140,46 +110,36 @@ int main(){
     }
     else sema_id = semget((key_t)9432, 1, IPC_CREAT|0666);
 
-    // operating++++++++++++++++
     pid_num = 0;
     while(1){
-        len = sizeof(client_addr);
-    
+        // signal wait
+        while(1){
+            getsem(sema_id);
+            if(shared->remain_num == 0){
+                returnsem(sema_id);
+                sigfillset(&sigwait);
+                sigdelset(&sigwait, SIGUSR1);
+                sigsuspend(&sigwait);
+                printf("client number is not 100, so start againg\n");
+            }
+            else{
+                returnsem(sema_id);
+                break;
+            }
+        }
+
         // accept
+        len = sizeof(client_addr);
         client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &len);
         if(client_fd < 0){
             printf("failed accept func\n");
             exit(0);
         }
-        
-        getsem(sema_id);
-        if(shared->remain_num == 0){
-            // sigwait
-            // signal 받아서
-            shared->remain_num++;
-        }
-        returnsem(sema_id);
 
-        if(client_pid[pid_num] == 0){
+        // real_operating++++++++++++++++
+        if(client_pid[pid_num] == -1){
             if((client_pid[pid_num] = fork()) == 0){ // child
                 close(server_fd);
-
-                // SSL setting
-                if((ssl = SSL_new(ctx) == NULL){
-                    printf("ssl_new error\n");
-                    exit(1);
-                }
-                SSL_set_fd(ssl, client_fd);
-                if((err = SSL_accept(ssl) == -1){
-                    printf("SSL_accept error\n");
-                    exit(1);
-                } 
-
-                cli_cert = SSL_get_peer_certificate(ssl);
-                if(cli_cert == NULL){
-                    printf("client doesn't have certificate\n");
-                    exit(1);
-                }
 
                 // semaphore 적용
                 getsem(sema_id);
@@ -187,29 +147,41 @@ int main(){
                 returnsem(sema_id);
                 
                 // 2
-                check_cipher(client_fd);
+                chk_ci = check_cipher(client_fd);
+                if(chk_ci == 0){
+                    close_child(sema_id, shared);
+                    exit(0);
+                }
 
-                // 3 ~ 5 /  b ~ c
-                in_database = get_privacy_and_check_database(client_fd);
+                // 3
+                hash_value = get_privacy(client_fd);
+                if(strcmp(hash_value, "fail") == 0){
+                    close_child(sema_id, shared);
+                    exit(0);
+                }
+
+                // 4, b 
+                in_database = check_database(hash_value);
                 if(in_database == 1){
                     int appen;
-                    // b 
                     sprintf(buf, "If you want new one, type 1 / If you want to append, type 2 : ");
                     write(client_fd, buf, strlen(buf));
                     read(client_fd, buf, Buf_len); 
                     appen = atoi(buf);
-                    // c
-                    if(appen == 1) send_question(client_fd);
-                    else if(appen == 2) send_append_question(client_fd); 
+                    
+                    // 5, c
+                    if(appen == 1) send_question(client_fd, hash_value);
+                    else if(appen == 2) send_append_question(client_fd, hash_value); 
                     else perror("Error about : ");
                 }
-                else send_question(client_fd); // 5
+                else send_question(client_fd, hash_value); // 5
 
                 // 6
-                write(client_fd, buf, strlen(buf));
+                result = studying(hash_value);
+                write(client_fd, result, strlen(result));
+                
                 close(client_fd);   
-                SSL_free(ssl);
-                SSL_CTX_free(ctx);
+                close_child(sema_id, shared);
                 exit(0);
             }
             pid_num++;
@@ -235,93 +207,155 @@ int main(){
     return 0;
 }
 
-void check_cipher(int client_fd){
-    char buf[Buf_len];
-    char *version;
+int check_cipher(int client_fd){
+    char buf[Buf_len], cmp[20];
+    char *version = "wget https://www.openssl.org/source/openssl-1.1.1g.tar.gz";
     int len;
 
     sprintf(buf, "Check cipher version & Response about updating cipher version(yes or no) : ");
     write(client_fd, buf, strlen(buf));
-    read(client_fd, buf, Buf_len); 
-    if(); // cipher version 확인 작성하기++
-    // file 전송하기++
-}
+    len = read(client_fd, buf, Buf_len); // take cipher version
+    buf[len] = '\0';
 
-int get_privacy_and_check_database(int client_fd){
-    int count = 0, exist, len;
-    char buf[Buf_len], privacy[512];
+    if(strcmp(buf, "fail") == 0)
+        return 0;
 
-    while(count != 2){
-        // 3
-        sprintf(buf, "Input your front part of Resident registration number : ");
-        write(client_fd, buf, strlen(buf));
-        len = SSL_read(client_fd, buf, Buf_len); 
-        buf[len] = '\0';
-        if(strcmp(buf, "fail")) close(client_fd);
-
-        // 4
-        // 암호화되어 전송된 data 복호화 추가하기++ // data 형식은 client에서 확인
-
-        // b
-        exist = check_database(privacy);
-        if(exist == 0) return 0; 
-        else return 1; // client answer in past.
+    strncpy(cmp, buf, 13);
+    cmp[13] = '\0';
+    if(strcmp(cmp, "Openssl 1.1.1") != 0){ // cipher version 확인
+        //strncpy(buf, version, strlen(version));
+        write(client_fd, version, strlen(version)); //file 전송하기
     }
-}
-
-void send_question(int client_fd){
-    int ques_fd, respon_fd;
-    char buf[Buf_len];
-
-    ques_fd = fopen("question.txt", "r");
-    respon_fd = fopen("respond.txt", "w"); // RESPOND FILE VERSION 관리 CODE++
-    while(ques_fd != NULL){
-        fgets(buf, Buf_len, ques_fd);  
+    else{
+        sprintf(buf, "safe");
         write(client_fd, buf, strlen(buf));
-        read(client_fd, buf, Buf_len); // Question에 대한 답 얻기
-        fputs(buf, respon_fd);
     }
-
-    close(ques_fd);
-    close(respon_fd);
+    return 1;
 }
 
-void send_append_question(int client_fd){
-    int app_fd, respon_fd;
-    char buf[Buf_len];
+char *get_privacy(int client_fd){
+    int len;
+    char buf[Buf_len], *privacy;
 
-    app_fd = fopen("append_question.txt", "r");
-    respon_fd = fopen("app_respond.txt", "w"); // APPEND FILE VERSTION 관리 CODE++
-    while(app_fd != NULL){
-        fgets(buf, Buf_len, app_fd);  
-        write(client_fd, buf, strlen(buf));
-        read(client_fd, buf, Buf_len); // Question에 대한 답 얻기
-        fputs(buf, respon_fd);
-    }
+    // 3
+    sprintf(buf, "Input your front part of Resident registration number : ");
+    write(client_fd, buf, strlen(buf));
+    read(client_fd, buf, Buf_len);  // take privacy 
+    buf[len] = '\0';
+    strcpy(privacy, buf);
+    if(strcmp(buf, "fail") == 0) return "fail";
 
-    close(app_fd);
-    close(respon_fd);
+    return privacy;
 }
 
-int check_database(char privacy[]){
+int check_database(char *privacy){
     int database_r_fd, database_w_fd;
-    char buf[Buf_len];
+    char buf[Buf_len], tmp[100];
 
-    database_r_fd = fopen("database.txt", "r");
-    while(database_r_fd != NULL){
-        fgets(buf, Buf_len, database_r_fd);
-        if(strcmp(buf, privacy) == 0){
+    database_r_fd = open("database.txt", O_CREAT|O_RDONLY, 0644);
+
+    if(get_r_lock(database_r_fd) == -1){
+        printf("file read_lock error\n");
+        exit(1);
+    }
+
+    while(read(database_r_fd, buf, 33) > 30){ 
+        buf[32] = '\0';
+        if(strcmp(buf, privacy) == 0){ // exist
             close(database_r_fd);
             return 1;
         }
-        else{
-            close(database_r_fd);
-            database_w_fd = fopen("database.txt", "a");
-            fputs(privacy, database_w_fd);
-            close(database_w_fd);
-            return 0;
-        }
     }
+
+    if(unlock(database_r_fd) == -1){
+        printf("file unlock error\n");
+        exit(1);
+    }
+    close(database_r_fd);
+
+    // not exist
+    database_w_fd = open("database.txt", O_WRONLY | O_CREAT | O_EXCL, 0644);
+
+    if(get_w_lock(database_w_fd) == -1){
+        printf("file write_lock error\n");
+        exit(1);
+    }
+
+    lseek(database_w_fd, 0, SEEK_END);
+    sprintf(tmp, "%s\n", privacy);
+    write(database_w_fd, tmp, strlen(tmp));
+
+    if(unlock(database_w_fd) == -1){
+        printf("file unlock error\n");
+        exit(1);
+    }
+    close(database_w_fd);
+
+    return 0;
+}
+
+void send_question(int client_fd, char *hash){
+    FILE* ques_fd;
+    FILE* respon_fd;
+    char buf[Buf_len], filename[50];
+
+    ques_fd = fopen("question.txt", "r");
+    sprintf(filename, "%s_respond.txt", hash);
+    const char *tmp = filename;
+    respon_fd = fopen(tmp, "w"); // RESPOND FILE VERSION 관리 CODE++
+    while(!feof(ques_fd)){
+        fgets(buf, Buf_len, ques_fd);
+        buf[strlen(buf) - 1] = '\0';
+
+        write(client_fd, buf, strlen(buf));
+        read(client_fd, buf, Buf_len); // Question에 대한 답 얻기
+        fputs(buf, respon_fd);
+    }
+
+    fclose(ques_fd);
+    fclose(respon_fd);
+}
+
+void send_append_question(int client_fd, char *hash){
+    FILE* app_fd;
+    FILE* respon_fd;
+    char buf[Buf_len], filename[50];
+
+    app_fd = fopen("append_question.txt", "r");
+    sprintf(filename, "%s_app_res.txt", hash);
+    const char *tmp = filename;
+    respon_fd = fopen(tmp, "a"); // APPEND FILE VERSTION 관리 CODE++
+    while(!feof(app_fd)){
+        fgets(buf, Buf_len, app_fd);
+        buf[strlen(buf) - 1] = '\0';
+
+        write(client_fd, buf, strlen(buf));
+        
+        read(client_fd, buf, Buf_len); // Question에 대한 답 얻기
+        fputs(buf, respon_fd);
+    }
+
+    fclose(app_fd);
+    fclose(respon_fd);
+}
+
+char *studying(char *hash){
+    char *result;
+    
+    // something result function do
+    sprintf(result, "result : ~~~~~~");
+
+    return result;
+}
+
+void close_child(int sema_id, shm_mem *shared){
+    // semaphore 적용
+    getsem(sema_id);
+    shared->remain_num++;
+    returnsem(sema_id);
+
+    // signal send
+    kill(getppid(), SIGUSR1);
 }
 
 // about semaphore
@@ -347,4 +381,34 @@ void returnsem(int semid){
         printf("failed return sem\n");
         exit(1);
     }
+}
+
+int get_w_lock(int fd){
+    struct flock lock;
+    lock.l_type = F_WRLCK;
+    lock.l_start = 0;
+    lock.l_whence = SEEK_SET;
+    lock.l_len = 0;
+
+    return fcntl(fd, F_SETLKW, &lock); // SETLKW는 lock을 얻을 때까지 blocking한다.
+}
+
+int get_r_lock(int fd){
+    struct flock lock;
+    lock.l_type = F_RDLCK;
+    lock.l_start = 0;
+    lock.l_whence = SEEK_SET;
+    lock.l_len = 0;
+
+    return fcntl(fd, F_SETLKW, &lock); // SETLKW는 lock을 얻을 때까지 blocking한다.
+}
+
+int unlock(int fd){
+    struct flock lock;
+    lock.l_type = F_UNLCK;
+    lock.l_start = 0;
+    lock.l_whence = SEEK_SET;
+    lock.l_len = 0;
+
+    return fcntl(fd, F_SETLK, &lock);
 }

@@ -7,18 +7,22 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <termio.h>
+#include <openssl/sha.h>
 
 #define Buf_len 128
 
 int check_cipher(int sock, char buf[]);
-int input_privacy();
+int input_send_privacy(int sock);
 int getch();
 
-int main(){
+int *SHA256()
 
+typedef struct SHA256state_st SHA256_CTX;
+
+int main(){
     int sock, i, succ, err = 0;
     struct sockaddr_in server_addr;
-    char buf[Buf_len+1], type_num[2];
+    char buf[Buf_len+1], type_num[2], tmp[Buf_len];
 
     if((sock = socket(PF_INET, SOCK_STREAM, 0)) < 0){
             printf("failed socket func\n");
@@ -39,36 +43,36 @@ int main(){
 
     while((i = read(sock, buf, Buf_len)) > 0){
         buf[i] = '\0';
-        if(strcmp(buf, "Check cipher version & Response about updating cipher version(yes or no) : ")){ // 2
+        if(strncmp(buf, "Check", 5) == 0){ // 2
             err = check_cipher(sock, buf);
             if(err == 0){
                 sprintf(buf, "fail", NULL);
                 write(sock, buf, strlen(buf));
                 break;
             }
+            read(sock, buf, Buf_len);
+            strcpy(tmp, buf);
+            buf[4] = '\0';
+            if(strcmp(buf, "wget") == 0) system(tmp);
         }
-        else if(strcmp(buf, "Input your front part of Resident registration number : ")){ // 3
+        else if(strncmp(buf, "Input", 5) == 0){ // 3
             printf("%s", buf);
-            err = input_privacy();
-            if(err == 0){
-                sprintf(buf, "fail", NULL);
-                write(sock, buf, strlen(buf));
-                break;
-            }
+            err = input_send_privacy(sock);
+            if(err == 0) break;
         }
-        else if(strcmp(buf, "If you want new one, type 1 / If you want to append, type 2 : ") == 0){ // b
+        else if(strncmp(buf, "If", 2) == 0){ // b
             scanf("%d", type_num);
             write(sock, type_num, strlen(type_num));
         }
-        else if(  ){ // 5 / c
-            printf("%s\n", buf);
-            scanf("%s", buf);
-            write(sock, buf, strlen(buf));
-        }
-        else if(strcmp(buf, "result") == 0){ // 6
+        else if(strncmp(buf, "result", 5) == 0){ // 6
             read(sock, buf, Buf_len);
             printf("%s\n", buf);
             break;
+        }
+        else{ // 5 / c
+            printf("%s\n", buf);
+            fgets(buf, Buf_len, stdin);
+            write(sock, buf, strlen(buf));
         }
     }
 
@@ -78,7 +82,7 @@ int main(){
 }
 
 int check_cipher(int sock, char buf[]){
-    char tmpbuf[Buf_len], ver[50];
+    char tmpbuf[Buf_len];
     int err = 1;
 
     strcpy(tmpbuf, buf);
@@ -104,12 +108,13 @@ int check_cipher(int sock, char buf[]){
             }
         }
 
-        if(err == 1){
-            // cipher version 확인+++
-
-
-            sprintf(buf, "%s yes", ver);
+        if(err == 1){   // cipher version 확인
+            system("openssl version > version.txt");
+            FILE *ver_fd;
+            ver_fd = fopen("version.txt", "r");
+            fgets(buf, Buf_len, ver_fd);
             write(sock, buf, strlen(buf));
+            fclose(ver_fd);
             break;
         }
         printf("Please input only 'yes' or 'no'\n");
@@ -118,9 +123,12 @@ int check_cipher(int sock, char buf[]){
     return 1;
 }
 
-int input_privacy(){
+int input_send_privacy(int sock){
     char buf[Buf_len], privacy[14];
     int i, err = 2;
+    //sha
+    SHA256_CTX sha256;
+    char sha256_val[SHA256_DIGEST_LENGTH]; // SHA256_DIGEST_LENGTH = 32
 
     for(i = 0; i < 13; i++){
         privacy[i] = getch();
@@ -155,6 +163,17 @@ int input_privacy(){
             printf("You fail 2 twice, so disconnect\n");
             break;
         }
+    }
+
+    if(err != 0){ // Make hash and write
+        SHA_Init(&sha256);
+        SHA256_Upadate(&sha256, privacy, strlen(privacy));
+        SHA256_Final(sha256_val, &sha256);
+        write(sock, sha256_val, strlen(sha256_val));
+    }
+    else if(err == 0){
+        sprintf(buf, "fail", NULL);
+        write(sock, buf, strlen(buf));
     }
 
     return err;
