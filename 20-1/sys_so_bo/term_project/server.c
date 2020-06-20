@@ -41,7 +41,8 @@ int main(){
     int in_database;
     char *hash_value, *result;
     //socket
-    struct sockaddr_in server_addr, client_addr, peer_addr;
+    int server_fd, client_fd;
+    struct sockaddr_in server_addr, client_addr;
     //fork
     pid_t client_pid[100];
     for(i = 0; i < 100; i++) client_pid[i] = -1;
@@ -55,13 +56,11 @@ int main(){
         struct   semid_ds   *buf;
         unsigned short int  *arrary;
     }  arg;
-    //file
-    int server_fd, client_fd;
     //siganl
     sigset_t sigwait;
 
     // socket()++++++++++++++++
-    if((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == -1){
+    if((server_fd = socket(PF_INET, SOCK_STREAM, 0)) == -1){
         printf("server can't open socket\n");
         exit(1);
     }
@@ -73,16 +72,16 @@ int main(){
     // set sever_addr
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    server_addr.sin_port = htons(50000);
+    server_addr.sin_port = htons(15100);
 
     // bind()
-    if(bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) != 0){ 
-        printf("failed bine func\n");
+    if(bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) == -1){ 
+        printf("failed bind func\n");
         exit(0);
     }
 
     // listen()
-    if(listen(server_fd, Listen_que) != 0){
+    if(listen(server_fd, Listen_que) == -1){
         printf("failed listen func\n");
         exit(0);
     }
@@ -99,6 +98,7 @@ int main(){
     }
 
     shared = (shm_mem *)memory;
+    shared->remain_num = 100;
 
     // semaphore++++++++++++++++
     if((sema_id = semget((key_t)9432, 1, IPC_CREAT|IPC_EXCL|0666)) != -1){
@@ -127,7 +127,7 @@ int main(){
                 break;
             }
         }
-
+printf("0\n");
         // accept
         len = sizeof(client_addr);
         client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &len);
@@ -140,35 +140,37 @@ int main(){
         if(client_pid[pid_num] == -1){
             if((client_pid[pid_num] = fork()) == 0){ // child
                 close(server_fd);
-
+printf("1\n");
                 // semaphore 적용
                 getsem(sema_id);
                 shared->remain_num--;
                 returnsem(sema_id);
-                
+printf("2\n");                
                 // 2
                 chk_ci = check_cipher(client_fd);
                 if(chk_ci == 0){
                     close_child(sema_id, shared);
                     exit(0);
                 }
-
+printf("3-bef\n");
                 // 3
                 hash_value = get_privacy(client_fd);
-                if(strcmp(hash_value, "fail") == 0){
+                if(strncmp(hash_value, "fail", 4) == 0){
                     close_child(sema_id, shared);
                     exit(0);
                 }
 
                 // 4, b 
                 in_database = check_database(hash_value);
+printf("data-%d\n", in_database);
                 if(in_database == 1){
                     int appen;
                     sprintf(buf, "If you want new one, type 1 / If you want to append, type 2 : ");
                     write(client_fd, buf, strlen(buf));
-                    read(client_fd, buf, Buf_len); 
+                    i = read(client_fd, buf, Buf_len); 
+                    buf[i] = '\0';
                     appen = atoi(buf);
-                    
+
                     // 5, c
                     if(appen == 1) send_question(client_fd, hash_value);
                     else if(appen == 2) send_append_question(client_fd, hash_value); 
@@ -217,13 +219,10 @@ int check_cipher(int client_fd){
     len = read(client_fd, buf, Buf_len); // take cipher version
     buf[len] = '\0';
 
-    if(strcmp(buf, "fail") == 0)
+    if(strncmp(buf, "fail", 4) == 0)
         return 0;
 
-    strncpy(cmp, buf, 13);
-    cmp[13] = '\0';
-    if(strcmp(cmp, "Openssl 1.1.1") != 0){ // cipher version 확인
-        //strncpy(buf, version, strlen(version));
+    if(strncmp(buf, "OpenSSL 1.1.1", 13) != 0){ // cipher version 확인
         write(client_fd, version, strlen(version)); //file 전송하기
     }
     else{
@@ -240,10 +239,13 @@ char *get_privacy(int client_fd){
     // 3
     sprintf(buf, "Input your front part of Resident registration number : ");
     write(client_fd, buf, strlen(buf));
-    read(client_fd, buf, Buf_len);  // take privacy 
+    len = read(client_fd, buf, Buf_len);  // take privacy 
     buf[len] = '\0';
+    
+    privacy = malloc(sizeof(char)*65);
     strcpy(privacy, buf);
-    if(strcmp(buf, "fail") == 0) return "fail";
+
+    if(strncmp(buf, "fail", 4) == 0) return "fail";
 
     return privacy;
 }
@@ -259,8 +261,9 @@ int check_database(char *privacy){
         exit(1);
     }
 
-    while(read(database_r_fd, buf, 33) > 30){ 
-        buf[32] = '\0';
+    while(read(database_r_fd, buf, 65) > 60){ 
+        buf[64] = '\0';
+        printf("%s\n",buf);
         if(strcmp(buf, privacy) == 0){ // exist
             close(database_r_fd);
             return 1;
@@ -274,7 +277,7 @@ int check_database(char *privacy){
     close(database_r_fd);
 
     // not exist
-    database_w_fd = open("database.txt", O_WRONLY | O_CREAT | O_EXCL, 0644);
+    database_w_fd = open("database.txt", O_WRONLY);
 
     if(get_w_lock(database_w_fd) == -1){
         printf("file write_lock error\n");
@@ -306,7 +309,7 @@ void send_question(int client_fd, char *hash){
     while(!feof(ques_fd)){
         fgets(buf, Buf_len, ques_fd);
         buf[strlen(buf) - 1] = '\0';
-
+printf("%s\n", buf);
         write(client_fd, buf, strlen(buf));
         read(client_fd, buf, Buf_len); // Question에 대한 답 얻기
         fputs(buf, respon_fd);

