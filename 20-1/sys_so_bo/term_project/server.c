@@ -12,6 +12,7 @@
 #include <sys/shm.h>
 #include <sys/sem.h>
 #include <signal.h>
+#include <sys/signal.h>
 
 #define Buf_len 128
 #define Listen_que 3
@@ -28,6 +29,8 @@ void send_append_question(int client_fd, char *hash);
 void some_function(int client_fd, char *hash);
 void close_child(int sema_id, shm_mem *shared);
 
+void handler(int signo);
+
 void getsem(int semid);
 void returnsem(int semid);
 
@@ -37,7 +40,7 @@ int unlock(int fd);
 
 int main(){
     char buf[Buf_len];
-    int len, i, mess_len, check_num, chk_ci;
+    int len, i, mess_len, check_num, chk_ci, count;
     int in_database;
     char *hash_value, *result;
     //socket
@@ -58,6 +61,7 @@ int main(){
     }  arg;
     //siganl
     sigset_t sigwait;
+    struct sigaction act;
 
     // socket()++++++++++++++++
     if((server_fd = socket(PF_INET, SOCK_STREAM, 0)) == -1){
@@ -72,7 +76,7 @@ int main(){
     // set sever_addr
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    server_addr.sin_port = htons(15000);
+    server_addr.sin_port = htons(15240);
 
     // bind()
     if(bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) == -1){ 
@@ -99,6 +103,7 @@ int main(){
 
     shared = (shm_mem *)memory;
     shared->remain_num = 100;
+    pid_num = 0;
 
     // semaphore++++++++++++++++
     if((sema_id = semget((key_t)9432, 1, IPC_CREAT|IPC_EXCL|0666)) != -1){
@@ -110,59 +115,80 @@ int main(){
     }
     else sema_id = semget((key_t)9432, 1, IPC_CREAT|0666);
 
-    pid_num = 0;
+    // signal setting
+    sigemptyset(&act.sa_mask);
+    //act.sa_flags = SA_RESETHAND;
+    act.sa_flags = 0;
+    act.sa_handler = handler;
+    if(sigaction(SIGUSR1, &act, (struct sigaction *)NULL) < 0){
+        printf("failed sigaction\n");
+        exit(1);
+    }
+    
+    count = 0;
     while(1){
-        // signal wait
-        while(1){
-            getsem(sema_id);
-            if(shared->remain_num == 0){
-                returnsem(sema_id);
-                sigfillset(&sigwait);
-                sigdelset(&sigwait, SIGUSR1);
+        getsem(sema_id);
+        if(shared->remain_num == 0){
+            // signal wait
+            returnsem(sema_id);
+            while(1){
                 sigsuspend(&sigwait);
-                printf("client number is not 100, so start againg\n");
+                count++;
+                if(count == 100)
+                    break;
             }
-            else{
-                returnsem(sema_id);
-                break;
-            }
+            count = 0;
+            printf("all client is close, so initiate\n");
+            sleep(1);
+            pid_num = 0;
+            for(i = 0; i < 100; i++) 
+                client_pid[i] = -1;
         }
+        else{
+            returnsem(sema_id);
+            // accept
+            len = sizeof(client_addr);
+            while(1){
+                client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &len);
+                if(client_fd != -1)
+                    break;
+            }
 
-        // accept
-        len = sizeof(client_addr);
-        client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &len);
-        if(client_fd < 0){
-            printf("failed accept func\n");
-            exit(0);
+            // semaphore 적용
+            getsem(sema_id);
+            shared->remain_num--;
+            returnsem(sema_id);
         }
 
         // real_operating++++++++++++++++
         if(client_pid[pid_num] == -1){
             if((client_pid[pid_num] = fork()) == 0){ // child
                 close(server_fd);
-
-                // semaphore 적용
-                getsem(sema_id);
-                shared->remain_num--;
-                returnsem(sema_id);
+                printf("%d-client connect\n", pid_num);
 
                 // 2
                 chk_ci = check_cipher(client_fd);
                 if(chk_ci == 0){
+                    close(client_fd);
                     close_child(sema_id, shared);
+
+                    printf("%d-client disconnect\n", pid_num);
                     exit(0);
                 }
 
                 // 3
                 hash_value = get_privacy(client_fd);
                 if(strncmp(hash_value, "fail", 4) == 0){
+                    close(client_fd);
                     close_child(sema_id, shared);
+
+                    printf("%d-client disconnect\n", pid_num);
                     exit(0);
                 }
-printf("done pri\n");
+
                 // 4, b 
                 in_database = check_database(hash_value);
-printf("done data\n");
+
                 if(in_database == 1){
                     int appen;
                     sprintf(buf, "If you want new one, type 1 / If you want to append, type 2 : ");
@@ -172,22 +198,23 @@ printf("done data\n");
                     appen = atoi(buf);
 
                     // 5, c
-                    if(appen == 1) send_question(client_fd, hash_value);
-                    else if(appen == 2) send_append_question(client_fd, hash_value); 
-                    else perror("Error about : ");
+                    if(appen == 1) 
+                        send_question(client_fd, hash_value);
+                    else if(appen == 2) 
+                        send_append_question(client_fd, hash_value); 
+                    else 
+                        perror("Error about : ");
                 }
-                else send_question(client_fd, hash_value); // 5
-printf("done send ques\n");
+                else 
+                    send_question(client_fd, hash_value); // 5
 
                 // 6
                 some_function(client_fd, hash_value);
-printf("done result func\n");
 
-                free(hash_value);
-                free(result);
                 close(client_fd);   
                 close_child(sema_id, shared);
-printf("done\n");
+
+                printf("%d-client disconnect\n", pid_num);
                 exit(0);
             }
             pid_num++;
@@ -245,11 +272,11 @@ char *get_privacy(int client_fd){
     write(client_fd, buf, strlen(buf));
     len = read(client_fd, buf, Buf_len);  // take privacy 
     buf[len] = '\0';
+
+    if(strncmp(buf, "fail", 4) == 0) return "fail";
     
     privacy = malloc(sizeof(char)*65);
     strcpy(privacy, buf);
-
-    if(strncmp(buf, "fail", 4) == 0) return "fail";
 
     return privacy;
 }
@@ -357,7 +384,7 @@ void send_append_question(int client_fd, char *hash){
 void some_function(int client_fd, char *hash){
     FILE* app_fd;
     FILE* respon_fd;
-    char result[50], filename[50];
+    char result[50], filename[80];
 
     // hash's respond data
     sprintf(filename, "%s_respond.txt", hash);
@@ -381,10 +408,14 @@ void close_child(int sema_id, shm_mem *shared){
     // semaphore 적용
     getsem(sema_id);
     shared->remain_num++;
-    returnsem(sema_id);
-
     // signal send
     kill(getppid(), SIGUSR1);
+    returnsem(sema_id);
+}
+
+//signal
+void handler(int signo){
+    printf("one client is close\n");
 }
 
 // about semaphore

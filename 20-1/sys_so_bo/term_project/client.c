@@ -30,7 +30,7 @@ int main(){
     memset(&server_addr, 0, sizeof(server_addr));
 
     server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(15000);
+    server_addr.sin_port = htons(15240);
     server_addr.sin_addr.s_addr = inet_addr("10.178.0.2");
     // = inet_pton( AF_INET, "34.64.182.41", &server_addr.sin_addr.s_addr );
 
@@ -75,11 +75,10 @@ int main(){
             printf("%s\n", buf);
             fgets(buf, Buf_len, stdin);
             write(sock, buf, strlen(buf));
-        }
+        }        
     }
 
     close(sock);
-
     return 0;
 }
 
@@ -166,7 +165,6 @@ int input_send_privacy(int sock){
         }
     }
     privacy[13] = '\0';
-    printf("\n");
 
     if(err != 0){ // Make hash and write
         SHA256_Init(&sha256);
