@@ -25,7 +25,7 @@ char *get_privacy(int client_fd);
 int check_database(char *hash);
 void send_question(int client_fd, char *hash);
 void send_append_question(int client_fd, char *hash);
-char *studying(char *hash);
+void some_function(int client_fd, char *hash);
 void close_child(int sema_id, shm_mem *shared);
 
 void getsem(int semid);
@@ -72,7 +72,7 @@ int main(){
     // set sever_addr
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    server_addr.sin_port = htons(15100);
+    server_addr.sin_port = htons(15000);
 
     // bind()
     if(bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) == -1){ 
@@ -127,7 +127,7 @@ int main(){
                 break;
             }
         }
-printf("0\n");
+
         // accept
         len = sizeof(client_addr);
         client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &len);
@@ -140,29 +140,29 @@ printf("0\n");
         if(client_pid[pid_num] == -1){
             if((client_pid[pid_num] = fork()) == 0){ // child
                 close(server_fd);
-printf("1\n");
+
                 // semaphore 적용
                 getsem(sema_id);
                 shared->remain_num--;
                 returnsem(sema_id);
-printf("2\n");                
+
                 // 2
                 chk_ci = check_cipher(client_fd);
                 if(chk_ci == 0){
                     close_child(sema_id, shared);
                     exit(0);
                 }
-printf("3-bef\n");
+
                 // 3
                 hash_value = get_privacy(client_fd);
                 if(strncmp(hash_value, "fail", 4) == 0){
                     close_child(sema_id, shared);
                     exit(0);
                 }
-
+printf("done pri\n");
                 // 4, b 
                 in_database = check_database(hash_value);
-printf("data-%d\n", in_database);
+printf("done data\n");
                 if(in_database == 1){
                     int appen;
                     sprintf(buf, "If you want new one, type 1 / If you want to append, type 2 : ");
@@ -177,13 +177,17 @@ printf("data-%d\n", in_database);
                     else perror("Error about : ");
                 }
                 else send_question(client_fd, hash_value); // 5
+printf("done send ques\n");
 
                 // 6
-                result = studying(hash_value);
-                write(client_fd, result, strlen(result));
-                
+                some_function(client_fd, hash_value);
+printf("done result func\n");
+
+                free(hash_value);
+                free(result);
                 close(client_fd);   
                 close_child(sema_id, shared);
+printf("done\n");
                 exit(0);
             }
             pid_num++;
@@ -263,7 +267,6 @@ int check_database(char *privacy){
 
     while(read(database_r_fd, buf, 65) > 60){ 
         buf[64] = '\0';
-        printf("%s\n",buf);
         if(strcmp(buf, privacy) == 0){ // exist
             close(database_r_fd);
             return 1;
@@ -301,18 +304,23 @@ void send_question(int client_fd, char *hash){
     FILE* ques_fd;
     FILE* respon_fd;
     char buf[Buf_len], filename[50];
+    int i, l, ques_num;
 
     ques_fd = fopen("question.txt", "r");
     sprintf(filename, "%s_respond.txt", hash);
     const char *tmp = filename;
     respon_fd = fopen(tmp, "w"); // RESPOND FILE VERSION 관리 CODE++
-    while(!feof(ques_fd)){
+    l = 0;
+    ques_num = 5;
+    while(l < ques_num){
         fgets(buf, Buf_len, ques_fd);
         buf[strlen(buf) - 1] = '\0';
-printf("%s\n", buf);
         write(client_fd, buf, strlen(buf));
-        read(client_fd, buf, Buf_len); // Question에 대한 답 얻기
+
+        i = read(client_fd, buf, Buf_len); // Question에 대한 답 얻기
+        buf[i] = '\0';
         fputs(buf, respon_fd);
+        l++;
     }
 
     fclose(ques_fd);
@@ -323,32 +331,50 @@ void send_append_question(int client_fd, char *hash){
     FILE* app_fd;
     FILE* respon_fd;
     char buf[Buf_len], filename[50];
+    int i, l, ques_num;
 
     app_fd = fopen("append_question.txt", "r");
     sprintf(filename, "%s_app_res.txt", hash);
     const char *tmp = filename;
     respon_fd = fopen(tmp, "a"); // APPEND FILE VERSTION 관리 CODE++
-    while(!feof(app_fd)){
+    l = 0;
+    ques_num = 5;
+    while(l < ques_num){
         fgets(buf, Buf_len, app_fd);
         buf[strlen(buf) - 1] = '\0';
-
         write(client_fd, buf, strlen(buf));
         
-        read(client_fd, buf, Buf_len); // Question에 대한 답 얻기
+        i = read(client_fd, buf, Buf_len); // Question에 대한 답 얻기
+        buf[i] = '\0';
         fputs(buf, respon_fd);
+        l++;
     }
 
     fclose(app_fd);
     fclose(respon_fd);
 }
 
-char *studying(char *hash){
-    char *result;
-    
-    // something result function do
-    sprintf(result, "result : ~~~~~~");
+void some_function(int client_fd, char *hash){
+    FILE* app_fd;
+    FILE* respon_fd;
+    char result[50], filename[50];
 
-    return result;
+    // hash's respond data
+    sprintf(filename, "%s_respond.txt", hash);
+    const char *tmp1 = filename;
+    respon_fd = fopen(tmp1, "r");
+
+    // hash's append_respond data
+    sprintf(filename, "%s_app_res.txt", hash);
+    const char *tmp2 = filename;
+    app_fd = fopen(tmp2, "r");
+
+    // result function do something by using data
+    strcpy(result, "result : ~~~~~~~~");
+    write(client_fd, result, strlen(result));
+
+    fclose(respon_fd);
+    if(app_fd != NULL) fclose(app_fd);
 }
 
 void close_child(int sema_id, shm_mem *shared){

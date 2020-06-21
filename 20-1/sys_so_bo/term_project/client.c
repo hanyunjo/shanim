@@ -30,7 +30,7 @@ int main(){
     memset(&server_addr, 0, sizeof(server_addr));
 
     server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(15100);
+    server_addr.sin_port = htons(15000);
     server_addr.sin_addr.s_addr = inet_addr("10.178.0.2");
     // = inet_pton( AF_INET, "34.64.182.41", &server_addr.sin_addr.s_addr );
 
@@ -38,7 +38,7 @@ int main(){
         printf("failed connect func\n");
         exit(0);
     }
-printf("1\n");
+
     while((i = read(sock, buf, Buf_len)) > 0){
         buf[i] = '\0';
         if(strncmp(buf, "Check", 5) == 0){ // 2
@@ -55,26 +55,25 @@ printf("1\n");
         else if(strncmp(buf, "Input", 5) == 0){ // 3
             printf("%s", buf);
             err = input_send_privacy(sock);
-printf("send privacy done\n");
             if(err == 0) break;
         }
         else if(strncmp(buf, "If", 2) == 0){ // b
             printf("%s\n", buf);
-            fgets(buf, Buf_len, stdin);
+            while(1){
+                fgets(buf, Buf_len, stdin);
+                if((int)buf[0] == '1' || (int)buf[0] == '2') break;
+                else printf("Only input 1 or 2\n");
+            }
             buf[1] = '\0';
             write(sock, buf, strlen(buf));
-printf("%s - b done\n", buf);
         }
-        else if(strncmp(buf, "result", 5) == 0){ // 6
-            i = read(sock, buf, Buf_len);
-            buf[i] = '\0';
+        else if(strncmp(buf, "result", 6) == 0){ // 6
             printf("%s\n", buf);
             break;
         }
         else{ // 5 / c
             printf("%s\n", buf);
             fgets(buf, Buf_len, stdin);
-            buf[strlen(buf)-1] = '\0';
             write(sock, buf, strlen(buf));
         }
     }
@@ -142,7 +141,6 @@ int input_send_privacy(int sock){
             i = -1;
         }
         else if((int)privacy[i] == 127){
-            err--;
             i = -1;
         }
         else if(i == 6){
@@ -168,6 +166,7 @@ int input_send_privacy(int sock){
         }
     }
     privacy[13] = '\0';
+    printf("\n");
 
     if(err != 0){ // Make hash and write
         SHA256_Init(&sha256);
