@@ -13,37 +13,35 @@ import java.security.KeyPairGenerator;
 import java.security.spec.RSAPrivateKeySpec;
 import java.security.spec.RSAPublicKeySpec;
 
-import java.util.Base64;
 import javax.crypto.Cipher;
 import javax.crypto.spec.IvParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 
 import java.util.Date;
+import java.text.SimpleDateFormat;
+import java.util.Base64;
 import java.util.Base64.Decoder;
 import java.util.Base64.Encoder;
-import java.text.SimpleDateFormat;
 
-public class Mainserver {	
-	private static Key publickey;
-	private static String strPublickey;
-	private static Key privatekey;
-	private static SecretKeySpec secretkeySpec;
-	private static IvParameterSpec iv;
+public class Mainserver {
+	RSA rsaOBJ;	
+	AES aesOBJ;
 
 	public static void main(String[] args) throws Exception {
 		try {
-			ServerSocket ser_sock = new ServerSocket(9506);
-			Socket cli_sock = ser_sock.accept();
-			
-			RSA rsaOBJ = new RSA();
-			AES aesOBJ = new AES();
+			ServerSocket ser_sock = new ServerSocket(9506);			
+			rsaOBJ = new RSA();
+			aesOBJ = new AES();
 			
 			rsaOBJ.creatKeyPair(); // 1. Create RSA Key Pair(2048bit)
 			
-			Receivethread rec_thread = new Receivethread(rsaOBJ.getprivatekey(), sharedDATA);
+			Socket cli_sock = ser_sock.accept();
+
+			Receivethread rec_thread = new Receivethread();
 			rec_thread.setSocket(cli_sock);
 			rec_thread.start();
 			
+			// send_thread
 			try {
 				BufferedReader tmpbuf = new BufferedReader(new InputStreamReader(System.in));
 				PrintWriter sendwriter = new PrintWriter(cli_sock.getOutputStream());
@@ -51,31 +49,23 @@ public class Mainserver {
 				int out = 0;
 				
 				synchronized(rec_thread) { // 2. Send Pulickey
-					sendstr = rsaOBJ.getStrPublickey();
+					sendstr = rsaOBJ.strPublickey;
 					sendwriter.println(sendstr);
 					sendwriter.flush();
-					rec_thread.notify();
-					rec_thread.wait();
-					aesOBJ.setSecretKeySpec(sharedDATA.getSecretKeySpec());
-					aesOBJ.setIvParameterSpec(sharedDATA.getIvParameterSpec());
+					rec_thread.notify(); 
+					rec_thread.wait(); ////////////1
 				}
 			
 				while(true) {
 					sendstr = tmpbuf.readLine();
-					if(sendstr.equals("exit")) {
-						out = 1;
-					}
 					
 					// 4-2. Make timestamp and Send encrypted data 
 					timestamp = new SimpleDateFormat("[yyyy/MM/dd HH:mm:ss]").format(new Date());
-					sendstr = sendstr + timestamp;
+					sendstr = "\"" + sendstr + "\"" + timestamp;
 					
 					sendstr = aesOBJ.encrypt(sendstr);
 					sendwriter.println(sendstr);
 					sendwriter.flush();
-					if(out == 1) {
-						break;
-					}
 				}
 				
 			} catch(IOException e) {
@@ -86,7 +76,6 @@ public class Mainserver {
 			
 			System.out.println("Connection closed");
 			ser_sock.close();
-			cli_sock.close();
 		} catch(IOException e) {
 			e.printStackTrace();
 		}
@@ -99,7 +88,7 @@ public class Mainserver {
 		public void run() {
 			super.run();
 			try {
-				BufferedReader tmpbuf = new BufferedReader(new InputStreamReader(System.in));
+				BufferedReader tmpbuf = new BufferedReader(new InputStreamReader(sock.getInputStream()));
 				String receivestr;
 				
 				RSA rsaOBJ = new RSA();
@@ -109,7 +98,7 @@ public class Mainserver {
 				
 				synchronized(this) { // 3 Take encrypted AES key and print decrypted AES key 
 					wait(3);
-					receivestr = tmpbuf.readLine();
+					receivestr = tmpbuf.readLine(); ////////////2
 					System.out.println("Received AES key : " + receivestr);
 					System.out.println("Decrypted AES key : "+ rsaOBJ.decrypt(receivestr));
 					sha_data.setSecretKeySpec(rsaOBJ.decrypt(receivestr));
@@ -120,14 +109,19 @@ public class Mainserver {
 				while(true) {
 					receivestr = tmpbuf.readLine();
 					
-					// 4-1. Print data and Print decrypted data 
-					System.out.println("Received : " + receivestr);
-					System.out.println("Encrypted Message : " + aesOBJ.encrypt(receivestr));
+					if(receivestring != null){
+						// 4-1. Print data and Print decrypted data 
+						System.out.println("Received : " + receivestr);
+						System.out.println("Encrypted Message : " + aesOBJ.encrypt(receivestr));
+					}
 					
-					if(receivestr.equals("exit")) {
+					if(receivestr.substring(1,4).equals("exit")) {
 						break;
 					}
 				}
+
+				tmpbuf.close();
+                sock.close();
 			} catch(IOException e) {
 				e.printStackTrace();
 			} catch (Exception e) {
@@ -141,6 +135,11 @@ public class Mainserver {
 	}
 	
 	class RSA{
+		Key publickey;
+		String strPublickey;
+		Key privatekey;
+		String strPrivatekey;
+
 		public void creatKeyPair() throws Exception {
 			System.out.println("Creating RSA key pair");
 			
@@ -152,10 +151,10 @@ public class Mainserver {
 			this.privatekey = keypair.getPrivate();
 			
 			this.strPublickey = Base64.getEncoder().encodeToString(this.publickey.getEncoded());
-			String strPrivatekey = Base64.getEncoder().encodeToString(this.privatekey.getEncoded());
+			this.strPrivatekey = Base64.getEncoder().encodeToString(this.privatekey.getEncoded());
 			
 			System.out.println("PublicKey : " + this.strPublickey);
-			System.out.println("PrivateKey : " + strPrivatekey);	
+			System.out.println("PrivateKey : " + this.strPrivatekey);	
 		}
 		
 		public String encrypt (String plainStr) throws Exception {
@@ -179,6 +178,9 @@ public class Mainserver {
 	}
 	
 	class AES{	
+		SecretKeySpec secretkeySpec;
+		IvParameterSpec iv;
+
 		public String Encrypt(String plainStr) throws Exception {
 			Cipher cipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
 			cipher.init(Cipher.ENCRYPT_MODE, secretkeySpec, this.iv);
@@ -198,21 +200,3 @@ public class Mainserver {
 		}
 	}
 }
-/*
-class SharedData{
-	private SecretKeySpec secretkeySpec;
-	private IvParameterSpec iv;
-	
-	public void setSecretKeySpec(SecretKeySpec secretkeySpec) {
-		this.secretkeySpec = secretkeySpec;
-	}
-	public void setIvParameterSpec(IvParameterSpec iv) {
-		this.iv = iv;
-	}
-	public SecretKeySpec getSecretKeySpec() {
-		return this.secretkeySpec;
-	}
-	public IvParameterSpec getIvParameterSpec() {
-		return this.iv;
-	}
-}*/
