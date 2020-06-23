@@ -24,6 +24,12 @@ import java.util.Base64.Encoder;
 import java.text.SimpleDateFormat;
 
 public class Mainserver {	
+	private static Key publickey;
+	private static String strPublickey;
+	private static Key privatekey;
+	private static SecretKeySpec secretkeySpec;
+	private static IvParameterSpec iv;
+
 	public static void main(String[] args) throws Exception {
 		try {
 			ServerSocket ser_sock = new ServerSocket(9506);
@@ -31,7 +37,6 @@ public class Mainserver {
 			
 			RSA rsaOBJ = new RSA();
 			AES aesOBJ = new AES();
-			SharedData sharedDATA = new SharedData();
 			
 			rsaOBJ.creatKeyPair(); // 1. Create RSA Key Pair(2048bit)
 			
@@ -86,8 +91,114 @@ public class Mainserver {
 			e.printStackTrace();
 		}
 	}
-}
 
+	class Receivethread extends Thread{
+		private Socket sock;
+		
+		@Override
+		public void run() {
+			super.run();
+			try {
+				BufferedReader tmpbuf = new BufferedReader(new InputStreamReader(System.in));
+				String receivestr;
+				
+				RSA rsaOBJ = new RSA();
+				AES aesOBJ = new AES();
+				
+				rsaOBJ.setprivatekey(this.privatekey);
+				
+				synchronized(this) { // 3 Take encrypted AES key and print decrypted AES key 
+					wait(3);
+					receivestr = tmpbuf.readLine();
+					System.out.println("Received AES key : " + receivestr);
+					System.out.println("Decrypted AES key : "+ rsaOBJ.decrypt(receivestr));
+					sha_data.setSecretKeySpec(rsaOBJ.decrypt(receivestr));
+					sha_data.setIvParameterSpec(rsaOBJ.decrypt(receivestr));
+					notify();
+				}
+				
+				while(true) {
+					receivestr = tmpbuf.readLine();
+					
+					// 4-1. Print data and Print decrypted data 
+					System.out.println("Received : " + receivestr);
+					System.out.println("Encrypted Message : " + aesOBJ.encrypt(receivestr));
+					
+					if(receivestr.equals("exit")) {
+						break;
+					}
+				}
+			} catch(IOException e) {
+				e.printStackTrace();
+			} catch (Exception e) {
+				e.printStackTrace();
+			}
+		}
+		
+		public void setSocket(Socket sock) {
+			this.sock = sock;
+		}	
+	}
+	
+	class RSA{
+		public void creatKeyPair() throws Exception {
+			System.out.println("Creating RSA key pair");
+			
+			KeyPairGenerator keypairgenerator = KeyPairGenerator.getInstance("RSA");
+			keypairgenerator.initialize(2048);
+				
+			KeyPair keypair = keypairgenerator.genKeyPair();
+			this.publickey = keypair.getPublic();
+			this.privatekey = keypair.getPrivate();
+			
+			this.strPublickey = Base64.getEncoder().encodeToString(this.publickey.getEncoded());
+			String strPrivatekey = Base64.getEncoder().encodeToString(this.privatekey.getEncoded());
+			
+			System.out.println("PublicKey : " + this.strPublickey);
+			System.out.println("PrivateKey : " + strPrivatekey);	
+		}
+		
+		public String encrypt (String plainStr) throws Exception {
+			Cipher cipher = Cipher.getInstance("RSA");
+			cipher.init(Cipher.ENCRYPT_MODE, this.publickey);
+			byte[] plainByte = cipher.doFinal(plainStr.getBytes());
+			String encryptedStr = Base64.getEncoder().encodeToString(plainByte);
+			
+			return encryptedStr;
+		}
+		 
+		public String decrypt (String encryptedStr) throws Exception {
+			Cipher cipher = Cipher.getInstance("RSA");
+			cipher.init(Cipher.DECRYPT_MODE, this.privatekey);
+			byte[] encryptedByte = Base64.getDecoder().decode(encryptedStr.getBytes());
+			byte[] plainByte = cipher.doFinal(encryptedByte);
+			String decryptedStr = new String(plainByte, "utf-8");
+			
+			return decryptedStr;
+		}
+	}
+	
+	class AES{	
+		public String Encrypt(String plainStr) throws Exception {
+			Cipher cipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
+			cipher.init(Cipher.ENCRYPT_MODE, secretkeySpec, this.iv);
+			byte[] encryptedByte = cipher.doFinal(plainStr.getBytes());
+			String encryptedStr = new String(encryptedByte);
+			
+			return encryptedStr;
+		}
+		
+		public String Decrpyt(String encryptedStr) throws Exception {
+			Cipher cipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
+			cipher.init(Cipher.DECRYPT_MODE, secretkeySpec, this.iv);
+			byte[] decryptedByte = cipher.doFinal(encryptedStr.getBytes());
+			String decryptedStr = new String(decryptedByte);
+			
+			return decryptedStr;
+		}
+	}
+}
+/*
 class SharedData{
 	private SecretKeySpec secretkeySpec;
 	private IvParameterSpec iv;
@@ -104,153 +215,4 @@ class SharedData{
 	public IvParameterSpec getIvParameterSpec() {
 		return this.iv;
 	}
-}
-
-class Receivethread extends Thread{
-	private Socket sock;
-	private Key privatekey;
-	private SharedData sha_data;
-	
-	public Receivethread(Key para1, SharedData sha_data) {
-		this.privatekey = para1;
-		this.sha_data = sha_data;
-	}
-	
-	@Override
-	public void run() {
-		super.run();
-		try {
-			BufferedReader tmpbuf = new BufferedReader(new InputStreamReader(System.in));
-			String receivestr;
-			
-			RSA rsaOBJ = new RSA();
-			AES aesOBJ = new AES();
-			
-			rsaOBJ.setprivatekey(this.privatekey);
-			
-			synchronized(this) { // 3 Take encrypted AES key and print decrypted AES key 
-				wait(3);
-				receivestr = tmpbuf.readLine();
-				System.out.println("Received AES key : " + receivestr);
-				System.out.println("Decrypted AES key : "+ rsaOBJ.decrypt(receivestr));
-				sha_data.setSecretKeySpec(rsaOBJ.decrypt(receivestr));
-				sha_data.setIvParameterSpec(rsaOBJ.decrypt(receivestr));
-				notify();
-			}
-			
-			while(true) {
-				receivestr = tmpbuf.readLine();
-				
-				// 4-1. Print data and Print decrypted data 
-				System.out.println("Received : " + receivestr);
-				System.out.println("Encrypted Message : " + aesOBJ.encrypt(receivestr));
-				
-				if(receivestr.equals("exit")) {
-					break;
-				}
-			}
-		} catch(IOException e) {
-			e.printStackTrace();
-		} catch (Exception e) {
-			e.printStackTrace();
-		}
-	}
-	
-	public void setSocket(Socket sock) {
-		this.sock = sock;
-	}	
-}
-
-class RSA{
-	private Key publickey;
-	private Key privatekey;
-	private String strPublickey;
-	
-	//RSA
-	public void creatKeyPair() throws Exception {
-		System.out.println("Creating RSA key pair");
-		
-		KeyPairGenerator keypairgenerator = KeyPairGenerator.getInstance("RSA");
-		keypairgenerator.initialize(2048);
-			
-		KeyPair keypair = keypairgenerator.genKeyPair();
-		this.publickey = keypair.getPublic();
-		this.privatekey = keypair.getPrivate();
-		
-		this.strPublickey = Base64.getEncoder().encodeToString(this.publickey.getEncoded());
-		String strPrivatekey = Base64.getEncoder().encodeToString(this.privatekey.getEncoded());
-		
-		System.out.println("PublicKey : " + this.strPublickey);
-		System.out.println("PrivateKey : " + strPrivatekey);	
-	}
-	
-	public String encrypt (String plainStr) throws Exception {
-        Cipher cipher = Cipher.getInstance("RSA");
-        cipher.init(Cipher.ENCRYPT_MODE, this.publickey);
-        byte[] plainByte = cipher.doFinal(plainStr.getBytes());
-        String encryptedStr = Base64.getEncoder().encodeToString(plainByte);
-        
-        return encryptedStr;
-    }
-     
-    public String decrypt (String encryptedStr) throws Exception {
-        Cipher cipher = Cipher.getInstance("RSA");
-        cipher.init(Cipher.DECRYPT_MODE, this.privatekey);
-        byte[] encryptedByte = Base64.getDecoder().decode(encryptedStr.getBytes());
-        byte[] plainByte = cipher.doFinal(encryptedByte);
-        String decryptedStr = new String(plainByte, "utf-8");
-        
-        return decryptedStr;
-    }
-	
-	public Key getpublickey() {
-		return this.publickey;
-	}
-	
-	public Key getprivatekey() {
-		return this.privatekey;
-	}
-	
-	public String getStrPublickey() {
-		return this.strPublickey;
-	}
-	
-	public void setpublickey(Key pub) {
-		this.publickey = pub;
-	}
-	
-	public void setprivatekey(Key pri) {
-		this.privatekey = pri;
-	}
-}
-
-class AES{
-	private SecretKeySpec secretkeySpec;
-	private IvParameterSpec iv;
-
-	public String Encrypt(String plainStr) throws Exception {
-		Cipher cipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
-		cipher.init(Cipher.ENCRYPT_MODE, secretkeySpec, this.iv);
-		byte[] encryptedByte = cipher.doFinal(plainStr.getBytes());
-		String encryptedStr = new String(encryptedByte);
-		
-		return encryptedStr;
-	}
-	
-	public String Decrpyt(String encryptedStr) throws Exception {
-		Cipher cipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
-		cipher.init(Cipher.DECRYPT_MODE, secretkeySpec, this.iv);
-		byte[] decryptedByte = cipher.doFinal(encryptedStr.getBytes());
-		String decryptedStr = new String(decryptedByte);
-		
-		return decryptedStr;
-	}
-		
-	public void setSecretKeySpec(SecretKeySpec secretKeySpec) {
-		this.secretkeySpec = secretKeySpec;
-	}
-	
-	public void setIvParameterSpec(IvParameterSpec iv) {
-		this.iv = iv;
-	}
-}
+}*/
