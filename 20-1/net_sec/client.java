@@ -26,7 +26,7 @@ public class Mainclient {
             rsaOBJ = new RSA();
             			
 			BufferedReader tmpbuf = new BufferedReader(new InputStreamReader(System.in));
-			String receivestring;
+			String receivestr;
 			
 			Sendthread sen_thread = new Sendthread();
 			sen_thread.setSocket(sock);
@@ -34,20 +34,21 @@ public class Mainclient {
             
             // receive_thread
 			synchronized(sen_thread) {
-				receivestring = tmpbuf.readLine();
-                System.out.printf("Received Public Key : " + receivestring);
-                rsaOBJ.publickey = Base64.getDecoder().decode(receivestring);
+				receivestr = tmpbuf.readLine();
+                System.out.printf("Received Public Key : " + receivestr);
+                //rsaOBJ.publickey = Base64.getDecoder().decode(receivestr);
+                rsaOBJ.publickey = receivestr.getBytes();
 				aesOBJ.createSecretkey();
 				sen_thread.notify(); ////////////3
 			}
 			
 			try {				
 				while(true) {
-                    receivestring = tmpbuf.readLine();
+                    receivestr = tmpbuf.readLine();
 
-                    if(receivestring != null){
-                        System.out.println("Received : " + aesOBJ.Decrpyt(receivestring));
-                        System.out.println("Encrypted Message : " + receivestring);
+                    if(receivestr != null){
+                        System.out.println("Received : " + aesOBJ.Decrpyt(receivestr));
+                        System.out.println("Encrypted Message : " + receivestr);
                     }
 
                     if(receivestr.substring(1,4).equals("exit")) {
@@ -79,7 +80,6 @@ public class Mainclient {
                 PrintWriter sendwriter = new PrintWriter(sock.getOutputStream());
                 String sendstr, timestamp;
                 
-                // Receive Public key
                 synchronized(this) {
                     wait(3);
                     sendstr = rsaOBJ.Encrypt(aesOBJ.secretkeySpec);
@@ -138,7 +138,7 @@ public class Mainclient {
             Cipher cipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
             cipher.init(Cipher.ENCRYPT_MODE, secretkeySpec, this.iv);
             byte[] encryptedByte = cipher.doFinal(plainStr.getBytes());
-            String encryptedStr = new String(encryptedByte);
+            String encryptedStr = new String(encryptedByte, "utf-8");
             
             return encryptedStr;
         }
@@ -147,7 +147,7 @@ public class Mainclient {
             Cipher cipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
             cipher.init(Cipher.DECRYPT_MODE, secretkeySpec, this.iv);
             byte[] decryptedByte = cipher.doFinal(encryptedStr.getBytes());
-            String decryptedStr = new String(decryptedByte);
+            String decryptedStr = new String(decryptedByte, "utf-8");
             
             return decryptedStr;
         }

@@ -100,9 +100,11 @@ public class Mainserver {
 					wait(3);
 					receivestr = tmpbuf.readLine(); ////////////2
 					System.out.println("Received AES key : " + receivestr);
-					System.out.println("Decrypted AES key : "+ rsaOBJ.decrypt(receivestr));
-					sha_data.setSecretKeySpec(rsaOBJ.decrypt(receivestr));
-					sha_data.setIvParameterSpec(rsaOBJ.decrypt(receivestr));
+					String[] tmpstr = rsaOBJ.decrypt(receivestr).split(" ");
+					System.out.println("Decrypted AES key : " + tmpstr[0]);
+					System.out.println("Decrypted IV : " + tmpstr[1]);
+					aesOBJ.secretkeySpec = aesOBJ.decrypt(tmpstr[0]).getBytes();
+					aesOBJ.iv = aesOBJ.decrypt(tmpstr[1]).getBytes();
 					notify();
 				}
 				
@@ -150,27 +152,19 @@ public class Mainserver {
 			this.publickey = keypair.getPublic();
 			this.privatekey = keypair.getPrivate();
 			
-			this.strPublickey = Base64.getEncoder().encodeToString(this.publickey.getEncoded());
-			this.strPrivatekey = Base64.getEncoder().encodeToString(this.privatekey.getEncoded());
+			//this.strPublickey = Base64.getEncoder().encodeToString(this.publickey.getEncoded());
+			//this.strPrivatekey = Base64.getEncoder().encodeToString(this.privatekey.getEncoded());
+			this.strPublickey = new String(publickey.getBytes(), "utf-8");
+			this.strPrivatekey = new String(publickey.getBytes(), "utf-8");
 			
 			System.out.println("PublicKey : " + this.strPublickey);
 			System.out.println("PrivateKey : " + this.strPrivatekey);	
 		}
-		
-		public String encrypt (String plainStr) throws Exception {
-			Cipher cipher = Cipher.getInstance("RSA");
-			cipher.init(Cipher.ENCRYPT_MODE, this.publickey);
-			byte[] plainByte = cipher.doFinal(plainStr.getBytes());
-			String encryptedStr = Base64.getEncoder().encodeToString(plainByte);
-			
-			return encryptedStr;
-		}
 		 
-		public String decrypt (String encryptedStr) throws Exception {
+		public String Decrypt (String encryptedStr) throws Exception {
 			Cipher cipher = Cipher.getInstance("RSA");
 			cipher.init(Cipher.DECRYPT_MODE, this.privatekey);
-			byte[] encryptedByte = Base64.getDecoder().decode(encryptedStr.getBytes());
-			byte[] plainByte = cipher.doFinal(encryptedByte);
+			byte[] plainByte = cipher.doFinal(encryptedStr.getBytes());
 			String decryptedStr = new String(plainByte, "utf-8");
 			
 			return decryptedStr;
@@ -185,7 +179,7 @@ public class Mainserver {
 			Cipher cipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
 			cipher.init(Cipher.ENCRYPT_MODE, secretkeySpec, this.iv);
 			byte[] encryptedByte = cipher.doFinal(plainStr.getBytes());
-			String encryptedStr = new String(encryptedByte);
+			String encryptedStr = new String(encryptedByte, "utf-8");
 			
 			return encryptedStr;
 		}
@@ -194,7 +188,7 @@ public class Mainserver {
 			Cipher cipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
 			cipher.init(Cipher.DECRYPT_MODE, secretkeySpec, this.iv);
 			byte[] decryptedByte = cipher.doFinal(encryptedStr.getBytes());
-			String decryptedStr = new String(decryptedByte);
+			String decryptedStr = new String(decryptedByte, "utf-8");
 			
 			return decryptedStr;
 		}
