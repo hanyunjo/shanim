@@ -44,7 +44,7 @@ import java.text.SimpleDateFormat;
 			/*sendWriter.println(Base64.getEncoder().encodeToString(publickey.getEncoded()));
 			sendWriter.flush();*/
 			
-			// receive privatekey and iv
+			/*// receive privatekey and iv
 			receivestr = receivebuf.readLine();
 			System.out.println("Received AES key : " + receivestr);
 			SecretKey secretkey = new SecretKeySpec(rsaDecrypt(privatekey, Base64.getDecoder().decode(receivestr)), 0, rsaDecrypt(privatekey, Base64.getDecoder().decode(receivestr)).length, "AES");
@@ -53,24 +53,24 @@ import java.text.SimpleDateFormat;
 			receivestr = receivebuf.readLine();
 			System.out.println("Received IV : " + receivestr);
 			IvParameterSpec iv = new IvParameterSpec(rsaDecrypt(privatekey, Base64.getDecoder().decode(receivestr)));
-			System.out.println("Decrypted IV : "+ Base64.getEncoder().encodeToString(iv.getIV()));			
+			System.out.println("Decrypted IV : "+ Base64.getEncoder().encodeToString(iv.getIV()));	*/		
 			
-			// start send & receive thread
+			/*// start send & receive thread
 			Receivethread rec_thread = new Receivethread(ser_sock, cli_sock, receivebuf, secretkey, iv);
 			Sendthread sen_thread = new Sendthread(secretkey, iv, sendWriter);
 			rec_thread.start();
 			sen_thread.start();	
 		} catch(IOException e) {
 			e.printStackTrace();
-		}
+		}*/
     }
     
-    public static byte[] rsaDecrypt (PrivateKey privateKey, byte[] encryptedByte) throws Exception {
+    /*public static byte[] rsaDecrypt (PrivateKey privateKey, byte[] encryptedByte) throws Exception {
         Cipher cipher = Cipher.getInstance("RSA");
         cipher.init(Cipher.DECRYPT_MODE, privateKey);
         byte[] plainByte = cipher.doFinal(encryptedByte);
         return plainByte;
-    }
+    }*/
 }
 
 /*class Receivethread extends Thread{

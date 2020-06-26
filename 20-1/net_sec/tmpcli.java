@@ -21,11 +21,11 @@ import java.security.PublicKey;
 			
 			// receive publickey
 			receivestr = receivebuf.readLine();*/
-			System.out.println("Received PublicKey : " + receivestr);
+			/*System.out.println("Received PublicKey : " + receivestr);
 			KeyFactory keyfactory = KeyFactory.getInstance("RSA");
-			PublicKey publickey = keyfactory.generatePublic(new X509EncodedKeySpec(Base64.getDecoder().decode(receivestr)));
+			PublicKey publickey = keyfactory.generatePublic(new X509EncodedKeySpec(Base64.getDecoder().decode(receivestr)));*/
 			
-			//produce secretkey
+			/*//produce secretkey
         	System.out.println("Creating AES 256 Key");
         	KeyGenerator keygenerator = KeyGenerator.getInstance("AES");
         	keygenerator.init(256);
@@ -34,22 +34,22 @@ import java.security.PublicKey;
         	// produce IV
         	String ivStr = new String(secretkey.getEncoded(), "UTF-8").substring(0,16);
         	IvParameterSpec iv = new IvParameterSpec(ivStr.getBytes());
-        	byte[] ivByte = iv.getIV();
+        	byte[] ivByte = iv.getIV();*/
 			
-        	// send encrypted secretkey and iv
+        	/*// send encrypted secretkey and iv
         	sendstr = new String(rsaEncrypt(publickey, secretkey.getEncoded()), "UTF-8");
         	System.out.println("AES 256 Key : " + Base64.getEncoder().encodeToString(secretkey.getEncoded()));
-        	sendstr = Base64.getEncoder().encodeToString(rsaEncrypt(publickey, secretkey.getEncoded()));
+//        	sendstr = Base64.getEncoder().encodeToString(rsaEncrypt(publickey, secretkey.getEncoded()));
         	System.out.println("Encrypted AES Key : " + sendstr);
         	sendWriter.println(sendstr);
         	sendWriter.flush();
         	
         	sendstr = new String(rsaEncrypt(publickey, ivByte), "UTF-8");
         	System.out.println("IV : " + Base64.getEncoder().encodeToString(ivByte));
-        	sendstr = Base64.getEncoder().encodeToString(rsaEncrypt(publickey, ivByte));
+        	//sendstr = Base64.getEncoder().encodeToString(rsaEncrypt(publickey, ivByte));
         	System.out.println("Encrypted IV : " + sendstr);
         	sendWriter.println(sendstr);
-			sendWriter.flush();
+			sendWriter.flush();*/
 			
 			// start send & receive thread
 			/*CliReceivethread rec_thread = new CliReceivethread(receivebuf, secretkey, iv);
@@ -72,12 +72,12 @@ import java.security.PublicKey;
         } 
     }*/
  	
- 	public static byte[] rsaEncrypt (PublicKey publickey, byte[] plainByte) throws Exception {
+ 	/*public static byte[] rsaEncrypt (PublicKey publickey, byte[] plainByte) throws Exception {
         Cipher cipher = Cipher.getInstance("RSA");
         cipher.init(Cipher.ENCRYPT_MODE, publickey);
         byte[] encryptedByte = cipher.doFinal(plainByte);
         return encryptedByte;
-    }
+    }*/
  	
  	public static byte[] aesEncrypt(SecretKey secretkey, IvParameterSpec iv, byte[] plainByte) throws Exception {
 		Cipher cipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
