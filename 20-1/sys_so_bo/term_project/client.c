@@ -143,9 +143,9 @@ int input_send_privacy(int sock){
             i = -1;
         }
         else if(i == 6){
-            if(!((int)privacy[6] == '1' || (int)privacy[6] == '2' || (int)privacy[6] == '3' || (int)privacy[6] == '4') && err == 2){
+            if(!((int)privacy[6] == '1' || (int)privacy[6] == '2' || (int)privacy[6] == '3' || (int)privacy[6] == '4')){
                 printf("First number of back part is incorrect.\n");
-                printf("Input : ");
+                if(err == 2) printf("Input : ");
                 i = -1;
                 err--;
             }
@@ -165,6 +165,7 @@ int input_send_privacy(int sock){
         }
     }
     privacy[13] = '\0';
+    printf("\n");
 
     if(err != 0){ // Make hash and write
         SHA256_Init(&sha256);
