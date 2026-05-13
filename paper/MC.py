@@ -35,7 +35,7 @@ def MC_BS_vanilla_gpu(eta, n_paths=1000, dt=0.001, type='call'):
 
 # 1-2) Heston
 def generate_heston_paths(eta, n_paths=2**10, dt=0.001):
-    r, lamb, v_bar, epsilon, rho, Y0, T = eta
+    S0, K, r, kappa, theta, xi, rho, Y0, T = eta
     n_steps = int(T / dt)
 
     W1 = np.random.randn(n_paths, n_steps)
@@ -52,9 +52,9 @@ def generate_heston_paths(eta, n_paths=2**10, dt=0.001):
         Y_t = np.maximum(Y[:, i], 0)
         X[:, i+1] = X[:, i] + (r - 0.5 * Y_t) * dt + np.sqrt(Y_t) * dWx[:, i]
         Y[:, i+1] = (Y_t
-                     + lamb * (v_bar - Y_t) * dt
-                     + epsilon * np.sqrt(Y_t) * dWy[:, i]
-                     + 0.25 * epsilon**2 * (dWy[:, i]**2 - dt))
+                     + kappa * (theta - Y_t) * dt
+                     + xi * np.sqrt(Y_t) * dWy[:, i]
+                     + 0.25 * xi**2 * (dWy[:, i]**2 - dt))
 
     XT = X[:, -1]
     YT = Y[:, -1]
@@ -70,7 +70,7 @@ def filter_paths(XT, T):
     return bool(check_mean and check_var)
 
 def generate_heston_paths_gpu(eta, n_paths=1000, dt=0.001):
-    r, lamb, v_bar, epsilon, rho, Y0, T = eta
+    S0, K, r, kappa, theta, xi, rho, Y0, T = eta
     n_steps = int(T / dt)
 
     W1 = cp.random.randn(n_paths, n_steps)
@@ -87,9 +87,9 @@ def generate_heston_paths_gpu(eta, n_paths=1000, dt=0.001):
         Y_t = cp.maximum(Y[:, i], 0)
         X[:, i+1] = X[:, i] + (r - 0.5 * Y_t) * dt + cp.sqrt(Y_t) * dWx[:, i]
         Y[:, i+1] = (Y_t
-                     + lamb * (v_bar - Y_t) * dt
-                     + epsilon * cp.sqrt(Y_t) * dWy[:, i]
-                     + 0.25 * epsilon**2 * (dWy[:, i]**2 - dt))
+                     + kappa * (theta - Y_t) * dt
+                     + xi * cp.sqrt(Y_t) * dWy[:, i]
+                     + 0.25 * xi**2 * (dWy[:, i]**2 - dt))
 
     XT = X[:, -1]
     YT = Y[:, -1]
@@ -97,8 +97,7 @@ def generate_heston_paths_gpu(eta, n_paths=1000, dt=0.001):
     return XT, YT, MT
 
 def MC_heston_vanilla_gpu(eta, n_paths=1000, dt=0.001, type='call'):
-    r, lamb, v_bar, epsilon, rho, Y0, T = eta
-    S0, K = 1.0, 1.0
+    S0, K, r, kappa, theta, xi, rho, Y0, T = eta
     XT, YT, MT = generate_heston_paths_gpu(eta, n_paths, dt)
 
     ST = S0 * cp.exp(XT)
@@ -112,8 +111,7 @@ def MC_heston_vanilla_gpu(eta, n_paths=1000, dt=0.001, type='call'):
 
 
 def MC_heston_vanilla_cpu(eta, n_paths=1000, dt=0.001, type='call'):
-    r, lamb, v_bar, epsilon, rho, Y0, T = eta
-    S0, K = 1.0, 1.0
+    S0, K, r, kappa, theta, xi, rho, Y0, T = eta
     XT, YT, MT, masks = generate_heston_paths(eta, n_paths, dt)
 
     ST = S0 * np.exp(XT)
@@ -135,7 +133,7 @@ def MC_heston_vanilla_cpu(eta, n_paths=1000, dt=0.001, type='call'):
 
 # 2) barrier 
 # 2-1) BS
-def MC_BS_barrier_gpu(eta, B, n_paths=2**14, dt=0.001, type='call'):
+def MC_BS_barrier_gpu(eta, B, n_paths=1000, dt=0.001, type='call'):
     S0, K, r, sigma, T = eta
     ST, MT = generate_BS_paths_gpu(eta, n_paths, dt)
 
@@ -148,9 +146,8 @@ def MC_BS_barrier_gpu(eta, B, n_paths=2**14, dt=0.001, type='call'):
     return price
 
 # 2-2) Heston
-def MC_heston_barrier_gpu(eta, B, n_paths=2**14, dt=0.001, type='call'):
-    r, lamb, v_bar, epsilon, rho, Y0, T = eta
-    S0, K = 1.0, 1.0
+def MC_heston_barrier_gpu(eta, B, n_paths=1000, dt=0.001, type='call'):
+    S0, K, r, kappa, theta, xi, rho, Y0, T = eta
     XT, YT, MT = generate_heston_paths_gpu(eta, n_paths, dt)
 
     ST   = S0 * cp.exp(XT)
