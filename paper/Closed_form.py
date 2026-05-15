@@ -43,8 +43,10 @@ def BS_barrier(eta, B, type='call'):
 
     coef1 = S0 * (B / S0)**(2 * lam)           
     coef2 = K * disc * (B / S0)**(2 * lam - 2) 
-    x1 = np.log(B**2 / (S0 * K)) / sqT + lam * sqT
+    x1 = np.log(B / S0) / sqT + lam * sqT
     x2 = x1 - sqT
+    y1 = np.log(B**2 / (S0 * K)) / sqT + lam * sqT
+    y2 = y1 - sqT
 
     if type == 'call':
         C_do = (vanilla_call() 
@@ -55,9 +57,6 @@ def BS_barrier(eta, B, type='call'):
     elif type == 'put':
         x_h1 = np.log(S0 / B) / sqT + lam * sqT
         x_h2 = x_h1 - sqT
-
-        y1 = np.log(B**2 / (S0 * K)) / sqT + lam * sqT
-        y2 = y1 - sqT
 
         P_do = (vanilla_put()
                 + S0 * norm.cdf(-x_h1) - K * disc * norm.cdf(-x_h2)

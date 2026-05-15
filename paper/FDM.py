@@ -372,7 +372,7 @@ def CN_BS_barrier(eta, type='call', B=0.8, S_max=4.0, dS=0.01, dt=0.01):
 
     # check payoff discountinuity, Rannacher: t_rannacher 스텝은 fully implicit
     has_discontinuity = (type == 'call' and K < B) or (type == 'put' and B < K)
-    t_rannacher = 30 if has_discontinuity else 0
+    t_rannacher = 4 if has_discontinuity else 0
 
     # payoff
     if type == 'call':
@@ -446,7 +446,7 @@ def CS_ADI_heston_barrier(eta, type='call', B=0.8, S_max=4.0, v_max=1.5, dS=0.01
     th = 0.5
     
     has_discontinuity = (type == 'call' and K < B) or (type == 'put' and B < K)
-    t_rannacher = 30 if has_discontinuity else 0
+    t_rannacher = 4 if has_discontinuity else 0
  
     S2D = S_grid[:, None] * np.ones((1, Nv))
     if type == 'call':
