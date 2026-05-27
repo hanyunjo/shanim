@@ -18,7 +18,7 @@ def generate_BS_paths_gpu(eta, n_paths=1000, dt=0.001, B=0):
     for i in range(n_steps):
         S[:, i+1] = S[:, i] * cp.exp((r - 0.5 * sigma**2) * dt + sigma * cp.sqrt(dt) * W[:, i])
 
-        # Brownian Bridge 보정
+        # reflection principel correction
         if B != 0:
             a = cp.log(S[:, i] / B)
             b = cp.log(S[:, i+1] / B)
@@ -54,7 +54,7 @@ def MC_BS_vanilla_gpu(eta, n_paths=1000, dt=0.001, type='call'):
 
 
 # 1-2) Heston
-def generate_heston_paths(eta, n_paths=2**10, dt=0.001, B=0):
+def generate_heston_paths(eta, B=0, n_paths=2**10, dt=0.001):
     S0, K, r, kappa, theta, xi, rho, Y0, T = eta
     n_steps = int(T / dt)
 
@@ -81,7 +81,7 @@ def generate_heston_paths(eta, n_paths=2**10, dt=0.001, B=0):
                      + xi * np.sqrt(Y_t) * dWy[:, i]
                      + 0.25 * xi**2 * (dWy[:, i]**2 - dt))
         
-        # Brownian Bridge 보정
+        # reflection principel correction
         if B != 0:
             a = log_S0B + X[:, i] 
             b = log_S0B + X[:, i+1]    
@@ -97,7 +97,7 @@ def generate_heston_paths(eta, n_paths=2**10, dt=0.001, B=0):
     if B != 0:
         knocked = knocked | (X.min(axis=1) <= np.log(B/S0))
     mask = filter_paths(XT, T)
-    return XT, YT, knocked, mask
+    return XT, knocked, mask
 
 # 연율화 수익률 평균/분산 필터링 (배치 전체 기준)
 def filter_paths(XT, T):
@@ -132,26 +132,26 @@ def generate_heston_paths_gpu(eta, n_paths=1000, dt=0.001, B=0):
                      + xi * cp.sqrt(Y_t) * dWy[:, i]
                      + 0.25 * xi**2 * (dWy[:, i]**2 - dt))
         
-        # Brownian Bridge 보정
+        # reflection principel correction
         if B != 0:
             a = log_S0B + X[:, i]      # X = ln(S_t/S0), a = ln(S_t/B)
             b = log_S0B + X[:, i+1]
             v_local = 0.5 * (Y_t + cp.maximum(Y[:, i+1], 0))
 
-            valid   = (a > 0) & (b > 0)  # 두 점 모두 barrier 위
-            p_cross = cp.where(valid, cp.exp(-2 * a * b / (v_local * dt + 1e-10)), 0.0) # 베리어 위에 두 점이 있을 때 베리어를 건드릴 확률
-            u = cp.random.uniform(size=n_paths) # 0~1사이의 랜덤 변수, 베르누이 시행
+            valid   = (a > 0) & (b > 0)  
+            p_cross = cp.where(valid, cp.exp(-2 * a * b / (v_local * dt + 1e-10)), 0.0)
+            u = cp.random.uniform(size=n_paths)
             knocked = knocked | (u < p_cross)
 
     XT = X[:, -1]
     YT = Y[:, -1]
     if B != 0:
         knocked = knocked | (X.min(axis=1) <= cp.log(B/S0))
-    return XT, YT, knocked
+    return XT, knocked
 
 def MC_heston_vanilla_cpu(eta, n_paths=1000, dt=0.001, type='call'):
     S0, K, r, kappa, theta, xi, rho, Y0, T = eta
-    XT, YT, MT, masks = generate_heston_paths(eta, n_paths, dt)
+    XT, MT, masks = generate_heston_paths(eta, n_paths, dt)
 
     ST = S0 * np.exp(XT)
 
@@ -164,7 +164,7 @@ def MC_heston_vanilla_cpu(eta, n_paths=1000, dt=0.001, type='call'):
 
 def MC_heston_vanilla_gpu(eta, n_paths=1000, dt=0.001, type='call'):
     S0, K, r, kappa, theta, xi, rho, Y0, T = eta
-    XT, YT, knocked = generate_heston_paths_gpu(eta, n_paths, dt)
+    XT, knocked = generate_heston_paths_gpu(eta, n_paths, dt)
 
     ST = S0 * cp.exp(XT)
 
@@ -203,7 +203,7 @@ def MC_BS_barrier_gpu(eta, B, n_paths=1000, dt=0.001, type='call'):
 # 2-2) Heston
 def MC_heston_barrier_gpu(eta, B, n_paths=1000, dt=0.001, type='call'):
     S0, K, r, kappa, theta, xi, rho, Y0, T = eta
-    XT, YT, knocked = generate_heston_paths_gpu(eta, n_paths, dt, B)
+    XT, knocked = generate_heston_paths_gpu(eta, n_paths, dt, B)
 
     ST   = S0 * cp.exp(XT)
     

@@ -1,0 +1,175 @@
+@startuml CVAE_full
+
+skinparam classAttributeIconSize 0
+skinparam classFontSize 12
+skinparam ArrowFontSize 10
+skinparam linetype ortho
+skinparam packageStyle rectangle
+
+' ══════════════════════════════════════════════
+' e_2_CVAE.py
+' ══════════════════════════════════════════════
+package "e_2_CVAE.py" #LightYellow {
+
+    class "mlp" as mlp << (F, orchid) >> {
+        + in_dim : int
+        + hidden_dims : list
+        + out_dim : int
+        + activation : nn.Tanh
+        ..returns..
+        nn.Sequential
+        ..구조..
+        Linear → Tanh → ... → Linear → Tanh
+    }
+
+    class RecognitionNet {
+        <i>q_φ(z | x, η)</i>
+        + net : nn.Sequential
+        + mu : nn.Linear(hidden[-1] → dim_z)
+        + logvar : nn.Linear(hidden[-1] → dim_z)
+        --
+        + __init__(dim_x, dim_eta, dim_z, hidden_dims)
+        + forward(x, eta) : (mu_z, log_var_z)
+    }
+
+    class PriorNet {
+        <i>p_θ(z | η)</i>
+        + net : nn.Sequential
+        + mu : nn.Linear(hidden[-1] → dim_z)
+        + logvar : nn.Linear(hidden[-1] → dim_z)
+        --
+        + __init__(dim_eta, dim_z, hidden_dims)
+        + forward(eta) : (mu_p, log_var_p)
+    }
+
+    class DecoderNet {
+        <i>p_θ(x | z, η)</i>
+        + net : nn.Sequential
+        + mu : nn.Linear(hidden[-1] → dim_x)
+        + logvar : nn.Linear(hidden[-1] → dim_x)
+        --
+        + __init__(dim_z, dim_eta, dim_x, hidden_dims)
+        + forward(z, eta) : (mu_x, log_var_x)
+    }
+
+    class CVAE {
+        + recognition : RecognitionNet
+        + prior : PriorNet
+        + decoder : DecoderNet
+        --
+        + dim_x : int
+        + dim_eta : int
+        + dim_z : int
+        + hidden_dims : list
+        --
+        + __init__(dim_x, dim_eta, dim_z, hidden_dims)
+        + reparameterize(mu, log_var) : z
+        + forward(x, eta) : (recon_loss, kl_loss)
+        + sample(eta, n_samples) : Tensor
+        + price_barrier(eta, B, K, r, T, opt_type, n_samples) : float
+        + price_vanilla(eta, K, r, T, opt_type, n_samples) : float
+    }
+
+    RecognitionNet --> mlp : uses
+    PriorNet       --> mlp : uses
+    DecoderNet     --> mlp : uses
+
+    CVAE *-- RecognitionNet : recognition
+    CVAE *-- PriorNet       : prior
+    CVAE *-- DecoderNet     : decoder
+}
+
+' ══════════════════════════════════════════════
+' e_1_run_cvae.py
+' ══════════════════════════════════════════════
+package "e_1_run_cvae.py" #LightCyan {
+
+    class ChunkDataset {
+        + x : Tensor (N, dim_x)
+        + eta : Tensor (N, dim_eta)
+        --
+        + __init__(chunk_path, etas, eta_min, eta_max, model_type)
+        + __len__() : int
+        + __getitem__(idx) : (Tensor, Tensor)
+    }
+
+    note right of ChunkDataset
+      model_type 따라 x 구성
+      'hes' : x = (X_T, M_T) dim_x=2
+      'bs'  : x = (X_T)      dim_x=1
+    end note
+
+    class "compute_eta_stats" as compute_eta << (F, orchid) >> {
+        + eta_path : str
+        ..returns..
+        etas : ndarray
+        eta_min : ndarray
+        eta_max : ndarray
+    }
+
+    class "train_chunk" as train_chunk << (F, orchid) >> {
+        + model_type : str
+        + dim_z : int
+        + hidden_dims : list
+        + batch_size : int
+        + n_epochs : int
+        + lr : float
+        + beta : float
+        + save_path : str
+        ..returns..
+        cvae, loss_history
+        eta_min, eta_max
+    }
+
+    class "compare_prices" as compare << (F, orchid) >> {
+        + cvae : CVAE
+        + B : float
+        + K : float
+        + eta_min : ndarray
+        + eta_max : ndarray
+        + etas : list
+        + eta_keys : list
+        + bench_price : float
+        + opt_type : str
+        + barr_type : str
+        + n_samples : int
+        ..출력..
+        eta | CVAE | bench | 오차%
+    }
+
+    train_chunk  --> compute_eta  : calls
+    train_chunk  --> ChunkDataset : creates
+    compare      --> CVAE         : price_barrier / price_vanilla
+}
+
+' ══════════════════════════════════════════════
+' 파일 간 관계
+' ══════════════════════════════════════════════
+train_chunk --> CVAE : creates & trains
+
+' ══════════════════════════════════════════════
+' 노트
+' ══════════════════════════════════════════════
+note top of "e_2_CVAE.py"
+  [Train]
+  x,eta -> Recognition -> z
+  eta   -> Prior (KL)
+  z,eta -> Decoder -> x_hat
+  Loss = Recon + beta*KL
+
+  [Inference]
+  eta -> Prior -> z -> Decoder -> (X_T, M_T)
+  price = exp(-rT) * E[h(X_T,M_T)]
+end note
+
+note bottom of "e_1_run_cvae.py"
+  [paper.ipynb 실행 순서]
+  1. train_chunk(model_type, save_path)
+     compute_eta_stats()
+     CVAE 생성
+     chunk별 ChunkDataset + DataLoader
+     학습 + 10 epoch마다 중간저장
+  2. compare_prices(cvae, B, K, ...)
+end note
+
+@enduml

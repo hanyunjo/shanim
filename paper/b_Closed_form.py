@@ -22,7 +22,7 @@ def BS_vanilla(eta, type='call'):
 
 
 
-#2) down-and-out call
+#2) down-and-out
 def BS_barrier(eta, B, type='call'):
     S0, K, r, sigma, T  = eta
     
@@ -50,8 +50,8 @@ def BS_barrier(eta, B, type='call'):
 
     if type == 'call':
         C_do = (vanilla_call() 
-                - coef1 * norm.cdf(x1) 
-                + coef2 * norm.cdf(x2))            
+                - coef1 * norm.cdf(y1) 
+                + coef2 * norm.cdf(y2))           
         
         return C_do
     elif type == 'put':
@@ -62,6 +62,5 @@ def BS_barrier(eta, B, type='call'):
                 + S0 * norm.cdf(-x_h1) - K * disc * norm.cdf(-x_h2)
                 - coef1 * (norm.cdf(y1) - norm.cdf(x1))
                 + coef2 * (norm.cdf(y2) - norm.cdf(x2)))
-
-
-        return P_do
+        
+    return P_do
