@@ -201,7 +201,7 @@ def generate_dataset(eta_path, chunk_dir, model_type='hes', S0=1.0, B=0,
     BATCH_SIZE       = n_workers * 10
     prefix           = 'heston' if model_type == 'hes' else 'bs'
     
-    buffer     = []   # row 누적 버퍼
+    buffer     = []   # path 저장 버퍼
     buf_size   = 0    # 현재 버퍼 행 수
     chunk_idx  = 0    # 청크 파일 번호
 
@@ -212,15 +212,17 @@ def generate_dataset(eta_path, chunk_dir, model_type='hes', S0=1.0, B=0,
     with h5py.File(eta_path, "r") as f1:
         paras = f1["etas"][:] # (2**16)*100 x 7 or 3
 
-    for i in range(1,3):
+    for i in range(9,10):
         print(f'round:{i}')
         true  = 0
-        fail  = 0 # bs : 174287 + / hes: 11,024~~~~~~~~
+        fail  = 0 # bs : 1,742,902 
+        # / hes: 1118 + 1131 + 1118 + 1130 + 1076 + 1117 + 1149 + 1062 + ~~~~~~~~
+        buffer   = []
+        buf_size = 0 
         start = time.time()
         eta_offset = i * target_per_round
 
         with ProcessPoolExecutor(max_workers=n_workers) as executor:
-
             for j in range(0, target_per_round, BATCH_SIZE):
                 eta_batch = paras[eta_offset + j : eta_offset + j + BATCH_SIZE]
                         
@@ -242,7 +244,7 @@ def generate_dataset(eta_path, chunk_dir, model_type='hes', S0=1.0, B=0,
                         buf_size += len(rows)
                         true += 1
 
-                        if true % (chunk_size) == 0 and true > 0:
+                        if true % (chunk_size) == 0:
                             chunk_idx, buffer = _flush_buffer(
                                 buffer, chunk_dir, prefix, chunk_idx)
                             buf_size = 0
@@ -260,41 +262,48 @@ def generate_dataset(eta_path, chunk_dir, model_type='hes', S0=1.0, B=0,
             
             while true < target_per_round:
                 shortage     = target_per_round - true
-                extra_paras = generate_BS_params(n_sets=int(shortage * 2)) if model_type == 'bs' \
-                    else generate_hes_valid_params(n_sets=int(shortage * 1.2))
+                extra_paras = generate_BS_params(n_sets=int(shortage * 1.3)) if model_type == 'bs' \
+                    else generate_hes_valid_params(n_sets=int(shortage * 1))
                 
                 with h5py.File(eta_path, "a") as f2:
                     old_size = f2["etas"].shape[0] # append 전 크기
                     f2["etas"].resize(old_size + len(extra_paras), axis=0)
                     f2["etas"][-len(extra_paras):] = extra_paras
 
-                extra_futures = {
-                    executor.submit(_worker, (eta, S0, B, 2**10, 0.001)):
-                    (old_size + k, eta)
-                    for k, eta in enumerate(extra_paras)
-                }
+                for k in range(0, len(extra_paras), BATCH_SIZE):
+                    eta_batch = extra_paras[k : k + BATCH_SIZE]
 
-                for future in as_completed(extra_futures):
-                    ori_idx, eta = extra_futures[future]
-                    XT, MT, mask = future.result()
+                    extra_futures = {
+                        executor.submit(_worker, (eta, S0, B, 2**10, 0.001)):
+                        (old_size + k, eta)
+                        for k, eta in enumerate(eta_batch)
+                    }
 
-                    if mask:
-                        rows = np.column_stack([
-                            np.full(len(XT), ori_idx), XT, MT
-                        ])
-                        buffer.append(rows)
-                        buf_size += len(rows)
-                        true += 1
+                    for future in as_completed(extra_futures):
+                        ori_idx, eta = extra_futures[future]
+                        XT, MT, mask = future.result()
 
-                        if true % (chunk_size) == 0 and true > 0:
-                            chunk_idx, buffer = _flush_buffer(
-                                buffer, chunk_dir, prefix, chunk_idx)
-                            buf_size = 0
-                    else:
-                        fail += 1
-                    
-                    if target_per_round <= true:
-                        break
+                        if mask:
+                            rows = np.column_stack([
+                                np.full(len(XT), ori_idx), XT, MT
+                            ])
+                            buffer.append(rows)
+                            buf_size += len(rows)
+                            true += 1
+
+                            if true % (chunk_size) == 0 and true > 0:
+                                chunk_idx, buffer = _flush_buffer(
+                                    buffer, chunk_dir, prefix, chunk_idx)
+                                buf_size = 0
+                                print(f"{time.time()-start}s")
+
+                            if true % 20000 == 0:
+                                print(f"[{true}/{target_per_round}] fail: {fail}")
+                        else:
+                            fail += 1
+                        
+                        if target_per_round <= true:
+                            break
 
         elapsed = time.time() - start
         print(f"done. true: {true}, fail: {fail}")

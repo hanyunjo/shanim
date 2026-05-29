@@ -39,6 +39,7 @@ class RecognitionNet(nn.Module):
         h       = self.net(torch.cat([x, eta], dim=-1))
         mu      = self.mu(h)
         log_var = self.logvar(h)   # log_var 사용 : 음수/연속성 문제 방지
+        log_var = torch.clamp(log_var, min=-10.0, max=5.0)  # log_var의 범위를 제한해 loss에서 exp 계산 안정성 향상, 의미상 log(var)이기 때문
         return mu, log_var
 
 
@@ -58,6 +59,7 @@ class PriorNet(nn.Module):
         h       = self.net(eta)
         mu      = self.mu(h)
         log_var = self.logvar(h)
+        log_var = torch.clamp(log_var, min=-10.0, max=5.0)
         return mu, log_var
 
 
@@ -77,6 +79,7 @@ class DecoderNet(nn.Module):
         h       = self.net(torch.cat([z, eta], dim=-1))
         mu      = self.mu(h)
         log_var = self.logvar(h)
+        log_var = torch.clamp(log_var, min=-10.0, max=5.0)
         return mu, log_var
 
 
@@ -99,10 +102,11 @@ class CVAE(nn.Module):
         self.decoder     = DecoderNet(dim_z,     dim_eta, dim_x, hidden_dims)
 
     @staticmethod
-    def reparameterize(mu, log_var):
+    def reparameterize(mu, log_var, eps=None):
         # z = μ + ε·σ,  ε ~ N(0, I)
         std = torch.exp(0.5 * log_var)
-        eps = torch.randn_like(std)
+        if eps is None:
+            eps = torch.randn_like(std)
         return mu + eps * std
 
     # forward + ELBO 
@@ -130,26 +134,28 @@ class CVAE(nn.Module):
     def sample(self, eta: torch.Tensor, n_samples: int = 10000):
         self.eval() 
         if eta.dim() == 1:
-            eta = eta.unsqueeze(0)                      # (1, dim_eta), expand할려면 2차로
-        eta_sam = eta.expand(n_samples, -1).to(device)  # (n_samples, dim_eta)
+            eta = eta.unsqueeze(0) # (1, dim_eta), expand할려면 2차로
+        
+        eta = eta.expand(n_samples, -1).to(device)
+        mu_p, lv_p = self.prior(eta)
+        eps_z = torch.randn_like(mu_p)
+        z = self.reparameterize(mu_p, lv_p, eps_z)
 
-        mu_p, lv_p = self.prior(eta_sam)
-        z = self.reparameterize(mu_p, lv_p)
-
-        mu_x, lv_x = self.decoder(z, eta_sam)
-        samples = self.reparameterize(mu_x, lv_x)       # (N, dim_x)
+        mu_x, lv_x = self.decoder(z, eta)
+        eps_x = torch.randn_like(mu_x)
+        samples = self.reparameterize(mu_x, lv_x, eps_x)
         return samples
 
     @torch.no_grad()
     def price_barrier(self, eta: torch.Tensor, B: float, K: float,
-                      r: float, T: float, opt_type: str = 'call',
+                      r: float, T: float, opt_type: str = 'call', 
                       n_samples: int = 10000):
 
-        samples = self.sample(eta, n_samples)  # (N, 2): (X_T, M_T)
+        samples = self.sample(eta, n_samples) # (N, dim_x) : (X_T, M_T)
         X_T = samples[:, 0]
-        M_T = samples[:, 1]
         S_T = torch.exp(X_T) #  X_T : log_return
-
+        M_T = samples[:, 1]
+        
         alive = (M_T > np.log(B)).float() # Knock-out mask (S0=1이므로 ln(B/S0)=ln(B))
 
         if opt_type == 'call':
