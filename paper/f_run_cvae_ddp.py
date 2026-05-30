@@ -1,6 +1,6 @@
 import argparse
 
-from e_1_run_cvae import train_chunk_ddp
+from e_1_run_cvae_ajoufe1 import train_chunk_ddp
 
 
 def parse_hidden_dims(value):
@@ -9,8 +9,8 @@ def parse_hidden_dims(value):
 
 def main():
     parser = argparse.ArgumentParser(description="Train CVAE with DistributedDataParallel.")
-    parser.add_argument("--model-type", choices=["hes", "bs"], default="hes")
-    parser.add_argument("--barr-type", choices=["barr", "van"], default="barr")
+    parser.add_argument("--model-type", choices=["hes", "bs"], default="bs")
+    parser.add_argument("--barr-type", choices=["barr", "van"], default="van")
     parser.add_argument("--dim-z", type=int, default=8)
     parser.add_argument("--hidden-dims", type=parse_hidden_dims, default=[128, 128, 64])
     parser.add_argument("--batch-size", type=int, default=1024, help="Batch size per GPU.")

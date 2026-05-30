@@ -11,7 +11,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-from e_1_run_cvae import (
+from e_1_run_cvae_ajoufe1 import (
     BS_CHUNK_DIR,
     BS_ETA_PATH,
     HES_CHUNK_DIR,
@@ -191,16 +191,16 @@ def benchmark_batch_size(args, batch_size, rank, local_rank, world_size, device)
 
 def main():
     parser = argparse.ArgumentParser(description="Benchmark CVAE DDP training speed for several batch sizes.")
-    parser.add_argument("--model-type", choices=["hes", "bs"], default="hes")
-    parser.add_argument("--barr-type", choices=["barr", "van"], default="barr")
-    parser.add_argument("--batch-sizes", type=parse_int_list, default=[512, 1024, 2048])
-    parser.add_argument("--num-chunks", type=int, default=3, help="Number of chunk files to benchmark.")
+    parser.add_argument("--model-type", choices=["hes", "bs"], default="bs")
+    parser.add_argument("--barr-type", choices=["barr", "van"], default="van")
+    parser.add_argument("--batch-sizes", type=parse_int_list, default=[2048, 4096, 8192])
+    parser.add_argument("--num-chunks", type=int, default=2, help="Number of chunk files to benchmark.")
     parser.add_argument("--total-chunks", type=int, default=100, help="Total chunks used for epoch-time estimate.")
     parser.add_argument("--dim-z", type=int, default=8)
-    parser.add_argument("--hidden-dims", type=parse_int_list, default=[128, 128, 64])
+    parser.add_argument("--hidden-dims", type=parse_int_list, default=[512, 512, 256])
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--beta", type=float, default=1.0)
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--seed", type=int, default=1234)
     args = parser.parse_args()
