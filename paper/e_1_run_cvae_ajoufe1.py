@@ -15,15 +15,6 @@ if not torch.cuda.is_available():
     raise ValueError("Cannot use GPU cuda")
 device = torch.device("cuda")
 
-'''
-# 사용 후, 전 결과 비교 필요
-torch.set_float32_matmul_precision("high")
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-'''
-
-
-
 # _basic(eta에 B가 없는 버전), _B
 BS_CHUNK_DIR  = os.path.expanduser("~/yunjo/bs_chunks_correction/")
 BS_ETA_PATH   = os.path.expanduser("~/yunjo/bs_eta_basic.h5")
@@ -81,13 +72,15 @@ def _ddp_setup():
     if not dist.is_available():
         raise RuntimeError("torch.distributed is not available")
     if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
+        dist.init_process_group(backend="nccl") # gpu process 간 통신을 위한 backend로 nccl 사용
 
-    local_rank = int(os.environ["LOCAL_RANK"])
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
+    # node_rank = server 번호
+    rank = dist.get_rank() # rank 번호 = 전체 gpu 번호, 
+    local_rank = int(os.environ["LOCAL_RANK"]) # server별 gpu 번호
+    world_size = dist.get_world_size() # 전체 프로세스 개수 = rank
     torch.cuda.set_device(local_rank)
     local_device = torch.device(f"cuda:{local_rank}")
+
     return rank, local_rank, world_size, local_device
 
 
@@ -105,13 +98,9 @@ def _load_plain_state_dict(model, state_dict):
 def train_chunk_ddp(model_type='hes', barr_type='barr', dim_z=8, hidden_dims=None, batch_size=1024,
                     n_epochs=200, lr=1e-3, beta=1.0, save_path='cvae_ddp.pt',
                     num_workers=4, prefetch_factor=2, seed=1234, overwrite=False,
-                    load_path=None):
-    """
-    DDP version of train_chunk.
+                    load_path=None, resume_path=None):
+    # batch size is batch_size * number_of_gpus.
 
-    Run with torchrun. Here batch_size is per GPU, so the effective global
-    batch size is batch_size * number_of_gpus.
-    """
     rank, local_rank, world_size, local_device = _ddp_setup()
 
     if hidden_dims is None:
@@ -132,7 +121,9 @@ def train_chunk_ddp(model_type='hes', barr_type='barr', dim_z=8, hidden_dims=Non
         raise FileNotFoundError(f"No chunk files found in {chunk_dir}")
 
     save_path = os.path.expanduser(save_path)
-    if os.path.exists(save_path) and not overwrite:
+    resume_path = os.path.expanduser(resume_path) if resume_path is not None else None
+    load_path = os.path.expanduser(load_path) if load_path is not None else None
+    if os.path.exists(save_path) and not overwrite and save_path != resume_path:
         raise FileExistsError(
             f"{save_path} already exists. Use overwrite=True or choose a different save_path."
         )
@@ -142,22 +133,39 @@ def train_chunk_ddp(model_type='hes', barr_type='barr', dim_z=8, hidden_dims=Non
 
     cvae = CVAE(dim_x=dim_x, dim_eta=dim_eta, dim_z=dim_z, hidden_dims=hidden_dims).to(local_device)
 
-    if load_path is not None:
-        load_model = torch.load(os.path.expanduser(load_path), map_location=local_device, weights_only=False)
+    resume_checkpoint = None
+    start_epoch = 0
+    if resume_path is not None:
+        resume_checkpoint = torch.load(resume_path, map_location=local_device, weights_only=False)
+        _load_plain_state_dict(cvae, resume_checkpoint['model_state']) # weight load
+        start_epoch = int(resume_checkpoint.get('epoch', len(resume_checkpoint.get('loss_history', {}).get('total_loss', []))))
+        _rank0_print(rank, f"체크포인트 재개: {resume_path} | 완료 epoch={start_epoch}")
+    elif load_path is not None:
+        load_model = torch.load(load_path, map_location=local_device, weights_only=False)
         _load_plain_state_dict(cvae, load_model['model_state'])
         _rank0_print(rank, f"초기 가중치 로드 완료: {load_path}")
 
     cvae = DDP(cvae, device_ids=[local_rank], output_device=local_rank)
     optimizer = torch.optim.Adam(cvae.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
-    loss_history = {'recon_loss': [], 'KL_loss': [], 'total_loss': []}
+
+    if resume_checkpoint is not None:
+        if 'optimizer_state' in resume_checkpoint:
+            optimizer.load_state_dict(resume_checkpoint['optimizer_state'])
+        if 'scheduler_state' in resume_checkpoint:
+            scheduler.load_state_dict(resume_checkpoint['scheduler_state'])
+        loss_history = resume_checkpoint.get('loss_history', {'recon_loss': [], 'KL_loss': [], 'total_loss': []})
+    else:
+        loss_history = {'recon_loss': [], 'KL_loss': [], 'total_loss': []}
 
     train_start = time.perf_counter()
     epoch_times = []
-    _rank0_print(rank, f"DDP 학습 시작 | world_size={world_size} | per_gpu_batch={batch_size} | global_batch={batch_size * world_size}")
+    target_epoch = start_epoch + n_epochs
+    _rank0_print(rank, f"DDP 학습 시작 | world_size={world_size} | per_gpu_batch={batch_size} | global_batch={batch_size * world_size} | epochs={start_epoch + 1}-{target_epoch}")
 
     try:
-        for epoch in range(1, n_epochs + 1):
+        for epoch_offset in range(1, n_epochs + 1):
+            epoch = start_epoch + epoch_offset
             torch.cuda.reset_peak_memory_stats(local_device)
             epoch_start = time.perf_counter()
             local_recon = 0.0
@@ -224,26 +232,31 @@ def train_chunk_ddp(model_type='hes', barr_type='barr', dim_z=8, hidden_dims=Non
                 epoch_time = time.perf_counter() - epoch_start
                 epoch_times.append(epoch_time)
                 avg_epoch_time = sum(epoch_times) / len(epoch_times)
-                remaining = avg_epoch_time * (n_epochs - epoch)
-                elapsed = time.perf_counter() - train_start
+                remaining = avg_epoch_time * (n_epochs - epoch_offset)
                 gpu_mem = torch.cuda.max_memory_allocated(local_device) / 1024**3
 
                 if epoch % 10 == 0 or epoch == 1:
-                    print(f"Epoch {epoch:4d}/{n_epochs} | "
-                          f"Recon: {avg_recon:.4f} | KL: {avg_kl:.4f} | Total: {avg_total:.4f}"
-                          f"epoch: {epoch_time/60:.2f}m | elapsed: {elapsed/60:.2f}m | ETA: {remaining/60:.2f}m"
-                          f"GPU mem: {gpu_mem:.2f}GB")
+                    print(f"Epoch {epoch:4d}/{target_epoch} |"
+                          f"Recon: {avg_recon:.4f} | KL: {avg_kl:.4f} | Total: {avg_total:.4f} |\n"
+                          f"epoch time : {epoch_time/60:.2f}m | remaining time: {remaining/60:.2f}m |\n"
+                          f"GPU mem: {gpu_mem:.2f}GB |")
 
                 if epoch % 10 == 0:
                     torch.save({
-                        'model_state' : cvae.module.state_dict(),
-                        'eta_min'     : eta_min,
-                        'eta_max'     : eta_max,
-                        'dim_x'       : dim_x,
-                        'dim_eta'     : dim_eta,
-                        'dim_z'       : dim_z,
-                        'hidden_dims' : hidden_dims,
-                        'loss_history': loss_history,
+                        'epoch'          : epoch,
+                        'model_state'    : cvae.module.state_dict(),
+                        'optimizer_state': optimizer.state_dict(),
+                        'scheduler_state': scheduler.state_dict(),
+                        'eta_min'        : eta_min,
+                        'eta_max'        : eta_max,
+                        'dim_x'          : dim_x,
+                        'dim_eta'        : dim_eta,
+                        'dim_z'          : dim_z,
+                        'hidden_dims'    : hidden_dims,
+                        'loss_history'   : loss_history,
+                        'batch_size'     : batch_size,
+                        'lr'             : lr,
+                        'beta'           : beta,
                     }, save_path)
                     print(f"  중간 저장 완료 (epoch {epoch})")
 
@@ -252,14 +265,20 @@ def train_chunk_ddp(model_type='hes', barr_type='barr', dim_z=8, hidden_dims=Non
         if rank == 0:
             total_time = time.perf_counter() - train_start
             torch.save({
-                'model_state' : cvae.module.state_dict(),
-                'eta_min'     : eta_min,
-                'eta_max'     : eta_max,
-                'dim_x'       : dim_x,
-                'dim_eta'     : dim_eta,
-                'dim_z'       : dim_z,
-                'hidden_dims' : hidden_dims,
-                'loss_history': loss_history,
+                'epoch'          : target_epoch,
+                'model_state'    : cvae.module.state_dict(),
+                'optimizer_state': optimizer.state_dict(),
+                'scheduler_state': scheduler.state_dict(),
+                'eta_min'        : eta_min,
+                'eta_max'        : eta_max,
+                'dim_x'          : dim_x,
+                'dim_eta'        : dim_eta,
+                'dim_z'          : dim_z,
+                'hidden_dims'    : hidden_dims,
+                'loss_history'   : loss_history,
+                'batch_size'     : batch_size,
+                'lr'             : lr,
+                'beta'           : beta,
             }, save_path)
             print(f"\n모델 저장 완료: {save_path}")
             print(f"\n총 학습 시간: {total_time/60:.2f}분 ({total_time/3600:.2f}시간)")

@@ -22,7 +22,8 @@ def main():
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--overwrite", action="store_true", help="Overwrite save-path if it already exists.")
-    parser.add_argument("--load-path", default=None, help="Optional checkpoint to initialize from.")
+    parser.add_argument("--load-path", default=None, help="Optional checkpoint to initialize model weights only.")
+    parser.add_argument("--resume-path", default=None, help="Checkpoint to resume model, optimizer, scheduler, epoch, and loss history from.")
     args = parser.parse_args()
 
     train_chunk_ddp(
@@ -40,6 +41,7 @@ def main():
         seed=args.seed,
         overwrite=args.overwrite,
         load_path=args.load_path,
+        resume_path=args.resume_path,
     )
 
 

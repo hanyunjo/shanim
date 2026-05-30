@@ -66,7 +66,7 @@ def compute_eta_stats(eta_path):
 # 2.train
 # ─────────────
 def train_chunk(model_type = 'hes', barr_type='barr', dim_z=8, hidden_dims=None, batch_size=1024,
-                n_epochs=200, lr=1e-3, beta=1.0, save_path='cvae.pt'):
+                n_epochs=200, lr=1e-3, beta=1.0, save_path='cvae.pt', resume_path=None):
     
     if hidden_dims is None:
         hidden_dims = [128, 128, 64]
@@ -89,7 +89,7 @@ def train_chunk(model_type = 'hes', barr_type='barr', dim_z=8, hidden_dims=None,
         raise FileNotFoundError(f"No chunk files found in {chunk_dir}")
 
     # 기존 모델 확인
-    if os.path.exists(save_path):
+    if resume_path is None and os.path.exists(save_path):
         choice = input(f"{save_path} 존재합니다. (1:불러오기 / 2:덮어쓰기 / 3:중지): ")
 
         if choice == '1':
@@ -120,12 +120,27 @@ def train_chunk(model_type = 'hes', barr_type='barr', dim_z=8, hidden_dims=None,
     cvae.to(device)
     optimizer    = torch.optim.Adam(cvae.parameters(), lr=lr)
     scheduler    = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
-    loss_history = {'recon_loss': [], 'KL_loss': [], 'total_loss': []}
+
+    start_epoch = 0
+    if resume_path is not None: # epoch을 이어서 학습하기 위해
+        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+        cvae.load_state_dict(ckpt["model_state"])
+        optimizer.load_state_dict(ckpt["optimizer_state"])
+        scheduler.load_state_dict(ckpt["scheduler_state"])
+        loss_history = ckpt["loss_history"]
+        eta_min = ckpt["eta_min"]
+        eta_max = ckpt["eta_max"]
+        start_epoch = int(ckpt["epoch"])
+    else:
+        loss_history = {'recon_loss': [], 'KL_loss': [], 'total_loss': []}
+
 
     train_start = time.perf_counter()
     epoch_times = []
+    target_epoch = start_epoch + n_epochs
     print("학습 시작")
-    for epoch in range(1, n_epochs + 1):
+    for epoch_offset in range(1, n_epochs + 1):
+        epoch = start_epoch + epoch_offset
         torch.cuda.reset_peak_memory_stats()
         epoch_start = time.perf_counter()
         epoch_recon = 0.0
@@ -201,14 +216,13 @@ def train_chunk(model_type = 'hes', barr_type='barr', dim_z=8, hidden_dims=None,
         epoch_times.append(epoch_time)
 
         avg_epoch_time = sum(epoch_times) / len(epoch_times)
-        remaining = avg_epoch_time * (n_epochs - epoch)
-        elapsed = time.perf_counter() - train_start
+        remaining = avg_epoch_time * (n_epochs - epoch_offset)
         gpu_mem = torch.cuda.max_memory_allocated() / 1024**3
 
         if epoch % 10 == 0 or epoch == 1:
-            print(f"Epoch {epoch:4d}/{n_epochs} | "
-                  f"Recon: {avg_recon:.4f} | KL: {avg_kl:.4f} | Total: {avg_total:.4f}"
-                  f"epoch: {epoch_time/60:.2f}m | elapsed: {elapsed/60:.2f}m | ETA: {remaining/60:.2f}m"
+            print(f"Epoch {epoch:4d}/{target_epoch} |\n"
+                  f"Recon: {avg_recon:.4f} | KL: {avg_kl:.4f} | Total: {avg_total:.4f} |\n"
+                  f"epoch time : {epoch_time/60:.2f}m | remaining time: {remaining/60:.2f}m |\n"
                   f"GPU mem: {gpu_mem:.2f}GB"
                   )
 
@@ -223,6 +237,9 @@ def train_chunk(model_type = 'hes', barr_type='barr', dim_z=8, hidden_dims=None,
                 'dim_z'       : dim_z,
                 'hidden_dims' : hidden_dims,
                 'loss_history': loss_history,
+                'epoch'          : epoch,
+                'optimizer_state': optimizer.state_dict(),
+                'scheduler_state': scheduler.state_dict(),
             }, save_path)
             print(f"  중간 저장 완료 (epoch {epoch})")
 
@@ -236,6 +253,9 @@ def train_chunk(model_type = 'hes', barr_type='barr', dim_z=8, hidden_dims=None,
         'dim_z'       : dim_z,
         'hidden_dims' : hidden_dims,
         'loss_history': loss_history,
+        'epoch'          : target_epoch,
+        'optimizer_state': optimizer.state_dict(),
+        'scheduler_state': scheduler.state_dict(),
     }, save_path)
     print(f"모델 저장 완료: {save_path}")
     print(f"총 학습 시간: {total_time/60:.2f}분 ({total_time/3600:.2f}시간)")
