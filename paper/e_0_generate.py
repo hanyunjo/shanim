@@ -215,8 +215,7 @@ def generate_dataset(eta_path, chunk_dir, model_type='hes', S0=1.0, B=0,
     for i in range(9,10):
         print(f'round:{i}')
         true  = 0
-        fail  = 0 # bs : 1,742,902 
-        # / hes: 1118 + 1131 + 1118 + 1130 + 1076 + 1117 + 1149 + 1062 + ~~~~~~~~
+        fail  = 0 # bs : 1,742,902 / hes: 11,111
         buffer   = []
         buf_size = 0 
         start = time.time()
