@@ -100,6 +100,13 @@ def _load_plain_state_dict(model, state_dict):
     model.load_state_dict(state_dict)
 
 
+def _load_chunk_dataset(chunk_path, etas, eta_min, eta_max, barr_type, rank, epoch, chunk_pos, n_chunks, ci):
+    _ddp_log(rank, f"epoch={epoch} chunk_pos={chunk_pos}/{n_chunks} ci={ci} load start")
+    dataset = ChunkDataset(chunk_path, etas, eta_min, eta_max, barr_type)
+    _ddp_log(rank, f"epoch={epoch} chunk_pos={chunk_pos} dataset loaded len={len(dataset)}")
+    return dataset
+
+
 def train_chunk_ddp(model_type='hes', barr_type='barr', dim_z=8, hidden_dims=None, batch_size=1024,
                     n_epochs=200, lr=1e-3, beta=1.0, save_path='cvae_ddp.pt',
                     num_workers=4, prefetch_factor=2, seed=1234, overwrite=False,
@@ -179,58 +186,80 @@ def train_chunk_ddp(model_type='hes', barr_type='barr', dim_z=8, hidden_dims=Non
             rng = np.random.default_rng(seed + epoch)
             chunk_order = rng.permutation(n_chunks)
 
-            for chunk_pos, ci in enumerate(chunk_order):
-                _ddp_log(rank, f"epoch={epoch} chunk_pos={chunk_pos}/{n_chunks} ci={ci} load start")
-                dataset = ChunkDataset(chunk_paths[ci], etas, eta_min, eta_max, barr_type)
-                _ddp_log(rank, f"epoch={epoch} chunk_pos={chunk_pos} dataset loaded len={len(dataset)}")
-
-                sampler = DistributedSampler(
-                    dataset,
-                    num_replicas=world_size,
-                    rank=rank,
-                    shuffle=True,
-                    seed=seed + epoch * n_chunks + chunk_pos,
-                    drop_last=True,
-                )
-                dataloader = DataLoader(
-                    dataset,
-                    batch_size=batch_size,
-                    sampler=sampler,
-                    shuffle=False,
-                    num_workers=num_workers,
-                    persistent_workers=(num_workers > 0),
-                    prefetch_factor=prefetch_factor if num_workers > 0 else None,
-                    pin_memory=True,
-                    drop_last=True,
+            def submit_chunk_load(executor, next_chunk_pos):
+                next_ci = int(chunk_order[next_chunk_pos])
+                return executor.submit(
+                    _load_chunk_dataset,
+                    chunk_paths[next_ci],
+                    etas,
+                    eta_min,
+                    eta_max,
+                    barr_type,
+                    rank,
+                    epoch,
+                    next_chunk_pos,
+                    n_chunks,
+                    next_ci,
                 )
 
-                _ddp_log(rank, f"epoch={epoch} chunk_pos={chunk_pos} dataloader ready batches={len(dataloader)}")
+            with ThreadPoolExecutor(max_workers=1) as chunk_loader:
+                dataset_future = submit_chunk_load(chunk_loader, 0)
 
-                cvae.train()
-                try:
-                    for x_batch, eta_batch in dataloader:
-                        x_batch = x_batch.to(local_device, non_blocking=True)
-                        eta_batch = eta_batch.to(local_device, non_blocking=True)
+                for chunk_pos, ci in enumerate(chunk_order):
+                    ci = int(ci)
+                    dataset = dataset_future.result()
+                    if chunk_pos + 1 < n_chunks:
+                        dataset_future = submit_chunk_load(chunk_loader, chunk_pos + 1)
+                    else:
+                        dataset_future = None
 
-                        recon_loss, kl_loss = cvae(x_batch, eta_batch)
-                        loss = recon_loss + beta * kl_loss
+                    sampler = DistributedSampler(
+                        dataset,
+                        num_replicas=world_size,
+                        rank=rank,
+                        shuffle=True,
+                        seed=seed + epoch * n_chunks + chunk_pos,
+                        drop_last=True,
+                    )
+                    dataloader = DataLoader(
+                        dataset,
+                        batch_size=batch_size,
+                        sampler=sampler,
+                        shuffle=False,
+                        num_workers=num_workers,
+                        persistent_workers=(num_workers > 0),
+                        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+                        pin_memory=True,
+                        drop_last=True,
+                    )
 
-                        optimizer.zero_grad()
-                        loss.backward()
-                        torch.nn.utils.clip_grad_norm_(cvae.parameters(), max_norm=5.0)
-                        optimizer.step()
+                    _ddp_log(rank, f"epoch={epoch} chunk_pos={chunk_pos} dataloader ready batches={len(dataloader)}")
 
-                        local_recon += recon_loss.item()
-                        local_kl += kl_loss.item()
-                        local_batches += 1
-                except Exception:
-                    _ddp_log(rank, f"FAILED at epoch={epoch}, chunk_pos={chunk_pos}, ci={ci}")
-                    traceback.print_exc()
-                    raise
+                    cvae.train()
+                    try:
+                        for x_batch, eta_batch in dataloader:
+                            x_batch = x_batch.to(local_device, non_blocking=True)
+                            eta_batch = eta_batch.to(local_device, non_blocking=True)
 
-                _ddp_log(rank, f"epoch={epoch} chunk_pos={chunk_pos} done")
-                
-                del dataloader, sampler, dataset
+                            recon_loss, kl_loss = cvae(x_batch, eta_batch)
+                            loss = recon_loss + beta * kl_loss
+
+                            optimizer.zero_grad()
+                            loss.backward()
+                            torch.nn.utils.clip_grad_norm_(cvae.parameters(), max_norm=5.0)
+                            optimizer.step()
+
+                            local_recon += recon_loss.item()
+                            local_kl += kl_loss.item()
+                            local_batches += 1
+                    except Exception:
+                        _ddp_log(rank, f"FAILED at epoch={epoch}, chunk_pos={chunk_pos}, ci={ci}")
+                        traceback.print_exc()
+                        raise
+
+                    _ddp_log(rank, f"epoch={epoch} chunk_pos={chunk_pos} done")
+
+                    del dataloader, sampler, dataset
 
             scheduler.step()
 
