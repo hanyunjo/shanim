@@ -4,6 +4,8 @@ import torch
 import h5py
 import glob
 import os
+import traceback
+from datetime import datetime
 from torch.utils.data import Dataset, DataLoader
 from concurrent.futures import ThreadPoolExecutor
 import torch.distributed as dist
@@ -88,6 +90,9 @@ def _rank0_print(rank, *args, **kwargs):
     if rank == 0:
         print(*args, **kwargs)
 
+def _ddp_log(rank, msg):
+    now = datetime.now().strftime("%H:%M:%S")
+    print(f"[{now}] [rank {rank}] {msg}", flush=True)
 
 def _load_plain_state_dict(model, state_dict):
     if any(key.startswith("module.") for key in state_dict):
@@ -175,7 +180,10 @@ def train_chunk_ddp(model_type='hes', barr_type='barr', dim_z=8, hidden_dims=Non
             chunk_order = rng.permutation(n_chunks)
 
             for chunk_pos, ci in enumerate(chunk_order):
+                _ddp_log(rank, f"epoch={epoch} chunk_pos={chunk_pos}/{n_chunks} ci={ci} load start")
                 dataset = ChunkDataset(chunk_paths[ci], etas, eta_min, eta_max, barr_type)
+                _ddp_log(rank, f"epoch={epoch} chunk_pos={chunk_pos} dataset loaded len={len(dataset)}")
+
                 sampler = DistributedSampler(
                     dataset,
                     num_replicas=world_size,
@@ -196,23 +204,32 @@ def train_chunk_ddp(model_type='hes', barr_type='barr', dim_z=8, hidden_dims=Non
                     drop_last=True,
                 )
 
+                _ddp_log(rank, f"epoch={epoch} chunk_pos={chunk_pos} dataloader ready batches={len(dataloader)}")
+
                 cvae.train()
-                for x_batch, eta_batch in dataloader:
-                    x_batch = x_batch.to(local_device, non_blocking=True)
-                    eta_batch = eta_batch.to(local_device, non_blocking=True)
+                try:
+                    for x_batch, eta_batch in dataloader:
+                        x_batch = x_batch.to(local_device, non_blocking=True)
+                        eta_batch = eta_batch.to(local_device, non_blocking=True)
 
-                    recon_loss, kl_loss = cvae(x_batch, eta_batch)
-                    loss = recon_loss + beta * kl_loss
+                        recon_loss, kl_loss = cvae(x_batch, eta_batch)
+                        loss = recon_loss + beta * kl_loss
 
-                    optimizer.zero_grad()
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(cvae.parameters(), max_norm=5.0)
-                    optimizer.step()
+                        optimizer.zero_grad()
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(cvae.parameters(), max_norm=5.0)
+                        optimizer.step()
 
-                    local_recon += recon_loss.item()
-                    local_kl += kl_loss.item()
-                    local_batches += 1
+                        local_recon += recon_loss.item()
+                        local_kl += kl_loss.item()
+                        local_batches += 1
+                except Exception:
+                    _ddp_log(rank, f"FAILED at epoch={epoch}, chunk_pos={chunk_pos}, ci={ci}")
+                    traceback.print_exc()
+                    raise
 
+                _ddp_log(rank, f"epoch={epoch} chunk_pos={chunk_pos} done")
+                
                 del dataloader, sampler, dataset
 
             scheduler.step()
