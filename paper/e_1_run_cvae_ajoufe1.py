@@ -101,7 +101,7 @@ def _load_plain_state_dict(model, state_dict):
 
 
 def _load_chunk_dataset(chunk_path, etas, eta_min, eta_max, barr_type, rank, epoch, chunk_pos, n_chunks, ci):
-    _ddp_log(rank, f"epoch={epoch} chunk_pos={chunk_pos}/{n_chunks} ci={ci} load start")
+    _ddp_log(rank, f"epoch={epoch} chunk_pos={chunk_pos}/{n_chunks-1} ci={ci} load start")
     dataset = ChunkDataset(chunk_path, etas, eta_min, eta_max, barr_type)
     _ddp_log(rank, f"epoch={epoch} chunk_pos={chunk_pos} dataset loaded len={len(dataset)}")
     return dataset
