@@ -13,7 +13,10 @@ def main():
     parser.add_argument("--barr-type", choices=["barr", "van"], default="van")
     parser.add_argument("--dim-z", type=int, default=8)
     parser.add_argument("--hidden-dims", type=parse_hidden_dims, default=[128, 128, 64])
+    parser.add_argument("--use-bn", action="store_true", help="Use BatchNorm1d in CVAE hidden layers.")
     parser.add_argument("--batch-size", type=int, default=1024, help="Batch size per GPU.")
+    parser.add_argument("--num-chunks", type=int, default=None, help="Use only the first N chunk files for training.")
+    parser.add_argument("--no-shuffle-chunks", action="store_true", help="Train selected chunk files in sorted order.")
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--beta", type=float, default=1.0)
@@ -31,7 +34,10 @@ def main():
         barr_type=args.barr_type,
         dim_z=args.dim_z,
         hidden_dims=args.hidden_dims,
+        use_bn=args.use_bn,
         batch_size=args.batch_size,
+        num_chunks=args.num_chunks,
+        shuffle_chunks=not args.no_shuffle_chunks,
         n_epochs=args.epochs,
         lr=args.lr,
         beta=args.beta,
