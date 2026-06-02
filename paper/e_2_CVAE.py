@@ -12,14 +12,46 @@ device = torch.device("cuda")
 
 
 # ────────────
+# BatchNorm utility
+# ────────────
+def freeze_batchnorm(model: nn.Module, freeze_affine: bool = True):
+    """
+    BN pretraining 후 BatchNorm running mean/var 업데이트를 멈춤.
+    freeze_affine=True이면 BN의 gamma/beta도 고정.
+    """
+    for m in model.modules():
+        if isinstance(m, nn.BatchNorm1d):
+            m.eval()
+            if freeze_affine:
+                if m.weight is not None:
+                    m.weight.requires_grad_(False)
+                if m.bias is not None:
+                    m.bias.requires_grad_(False)
+
+
+def set_batchnorm_eval(model: nn.Module):
+    """
+    cvae.train() 호출 후에도 BatchNorm만 eval 모드로 유지하기 위한 함수.
+    """
+    for m in model.modules():
+        if isinstance(m, nn.BatchNorm1d):
+            m.eval()
+
+
+# ────────────
 # Sub-networks
 # ────────────
-def _mlp(in_dim: int, hidden_dims: list, out_dim: int, activation=nn.Tanh) -> nn.Sequential:
-    # Tanh : Greeks 계산 시 미분가능성 보장
+def _hidden_mlp(in_dim: int, hidden_dims: list, activation=nn.Tanh, use_bn: bool = False) -> nn.Sequential:
     layers = []
-    dims = [in_dim] + hidden_dims + [out_dim]
-    for i in range(len(dims) - 1):
-        layers += [nn.Linear(dims[i], dims[i + 1]), activation()]
+    prev_dim = in_dim
+
+    for h_dim in hidden_dims:
+        layers.append(nn.Linear(prev_dim, h_dim))
+        if use_bn:
+            layers.append(nn.BatchNorm1d(h_dim))
+        layers.append(activation())
+        prev_dim = h_dim
+
     return nn.Sequential(*layers)
 
 
@@ -29,17 +61,17 @@ class RecognitionNet(nn.Module):
     Input  : [x, η]  dim = dim_x + dim_eta
     Output : μ_z, log σ_z  dim = dim_z each
     """
-    def __init__(self, dim_x, dim_eta, dim_z, hidden_dims):
+    def __init__(self, dim_x, dim_eta, dim_z, hidden_dims, use_bn=False):
         super().__init__()
-        self.net    = _mlp(dim_x + dim_eta, hidden_dims[:-1], hidden_dims[-1])
-        self.mu     = nn.Linear(hidden_dims[-1], dim_z)
+        self.net = _hidden_mlp(dim_x + dim_eta, hidden_dims, use_bn=use_bn)
+        self.mu = nn.Linear(hidden_dims[-1], dim_z)
         self.logvar = nn.Linear(hidden_dims[-1], dim_z)
 
     def forward(self, x, eta):
-        h       = self.net(torch.cat([x, eta], dim=-1))
-        mu      = self.mu(h)
-        log_var = self.logvar(h)   # log_var 사용 : 음수/연속성 문제 방지
-        log_var = torch.clamp(log_var, min=-10.0, max=5.0)  # log_var의 범위를 제한해 loss에서 exp 계산 안정성 향상, 의미상 log(var)이기 때문
+        h = self.net(torch.cat([x, eta], dim=-1))
+        mu = self.mu(h)
+        log_var = self.logvar(h)
+        log_var = torch.clamp(log_var, min=-10.0, max=5.0)
         return mu, log_var
 
 
@@ -49,15 +81,15 @@ class PriorNet(nn.Module):
     Input  : η  dim = dim_eta
     Output : μ_p, log σ_p  dim = dim_z each
     """
-    def __init__(self, dim_eta, dim_z, hidden_dims):
+    def __init__(self, dim_eta, dim_z, hidden_dims, use_bn=False):
         super().__init__()
-        self.net    = _mlp(dim_eta, hidden_dims[:-1], hidden_dims[-1])
-        self.mu     = nn.Linear(hidden_dims[-1], dim_z)
+        self.net = _hidden_mlp(dim_eta, hidden_dims, use_bn=use_bn)
+        self.mu = nn.Linear(hidden_dims[-1], dim_z)
         self.logvar = nn.Linear(hidden_dims[-1], dim_z)
 
     def forward(self, eta):
-        h       = self.net(eta)
-        mu      = self.mu(h)
+        h = self.net(eta)
+        mu = self.mu(h)
         log_var = self.logvar(h)
         log_var = torch.clamp(log_var, min=-10.0, max=5.0)
         return mu, log_var
@@ -69,15 +101,15 @@ class DecoderNet(nn.Module):
     Input  : [z, η]  dim = dim_z + dim_eta
     Output : μ_x, log σ_x  dim = dim_x each
     """
-    def __init__(self, dim_z, dim_eta, dim_x, hidden_dims):
+    def __init__(self, dim_z, dim_eta, dim_x, hidden_dims, use_bn=False):
         super().__init__()
-        self.net    = _mlp(dim_z + dim_eta, hidden_dims[:-1], hidden_dims[-1])
-        self.mu     = nn.Linear(hidden_dims[-1], dim_x)
+        self.net = _hidden_mlp(dim_z + dim_eta, hidden_dims, use_bn=use_bn)
+        self.mu = nn.Linear(hidden_dims[-1], dim_x)
         self.logvar = nn.Linear(hidden_dims[-1], dim_x)
 
     def forward(self, z, eta):
-        h       = self.net(torch.cat([z, eta], dim=-1))
-        mu      = self.mu(h)
+        h = self.net(torch.cat([z, eta], dim=-1))
+        mu = self.mu(h)
         log_var = self.logvar(h)
         log_var = torch.clamp(log_var, min=-10.0, max=5.0)
         return mu, log_var
@@ -91,15 +123,22 @@ class CVAE(nn.Module):
                  dim_x: int = 2,       # (X_T, M_T)=2, (X_T)=1
                  dim_eta: int = 7,     # BS=3, Heston=7
                  dim_z: int = 8,       # latent dim
-                 hidden_dims: list = None):
+                 hidden_dims: list = None,
+                 use_bn: bool = False):
         super().__init__()
 
         if hidden_dims is None:
             hidden_dims = [128, 128, 64]
 
-        self.recognition = RecognitionNet(dim_x, dim_eta, dim_z, hidden_dims)
-        self.prior       = PriorNet(             dim_eta, dim_z, hidden_dims)
-        self.decoder     = DecoderNet(dim_z,     dim_eta, dim_x, hidden_dims)
+        self.dim_x = dim_x
+        self.dim_eta = dim_eta
+        self.dim_z = dim_z
+        self.hidden_dims = hidden_dims
+        self.use_bn = use_bn
+
+        self.recognition = RecognitionNet(dim_x, dim_eta, dim_z, hidden_dims, use_bn=use_bn)
+        self.prior = PriorNet(dim_eta, dim_z, hidden_dims, use_bn=use_bn)
+        self.decoder = DecoderNet(dim_z, dim_eta, dim_x, hidden_dims, use_bn=use_bn)
 
     @staticmethod
     def reparameterize(mu, log_var, eps=None):
@@ -109,12 +148,12 @@ class CVAE(nn.Module):
             eps = torch.randn_like(std)
         return mu + eps * std
 
-    # forward + ELBO 
+    # forward + ELBO
     def forward(self, x, eta):
-        mu_q, lv_q = self.recognition(x, eta)   # reg : q_φ(z|x,η)
-        mu_p, lv_p = self.prior(eta)            # prior : p_θ(z|η)
+        mu_q, lv_q = self.recognition(x, eta)
+        mu_p, lv_p = self.prior(eta)
         z = self.reparameterize(mu_q, lv_q)
-        mu_x, lv_x = self.decoder(z, eta)       # decoder : p_θ(x|z,η)
+        mu_x, lv_x = self.decoder(z, eta)
 
         # Reconstruction loss : Gaussian NLL
         recon_loss = 0.5 * (
@@ -132,11 +171,12 @@ class CVAE(nn.Module):
 
     @torch.no_grad()
     def sample(self, eta: torch.Tensor, n_samples: int = 10000):
-        self.eval() 
+        self.eval()
         if eta.dim() == 1:
-            eta = eta.unsqueeze(0) # (1, dim_eta), expand할려면 2차로
-        
-        eta = eta.expand(n_samples, -1).to(device)
+            eta = eta.unsqueeze(0)
+
+        model_device = next(self.parameters()).device
+        eta = eta.expand(n_samples, -1).to(model_device)
         mu_p, lv_p = self.prior(eta)
         eps_z = torch.randn_like(mu_p)
         z = self.reparameterize(mu_p, lv_p, eps_z)
@@ -148,15 +188,15 @@ class CVAE(nn.Module):
 
     @torch.no_grad()
     def price_barrier(self, eta: torch.Tensor, B: float, K: float,
-                      r: float, T: float, opt_type: str = 'call', 
+                      r: float, T: float, opt_type: str = 'call',
                       n_samples: int = 10000):
 
-        samples = self.sample(eta, n_samples) # (N, dim_x) : (X_T, M_T)
+        samples = self.sample(eta, n_samples)
         X_T = samples[:, 0]
-        S_T = torch.exp(X_T) #  X_T : log_return
+        S_T = torch.exp(X_T)
         M_T = samples[:, 1]
-        
-        alive = (M_T > np.log(B)).float() # Knock-out mask (S0=1이므로 ln(B/S0)=ln(B))
+
+        alive = (M_T > np.log(B)).float()
 
         if opt_type == 'call':
             payoff = torch.clamp(S_T - K, min=0.0) * alive
@@ -172,7 +212,7 @@ class CVAE(nn.Module):
                       r: float, T: float, opt_type: str = 'call',
                       n_samples: int = 10000):
 
-        samples = self.sample(eta, n_samples)  # (N, 1): (X_T)
+        samples = self.sample(eta, n_samples)
         X_T = samples[:, 0]
         S_T = torch.exp(X_T)
 
