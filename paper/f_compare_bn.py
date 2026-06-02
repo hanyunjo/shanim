@@ -80,7 +80,6 @@ def load_cvae_xt_mt(save_path, test_etas, n_samples=100000):
     return x_gen, m_gen, ckpt
 
 
-
 # =================
 # print result
 # =================
