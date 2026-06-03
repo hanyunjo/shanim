@@ -16,7 +16,8 @@ def main():
     parser.add_argument("--use-bn", action="store_true", help="Use BatchNorm1d in CVAE hidden layers.")
     parser.add_argument("--batch-size", type=int, default=1024, help="Batch size per GPU.")
     parser.add_argument("--num-chunks", type=int, default=None, help="Train this many chunk steps from the saved progress position.")
-    parser.add_argument("--shuffle-chunks", action="store_true", help="Shuffle chunk order within each epoch.")
+    parser.add_argument("--shuffle-chunks", dest="shuffle_chunks", action="store_true", default=True, help="Shuffle chunk order within each epoch. Enabled by default.")
+    parser.add_argument("--no-shuffle-chunks", dest="shuffle_chunks", action="store_false", help="Read chunk files in sorted order.")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--beta", type=float, default=1.0)
     parser.add_argument("--save-path", default="cvae_ddp.pt")
@@ -24,7 +25,6 @@ def main():
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--overwrite", action="store_true", help="Overwrite save-path if it already exists.")
-    parser.add_argument("--load-path", default=None, help="Optional checkpoint to initialize model weights only.")
     parser.add_argument("--resume-path", default=None, help="Checkpoint to resume model, optimizer, scheduler, epoch, and loss history from.")
     args = parser.parse_args()
 
@@ -44,7 +44,6 @@ def main():
         prefetch_factor=args.prefetch_factor,
         seed=args.seed,
         overwrite=args.overwrite,
-        load_path=args.load_path,
         resume_path=args.resume_path,
     )
 
