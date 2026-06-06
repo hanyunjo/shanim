@@ -7,7 +7,7 @@ import os
 import re
 from torch.utils.data import Dataset, DataLoader
 from concurrent.futures import ThreadPoolExecutor
-from e_2_CVAE import *
+from e_2_CVAE_norm import *
 
 if not torch.cuda.is_available():
     raise ValueError("Cannot use GPU cuda")
@@ -25,7 +25,8 @@ HES_ETA_PATH  = "/mnt/d/heston_eta_basic.h5"
 # ──────────────────────────────────────────────
 class ChunkDataset(Dataset):
     # 청크 파일 하나를 RAM에 로드.
-    def __init__(self, chunk_path, etas, eta_min, eta_max):
+    def __init__(self, chunk_path, etas, eta_min, eta_max, 
+                 x_mean, x_std, m_mean, m_std):
 
         with h5py.File(chunk_path, 'r') as f:
             paths = f['paths'][:] # (N, 3) : [ori_idx, X_T, M_T]
@@ -37,7 +38,10 @@ class ChunkDataset(Dataset):
         eta_matched = etas[ori_idx].astype(np.float32)
         eta_matched = (eta_matched - eta_min) / (eta_max - eta_min + 1e-8)
 
-        self.x = torch.tensor(np.stack([X_T, M_T], axis=1))  # (N, 2)
+        x_raw = np.stack([X_T, M_T], axis=1).astype(np.float32)
+        xm_mean = np.array([float(x_mean), float(m_mean)], dtype=np.float32)
+        xm_std = np.array([float(x_std), float(m_std)], dtype=np.float32)
+        self.x = torch.tensor((x_raw - xm_mean) / (xm_std + 1e-8), dtype=torch.float32)
 
         self.eta = torch.tensor(eta_matched)   # (N, dim_eta)
 
@@ -68,9 +72,10 @@ def _chunk_sort_key(chunk_path):
 # ─────────────
 # 2.train
 # ─────────────
-def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
+def train_chunk_norm(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
                 lr=1e-3, beta=1.0, warmup_chunks=None, use_bn=False, bn_chunks=None, num_chunks=None,
-                shuffle_chunks=True, save_path=None, resume_path=None):
+                shuffle_chunks=True, save_path=None, resume_path=None,
+                x_mean=None, x_std=None, m_mean=None, m_std=None):
     
     def chunk_order_for_epoch(epoch):
         if shuffle_chunks:
@@ -86,7 +91,8 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
         return epoch, chunk_pos, ci
 
     def load_chunk(ci):
-        dataset = ChunkDataset(chunk_paths[ci], etas, eta_min, eta_max)
+        dataset = ChunkDataset(chunk_paths[ci], etas, eta_min, eta_max,
+                               x_mean, x_std, m_mean, m_std)
         return dataset
 
     def apply_bn_mode(global_chunk):
@@ -166,6 +172,8 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
             'dim_z'       : dim_z,
             'hidden_dims' : hidden_dims,
             'use_bn'      : use_bn,
+            'x_mean'      : x_norm_mean,
+            'x_std'       : x_norm_std,
             'bn_chunks'   : bn_chunks,
             'warmup_chunks': warmup_chunks,
             'loss_history': loss_history, # epoch별 평균 손실 기록
@@ -234,6 +242,13 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
     if hidden_dims is None:
         hidden_dims = [128, 128, 64]
 
+    if x_mean is None or x_std is None or m_mean is None or m_std is None:
+        raise ValueError("x_mean, x_std, m_mean, m_std must be provided for normalized training.")
+    x_norm_mean = np.array([float(x_mean), float(m_mean)], dtype=np.float32)
+    x_norm_std = np.array([float(x_std), float(m_std)], dtype=np.float32)
+    if np.any(x_norm_std <= 0):
+        raise ValueError(f"x_std and m_std must be positive, got {x_norm_std}")
+
     if model_type == 'hes':
         chunk_dir = HES_CHUNK_DIR
         eta_path  = HES_ETA_PATH
@@ -278,7 +293,9 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
                         dim_eta=existing_model['dim_eta'],
                         dim_z=existing_model['dim_z'], 
                         hidden_dims=existing_model['hidden_dims'],
-                        use_bn=existing_model.get('use_bn', False)
+                        use_bn=existing_model.get('use_bn', False),
+                        x_mean=existing_model.get('x_mean', x_norm_mean),
+                        x_std=existing_model.get('x_std', x_norm_std)
                         )
             cvae.load_state_dict(existing_model['model_state'])
             cvae.to(device)
@@ -309,8 +326,20 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
     else:
         use_bn = bool(use_bn)
 
+    if checkpoint is not None:
+        ckpt_x_mean = np.asarray(checkpoint.get('x_mean', x_norm_mean), dtype=np.float32)
+        ckpt_x_std = np.asarray(checkpoint.get('x_std', x_norm_std), dtype=np.float32)
+        if not np.allclose(ckpt_x_mean, x_norm_mean) or not np.allclose(ckpt_x_std, x_norm_std):
+            raise ValueError(
+                f"Normalization stats differ from checkpoint. checkpoint mean/std={ckpt_x_mean}/{ckpt_x_std}, "
+                f"input mean/std={x_norm_mean}/{x_norm_std}"
+            )
+        x_norm_mean = ckpt_x_mean
+        x_norm_std = ckpt_x_std
+
     # 모델 생성
-    cvae = CVAE(dim_x=dim_x, dim_eta=dim_eta, dim_z=dim_z, hidden_dims=hidden_dims, use_bn=use_bn)
+    cvae = CVAE(dim_x=dim_x, dim_eta=dim_eta, dim_z=dim_z, hidden_dims=hidden_dims,
+                use_bn=use_bn, x_mean=x_norm_mean, x_std=x_norm_std)
     cvae.bn_chunks = bn_chunks
 
     # 학습
@@ -410,9 +439,17 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
 # 2-1. test one chunk train time
 # ─────────────
 def benchmark_one_chunk(model_type='hes', barr_type='barr', dim_z=8, hidden_dims=None,
-                        batch_size=1024, lr=1e-3, beta=1.0, chunk_idx=0):
+                        batch_size=1024, lr=1e-3, beta=1.0, chunk_idx=0,
+                        x_mean=None, x_std=None, m_mean=None, m_std=None):
     if hidden_dims is None:
         hidden_dims = [128, 128, 64]
+
+    if x_mean is None or x_std is None or m_mean is None or m_std is None:
+        raise ValueError("x_mean, x_std, m_mean, m_std must be provided for normalized training.")
+    x_norm_mean = np.array([float(x_mean), float(m_mean)], dtype=np.float32)
+    x_norm_std = np.array([float(x_std), float(m_std)], dtype=np.float32)
+    if np.any(x_norm_std <= 0):
+        raise ValueError(f"x_std and m_std must be positive, got {x_norm_std}")
 
     if model_type == 'hes':
         chunk_dir = HES_CHUNK_DIR
@@ -430,12 +467,14 @@ def benchmark_one_chunk(model_type='hes', barr_type='barr', dim_z=8, hidden_dims
     etas, eta_min, eta_max = compute_eta_stats(eta_path)
     dim_eta = etas.shape[1]
 
-    cvae = CVAE(dim_x=dim_x, dim_eta=dim_eta, dim_z=dim_z, hidden_dims=hidden_dims).to(device)
+    cvae = CVAE(dim_x=dim_x, dim_eta=dim_eta, dim_z=dim_z, hidden_dims=hidden_dims,
+                x_mean=x_norm_mean, x_std=x_norm_std).to(device)
     optimizer = torch.optim.Adam(cvae.parameters(), lr=lr)
 
     # chunk load time
     load_start = time.perf_counter()
-    dataset = ChunkDataset(chunk_paths[chunk_idx], etas, eta_min, eta_max)
+    dataset = ChunkDataset(chunk_paths[chunk_idx], etas, eta_min, eta_max,
+                           x_mean, x_std, m_mean, m_std)
     load_time = time.perf_counter() - load_start
 
     dataloader = DataLoader(

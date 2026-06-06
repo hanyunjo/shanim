@@ -29,7 +29,7 @@ HES_ETA_PATH  = os.path.expanduser("~/yunjo/heston_eta_basic.h5")
 # ──────────────────────────────────────────────
 class ChunkDataset(Dataset):
     # 청크 파일 하나를 RAM에 로드.
-    def __init__(self, chunk_path, etas, eta_min, eta_max, barr_type='barr'):
+    def __init__(self, chunk_path, etas, eta_min, eta_max):
 
         with h5py.File(chunk_path, 'r') as f:
             paths = f['paths'][:] # (N, 3) : [ori_idx, X_T, M_T]
@@ -41,10 +41,7 @@ class ChunkDataset(Dataset):
         eta_matched = etas[ori_idx].astype(np.float32)
         eta_matched = (eta_matched - eta_min) / (eta_max - eta_min + 1e-8)
 
-        if barr_type == 'barr':
-            self.x = torch.tensor(np.stack([X_T, M_T], axis=1))  # (N, 2)
-        else:  # van
-            self.x = torch.tensor(np.stack([X_T], axis=1))       # (N, 1)
+        self.x = torch.tensor(np.stack([X_T, M_T], axis=1))  # (N, 2)
 
         self.eta = torch.tensor(eta_matched)   # (N, dim_eta)
 
@@ -105,16 +102,16 @@ def _load_plain_state_dict(model, state_dict):
     model.load_state_dict(state_dict)
 
 
-def _load_chunk_dataset(chunk_path, etas, eta_min, eta_max, barr_type, rank, epoch, chunk_pos, n_chunks, ci):
+def _load_chunk_dataset(chunk_path, etas, eta_min, eta_max, rank, epoch, chunk_pos, n_chunks, ci):
     _ddp_log(rank, f"epoch={epoch} chunk_pos={chunk_pos}/{n_chunks-1} ci={ci} load start")
-    dataset = ChunkDataset(chunk_path, etas, eta_min, eta_max, barr_type)
+    dataset = ChunkDataset(chunk_path, etas, eta_min, eta_max)
     _ddp_log(rank, f"epoch={epoch} chunk_pos={chunk_pos} dataset loaded len={len(dataset)}")
     return dataset
 
 
-def train_chunk_ddp(model_type='hes', barr_type='barr', dim_z=8, hidden_dims=None, batch_size=1024,
-                    lr=1e-3, beta=1.0, save_path='cvae_ddp.pt',
-                    use_bn=False, num_chunks=None, shuffle_chunks=True, num_workers=4, prefetch_factor=2, seed=1234, overwrite=False,
+def train_chunk_ddp(model_type='hes', dim_z=8, hidden_dims=None, batch_size=1024,
+                    lr=1e-3, beta=1.0, warmup_chunks=None, save_path=None,
+                    use_bn=False, bn_chunks=None, num_chunks=None, shuffle_chunks=True, num_workers=4, prefetch_factor=2, seed=1234, overwrite=False,
                     resume_path=None):
     # batch size is batch_size * number_of_gpus.
 
@@ -130,7 +127,7 @@ def train_chunk_ddp(model_type='hes', barr_type='barr', dim_z=8, hidden_dims=Non
         chunk_dir = BS_CHUNK_DIR
         eta_path  = BS_ETA_PATH
 
-    dim_x = 2 if barr_type == 'barr' else 1
+    dim_x = 2   # always train (X_T, M_T); vanilla pricing ignores M_T
 
     chunk_paths = sorted(
         glob.glob(os.path.join(os.path.expanduser(chunk_dir), "*.h5")),
@@ -143,8 +140,21 @@ def train_chunk_ddp(model_type='hes', barr_type='barr', dim_z=8, hidden_dims=Non
         num_chunks = total_chunks
     if num_chunks < 1:
         raise ValueError("num_chunks must be >= 1")
+    if bn_chunks is not None:
+        bn_chunks = int(bn_chunks)
+        if bn_chunks < 0:
+            raise ValueError("bn_chunks must be >= 0")
+    if warmup_chunks is not None:
+        warmup_chunks = int(warmup_chunks)
+        if warmup_chunks < 0:
+            raise ValueError("warmup_chunks must be >= 0")
 
+    if save_path is None:
+        save_path = f"result/cvae/{model_type}/cvae_{model_type}_{dim_z}_{hidden_dims[0]}_{batch_size}_{bn_chunks}_{lr}_{beta}_{warmup_chunks}_chunk{num_chunks}.pt"
     save_path = os.path.expanduser(save_path)
+    save_dir = os.path.dirname(save_path)
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
     resume_path = os.path.expanduser(resume_path) if resume_path is not None else None
     if os.path.exists(save_path) and not overwrite and save_path != resume_path:
         raise FileExistsError(
@@ -164,22 +174,44 @@ def train_chunk_ddp(model_type='hes', barr_type='barr', dim_z=8, hidden_dims=Non
         if checkpoint_use_bn != bool(use_bn):
             _rank0_print(rank, f"use_bn을 checkpoint 설정({checkpoint_use_bn})으로 맞춥니다.")
         use_bn = checkpoint_use_bn
+        checkpoint_bn_chunks = checkpoint.get('bn_chunks', None)
+        checkpoint_warmup_chunks = checkpoint.get('warmup_chunks', warmup_chunks)
     else:
         use_bn = bool(use_bn)
 
     cvae = CVAE(dim_x=dim_x, dim_eta=dim_eta, dim_z=dim_z, hidden_dims=hidden_dims, use_bn=use_bn).to(local_device)
+    cvae.bn_chunks = bn_chunks
 
     completed_chunks = 0
-    epoch_accum = {'recon_sum': 0.0, 'kl_sum': 0.0, 'n_batches': 0.0}
+    epoch_accum = {'recon_sum': 0.0, 'kl_sum': 0.0, 'total_sum': 0.0, 'n_batches': 0.0}
     empty_chunk_history = {
         'epoch': [], 'global_chunk': [], 'chunk_pos': [], 'chunk_idx': [], 'chunk_file': [],
-        'recon_loss': [], 'KL_loss': [], 'total_loss': []
+        'recon_loss': [], 'KL_loss': [], 'total_loss': [], 'beta_eff': []
     }
 
     if resume_checkpoint is not None:
         _load_plain_state_dict(cvae, resume_checkpoint['model_state'])
         completed_chunks = int(resume_checkpoint.get('trained_chunks', len(resume_checkpoint.get('chunk_loss_history', {}).get('chunk_idx', []))))
+        if checkpoint_bn_chunks is None:
+            if use_bn and bn_chunks is not None and completed_chunks > bn_chunks:
+                raise ValueError(
+                    f"이전 checkpoint에는 bn_chunks가 없고 이미 {completed_chunks} chunks가 BN으로 학습됐습니다. "
+                    f"bn_chunks={bn_chunks}로는 과거 BN 적용을 되돌릴 수 없어 resume할 수 없습니다."
+                )
+            if bn_chunks is not None:
+                _rank0_print(rank, f"기존 checkpoint에 bn_chunks가 없어 새 설정({bn_chunks})으로 이어서 저장합니다.")
+        elif checkpoint_bn_chunks != bn_chunks:
+            raise ValueError(
+                f"bn_chunks가 checkpoint 설정({checkpoint_bn_chunks})과 다릅니다. "
+                f"resume 입력값: {bn_chunks}"
+            )
+        if checkpoint_warmup_chunks != warmup_chunks:
+            raise ValueError(
+                f"warmup_chunks가 checkpoint 설정({checkpoint_warmup_chunks})과 다릅니다. "
+                f"resume 입력값: {warmup_chunks}"
+            )
         epoch_accum = resume_checkpoint.get('epoch_accum', epoch_accum)
+        epoch_accum.setdefault('total_sum', 0.0)
         _rank0_print(rank, f"체크포인트 재개: {resume_path} | 완료 chunks={completed_chunks}")
 
     cvae = DDP(cvae, device_ids=[local_rank], output_device=local_rank)
@@ -258,7 +290,7 @@ def train_chunk_ddp(model_type='hes', barr_type='barr', dim_z=8, hidden_dims=Non
         f"DDP 학습 시작 | world_size={world_size} | per_gpu_batch={batch_size} | "
         f"global_batch={batch_size * world_size} | 이번 실행 chunks={len(planned_chunks)} | "
         f"진행 chunks={run_start_chunk}->{target_chunks} | files/epoch={total_chunks} | "
-        f"shuffle_chunks={shuffle_chunks}"
+        f"shuffle_chunks={shuffle_chunks} | bn_chunks={bn_chunks} | warmup_chunks={warmup_chunks}"
     )
 
     train_start = time.perf_counter()
@@ -280,6 +312,8 @@ def train_chunk_ddp(model_type='hes', barr_type='barr', dim_z=8, hidden_dims=Non
             'dim_z'          : dim_z,
             'hidden_dims'    : hidden_dims,
             'use_bn'         : use_bn,
+            'bn_chunks'      : bn_chunks,
+            'warmup_chunks'  : warmup_chunks,
             'loss_history'   : loss_history,
             'chunk_loss_history': chunk_loss_history,
             'num_chunks'     : num_chunks,
@@ -291,10 +325,11 @@ def train_chunk_ddp(model_type='hes', barr_type='barr', dim_z=8, hidden_dims=Non
             'beta'           : beta,
         }, save_path)
 
-    def record_chunk_loss(global_chunk, epoch, chunk_pos, ci, chunk_losses):
+    def record_chunk_loss(global_chunk, epoch, chunk_pos, ci, chunk_losses, bn_mode):
         if rank != 0:
             return
-        chunk_avg_recon, chunk_avg_kl, chunk_avg_total = chunk_losses
+        chunk_avg_recon, chunk_avg_kl, chunk_avg_total, beta_eff = chunk_losses
+        chunk_loss_history.setdefault('beta_eff', [])
         chunk_loss_history['epoch'].append(epoch)
         chunk_loss_history['global_chunk'].append(global_chunk)
         chunk_loss_history['chunk_pos'].append(chunk_pos)
@@ -303,13 +338,30 @@ def train_chunk_ddp(model_type='hes', barr_type='barr', dim_z=8, hidden_dims=Non
         chunk_loss_history['recon_loss'].append(chunk_avg_recon)
         chunk_loss_history['KL_loss'].append(chunk_avg_kl)
         chunk_loss_history['total_loss'].append(chunk_avg_total)
+        chunk_loss_history['beta_eff'].append(beta_eff)
         print(
             f"Chunk step {global_chunk + 1:5d} | "
             f"epoch {epoch:4d} chunk {chunk_pos + 1:3d}/{total_chunks} | "
             f"file_idx {ci:3d} | "
+            f"BN {bn_mode:6s} | beta_eff: {beta_eff:.4f} | "
             f"Recon: {chunk_avg_recon:.4f} | KL: {chunk_avg_kl:.4f} | Total: {chunk_avg_total:.4f}",
             flush=True,
         )
+
+    def apply_bn_mode(global_chunk):
+        if not use_bn:
+            return "off"
+        if bn_chunks is not None and global_chunk >= bn_chunks:
+            freeze_batchnorm(cvae.module)
+            return "frozen"
+        cvae.train()
+        return "train"
+
+    def beta_eff_for_chunk(global_chunk):
+        if warmup_chunks is None or warmup_chunks == 0:
+            return float(beta)
+        ratio = min(1.0, float(global_chunk + 1) / float(warmup_chunks))
+        return float(beta) * ratio
 
     def finish_epoch(epoch, epoch_start, current_chunks):
         scheduler.step()
@@ -317,7 +369,7 @@ def train_chunk_ddp(model_type='hes', barr_type='barr', dim_z=8, hidden_dims=Non
             n_batches = max(float(epoch_accum['n_batches']), 1.0)
             avg_recon = epoch_accum['recon_sum'] / n_batches
             avg_kl = epoch_accum['kl_sum'] / n_batches
-            avg_total = avg_recon + beta * avg_kl
+            avg_total = epoch_accum['total_sum'] / n_batches
             loss_history['recon_loss'].append(avg_recon)
             loss_history['KL_loss'].append(avg_kl)
             loss_history['total_loss'].append(avg_total)
@@ -331,6 +383,7 @@ def train_chunk_ddp(model_type='hes', barr_type='barr', dim_z=8, hidden_dims=Non
 
             epoch_accum['recon_sum'] = 0.0
             epoch_accum['kl_sum'] = 0.0
+            epoch_accum['total_sum'] = 0.0
             epoch_accum['n_batches'] = 0.0
 
             if epoch % 10 == 0:
@@ -350,7 +403,6 @@ def train_chunk_ddp(model_type='hes', barr_type='barr', dim_z=8, hidden_dims=Non
                 etas,
                 eta_min,
                 eta_max,
-                barr_type,
                 rank,
                 epoch,
                 chunk_pos,
@@ -381,8 +433,11 @@ def train_chunk_ddp(model_type='hes', barr_type='barr', dim_z=8, hidden_dims=Non
             _ddp_log(rank, f"epoch={epoch} chunk_pos={chunk_pos} dataloader ready batches={len(dataloader)}")
 
             cvae.train()
+            bn_mode = apply_bn_mode(global_chunk)
+            beta_eff = beta_eff_for_chunk(global_chunk)
             chunk_recon = 0.0
             chunk_kl = 0.0
+            chunk_total = 0.0
             chunk_batches = 0
             try:
                 for x_batch, eta_batch in dataloader:
@@ -390,7 +445,7 @@ def train_chunk_ddp(model_type='hes', barr_type='barr', dim_z=8, hidden_dims=Non
                     eta_batch = eta_batch.to(local_device, non_blocking=True)
 
                     recon_loss, kl_loss = cvae(x_batch, eta_batch)
-                    loss = recon_loss + beta * kl_loss
+                    loss = recon_loss + beta_eff * kl_loss
 
                     optimizer.zero_grad()
                     loss.backward()
@@ -399,27 +454,30 @@ def train_chunk_ddp(model_type='hes', barr_type='barr', dim_z=8, hidden_dims=Non
 
                     recon_value = recon_loss.item()
                     kl_value = kl_loss.item()
+                    total_value = loss.item()
                     chunk_recon += recon_value
                     chunk_kl += kl_value
+                    chunk_total += total_value
                     chunk_batches += 1
             except Exception:
                 _ddp_log(rank, f"FAILED at epoch={epoch}, chunk_pos={chunk_pos}, ci={ci}")
                 traceback.print_exc()
                 raise
 
-            chunk_totals = torch.tensor([chunk_recon, chunk_kl, chunk_batches], device=local_device, dtype=torch.float64)
+            chunk_totals = torch.tensor([chunk_recon, chunk_kl, chunk_total, chunk_batches], device=local_device, dtype=torch.float64)
             dist.all_reduce(chunk_totals, op=dist.ReduceOp.SUM)
-            chunk_total_batches = max(chunk_totals[2].item(), 1.0)
+            chunk_total_batches = max(chunk_totals[3].item(), 1.0)
             chunk_avg_recon = chunk_totals[0].item() / chunk_total_batches
             chunk_avg_kl = chunk_totals[1].item() / chunk_total_batches
-            chunk_avg_total = chunk_avg_recon + beta * chunk_avg_kl
+            chunk_avg_total = chunk_totals[2].item() / chunk_total_batches
 
             if rank == 0:
                 epoch_accum['recon_sum'] += chunk_totals[0].item()
                 epoch_accum['kl_sum'] += chunk_totals[1].item()
-                epoch_accum['n_batches'] += chunk_totals[2].item()
+                epoch_accum['total_sum'] += chunk_totals[2].item()
+                epoch_accum['n_batches'] += chunk_totals[3].item()
 
-            record_chunk_loss(global_chunk, epoch, chunk_pos, ci, (chunk_avg_recon, chunk_avg_kl, chunk_avg_total))
+            record_chunk_loss(global_chunk, epoch, chunk_pos, ci, (chunk_avg_recon, chunk_avg_kl, chunk_avg_total, beta_eff), bn_mode)
             _ddp_log(rank, f"epoch={epoch} chunk_pos={chunk_pos} done")
 
             del dataloader, sampler, dataset

@@ -1,8 +1,15 @@
+from __future__ import annotations
+
 import numpy as np
 import os
+import glob
 import time
 import h5py
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
+import math
+import re
+
 
 
 # step1. generate parameter combinations
@@ -307,3 +314,95 @@ def generate_dataset(eta_path, chunk_dir, model_type='hes', S0=1.0, B=0,
         elapsed = time.time() - start
         print(f"done. true: {true}, fail: {fail}")
         print(f"elapsed: {elapsed:.1f}s ({elapsed/3600:.2f}h)")
+
+
+
+def compute_xm_stats(
+    model_type="bs",
+    chunk_dir=None,
+    pattern="*.h5",
+    expected_chunks=100,
+    row_batch_size=1_000_000,
+):
+    if chunk_dir is None:
+        if model_type == "bs":
+            chunk_dir = Path("/mnt/d/bs_chunks_correction")
+        elif model_type == "hes":
+            chunk_dir = Path("/mnt/d/heston_chunks_correction")
+        else:
+            raise ValueError(f"Unknown model_type: {model_type}")
+
+    chunk_dir = Path(chunk_dir)
+    chunk_paths = list_chunk_paths(chunk_dir, pattern, expected_chunks)
+
+    n_total = 0
+    x_sum = 0.0
+    x_sum_sq = 0.0
+    m_sum = 0.0
+    m_sum_sq = 0.0
+
+    for chunk_idx, chunk_path in enumerate(chunk_paths, start=1):
+        with h5py.File(chunk_path, "r") as h5:
+            data_ds = h5["paths"]
+
+            if data_ds.ndim != 2 or data_ds.shape[1] < 3:
+                raise ValueError(
+                    f"Expected paths shape (N, >=3) with [eta_index, X_T, M_T], got {data_ds.shape}"
+                )
+
+            n_rows = data_ds.shape[0]
+
+            for start in range(0, n_rows, row_batch_size):
+                end = min(start + row_batch_size, n_rows)
+                batch = np.asarray(data_ds[start:end])
+
+                x_t = batch[:, 1].astype(np.float64, copy=False)
+                m_t = batch[:, 2].astype(np.float64, copy=False)
+
+                n_batch = end - start
+
+                x_sum += float(x_t.sum())
+                x_sum_sq += float((x_t * x_t).sum())
+
+                m_sum += float(m_t.sum())
+                m_sum_sq += float((m_t * m_t).sum())
+
+                n_total += n_batch
+
+        print(f"[{chunk_idx:03d}/{len(chunk_paths):03d}] done: {chunk_path.name} rows={n_rows:,}")
+
+    if n_total == 0:
+        raise ValueError("No rows were accumulated.")
+
+    x_mean = x_sum / n_total
+    m_mean = m_sum / n_total
+
+    x_var = x_sum_sq / n_total - x_mean**2
+    m_var = m_sum_sq / n_total - m_mean**2
+
+    x_std = np.sqrt(max(x_var, 0.0))
+    m_std = np.sqrt(max(m_var, 0.0))
+
+    stats = {
+        "model_type": model_type,
+        "chunk_dir": str(chunk_dir),
+        "num_chunks": len(chunk_paths),
+        "n_total": n_total,
+        "x_mean": x_mean,
+        "x_std": x_std,
+        "m_mean": m_mean,
+        "m_std": m_std,
+    }
+
+    print("\n" + "=" * 64)
+    print(f"{model_type} integrated X_T, M_T stats")
+    print("=" * 64)
+    print(f"chunks  : {len(chunk_paths)}")
+    print(f"n_total : {n_total:,}")
+    print(f"X_T mean: {x_mean:.10f}")
+    print(f"X_T std : {x_std:.10f}")
+    print(f"M_T mean: {m_mean:.10f}")
+    print(f"M_T std : {m_std:.10f}")
+    print("=" * 64)
+
+    return stats
