@@ -20,7 +20,7 @@ device = torch.device("cuda")
 # _basic(eta에 B가 없는 버전), _B
 BS_CHUNK_DIR  = os.path.expanduser("~/yunjo/bs_chunks_correction/")
 BS_ETA_PATH   = os.path.expanduser("~/yunjo/bs_eta_basic.h5")
-HES_CHUNK_DIR = os.path.expanduser("~/yunjo/chunks/")
+HES_CHUNK_DIR = os.path.expanduser("~/yunjo/heston_chunks_correction/")
 HES_ETA_PATH  = os.path.expanduser("~/yunjo/heston_eta_basic.h5")
 
 
