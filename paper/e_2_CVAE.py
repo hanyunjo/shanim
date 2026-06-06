@@ -15,10 +15,7 @@ device = torch.device("cuda")
 # BatchNorm utility
 # ────────────
 def freeze_batchnorm(model: nn.Module, freeze_affine: bool = True):
-    """
-    BN pretraining 후 BatchNorm running mean/var 업데이트를 멈춤.
-    freeze_affine=True이면 BN의 gamma/beta도 고정.
-    """
+    # BN의 gamma/beta도 고정.
     for m in model.modules():
         if isinstance(m, nn.BatchNorm1d):
             m.eval()

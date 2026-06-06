@@ -7,6 +7,12 @@ def parse_hidden_dims(value):
     return [int(item.strip()) for item in value.split(",") if item.strip()]
 
 
+def parse_int_list(value):
+    if value is None or value.strip() == "":
+        return []
+    return [int(item.strip()) for item in value.split(",") if item.strip()]
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train CVAE with DistributedDataParallel.")
     parser.add_argument("--model-type", choices=["hes", "bs"], default="bs")
@@ -18,6 +24,7 @@ def main():
     parser.add_argument("--num-chunks", type=int, default=None, help="Train this many chunk steps from the saved progress position.")
     parser.add_argument("--shuffle-chunks", dest="shuffle_chunks", action="store_true", default=True, help="Shuffle chunk order within each epoch. Enabled by default.")
     parser.add_argument("--no-shuffle-chunks", dest="shuffle_chunks", action="store_false", help="Read chunk files in sorted order.")
+    parser.add_argument("--exclude-chunk-idxs", type=parse_int_list, default=[], help="Comma-separated chunk file indices to exclude from training, e.g. 5,17,42.")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--beta", type=float, default=1.0)
     parser.add_argument("--warmup-chunks", type=int, default=None, help="Linearly warm up KL beta over this many global chunk steps.")
@@ -38,6 +45,7 @@ def main():
         batch_size=args.batch_size,
         num_chunks=args.num_chunks,
         shuffle_chunks=args.shuffle_chunks,
+        exclude_chunk_idxs=args.exclude_chunk_idxs,
         lr=args.lr,
         beta=args.beta,
         warmup_chunks=args.warmup_chunks,

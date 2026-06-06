@@ -69,6 +69,13 @@ def _chunk_sort_key(chunk_path):
     return int(numbers[-1]) if numbers else -1
 
 
+def _chunk_file_idx(chunk_path):
+    idx = _chunk_sort_key(chunk_path)
+    if idx < 0:
+        raise ValueError(f"Cannot parse chunk index from filename: {chunk_path}")
+    return idx
+
+
 # ─────────────
 # Distributed data parallel(multi GPU train)
 # ─────────────
@@ -111,7 +118,8 @@ def _load_chunk_dataset(chunk_path, etas, eta_min, eta_max, rank, epoch, chunk_p
 
 def train_chunk_ddp(model_type='hes', dim_z=8, hidden_dims=None, batch_size=1024,
                     lr=1e-3, beta=1.0, warmup_chunks=None, save_path=None,
-                    use_bn=False, bn_chunks=None, num_chunks=None, shuffle_chunks=True, num_workers=8, prefetch_factor=2, seed=1234, overwrite=False,
+                    use_bn=False, bn_chunks=None, num_chunks=None, shuffle_chunks=True,
+                    exclude_chunk_idxs=None, num_workers=8, prefetch_factor=2, seed=1234, overwrite=False,
                     resume_path=None):
     # batch size is batch_size * number_of_gpus.
 
@@ -135,9 +143,27 @@ def train_chunk_ddp(model_type='hes', dim_z=8, hidden_dims=None, batch_size=1024
         glob.glob(os.path.join(os.path.expanduser(chunk_dir), "*.h5")),
         key=_chunk_sort_key,
     )
-    total_chunks = len(chunk_paths)
-    if total_chunks == 0:
+    num_all_chunks = len(chunk_paths)
+    if num_all_chunks == 0:
         raise FileNotFoundError(f"No chunk files found in {chunk_dir}")
+
+    all_chunk_idxs = [_chunk_file_idx(path) for path in chunk_paths]
+    if len(set(all_chunk_idxs)) != len(all_chunk_idxs):
+        raise ValueError(f"Duplicate chunk indices found in {chunk_dir}: {all_chunk_idxs}")
+    chunk_path_by_idx = dict(zip(all_chunk_idxs, chunk_paths))
+
+    if exclude_chunk_idxs is None:
+        exclude_chunk_idxs = set()
+    else:
+        exclude_chunk_idxs = {int(idx) for idx in exclude_chunk_idxs}
+    invalid_excludes = sorted(idx for idx in exclude_chunk_idxs if idx not in chunk_path_by_idx)
+    if invalid_excludes:
+        raise ValueError(f"exclude_chunk_idxs contains indices not found in filenames: {invalid_excludes}")
+
+    trainable_chunk_idxs = [idx for idx in all_chunk_idxs if idx not in exclude_chunk_idxs]
+    total_chunks = len(trainable_chunk_idxs)
+    if total_chunks == 0:
+        raise ValueError("All chunk files are excluded. At least one chunk must remain for training.")
     if num_chunks is None:
         raise ValueError("Input num_chunks")
     if num_chunks < 1:
@@ -207,6 +233,12 @@ def train_chunk_ddp(model_type='hes', dim_z=8, hidden_dims=None, batch_size=1024
         completed_chunks = int(resume_checkpoint.get('trained_chunks', len(resume_checkpoint.get('chunk_loss_history', {}).get('chunk_idx', []))))
         checkpoint_bn_chunks = resume_checkpoint.get('bn_chunks', None)
         checkpoint_warmup_chunks = resume_checkpoint.get('warmup_chunks', warmup_chunks)
+        checkpoint_excluded_chunk_idxs = set(map(int, resume_checkpoint.get('excluded_chunk_idxs', [])))
+        if checkpoint_excluded_chunk_idxs != exclude_chunk_idxs:
+            raise ValueError(
+                f"exclude_chunk_idxs가 checkpoint 설정({sorted(checkpoint_excluded_chunk_idxs)})과 다릅니다. "
+                f"resume 입력값: {sorted(exclude_chunk_idxs)}"
+            )
         if checkpoint_bn_chunks is None:
             if use_bn and bn_chunks is not None and completed_chunks > bn_chunks:
                 raise ValueError(
@@ -229,7 +261,7 @@ def train_chunk_ddp(model_type='hes', dim_z=8, hidden_dims=None, batch_size=1024
         epoch_accum.setdefault('total_sum', 0.0)
         _rank0_print(rank, f"체크포인트 재개: {resume_path} | 완료 chunks={completed_chunks}")
 
-    cvae = DDP(cvae, device_ids=[local_rank], output_device=local_rank)
+    cvae = DDP(cvae, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True,)
     optimizer = torch.optim.Adam(cvae.parameters(), lr=lr)
 
     if resume_checkpoint is not None:
@@ -247,10 +279,11 @@ def train_chunk_ddp(model_type='hes', dim_z=8, hidden_dims=None, batch_size=1024
             chunk_loss_history['global_chunk'] = list(range(len(chunk_loss_history.get('chunk_idx', []))))
 
     def chunk_order_for_epoch(epoch):
+        chunk_indices = np.array(trainable_chunk_idxs, dtype=int)
         if shuffle_chunks:
             rng = np.random.default_rng(epoch)
-            return rng.permutation(total_chunks)
-        return np.arange(total_chunks)
+            return rng.permutation(chunk_indices)
+        return chunk_indices
 
     def chunk_info(global_chunk):
         epoch = global_chunk // total_chunks + 1
@@ -272,6 +305,7 @@ def train_chunk_ddp(model_type='hes', dim_z=8, hidden_dims=None, batch_size=1024
         f"DDP 학습 시작 | world_size={world_size} | per_gpu_batch={batch_size} | "
         f"global_batch={batch_size * world_size} | 이번 실행 chunks={len(planned_chunks)} | "
         f"진행 chunks={run_start_chunk}->{target_chunks} | files/epoch={total_chunks} | "
+        f"excluded={sorted(exclude_chunk_idxs)} | "
         f"shuffle_chunks={shuffle_chunks} | bn_chunks={bn_chunks} | warmup_chunks={warmup_chunks}"
     )
 
@@ -300,6 +334,9 @@ def train_chunk_ddp(model_type='hes', dim_z=8, hidden_dims=None, batch_size=1024
             'num_chunks'     : num_chunks,
             'total_chunks'   : total_chunks,
             'shuffle_chunks' : shuffle_chunks,
+            'excluded_chunk_idxs': sorted(exclude_chunk_idxs),
+            'num_all_chunks'  : num_all_chunks,
+            'all_chunk_idxs'  : all_chunk_idxs,
             'epoch_accum'    : epoch_accum,
             'batch_size'     : batch_size,
             'lr'             : lr,
@@ -315,7 +352,7 @@ def train_chunk_ddp(model_type='hes', dim_z=8, hidden_dims=None, batch_size=1024
         chunk_loss_history['global_chunk'].append(global_chunk)
         chunk_loss_history['chunk_pos'].append(chunk_pos)
         chunk_loss_history['chunk_idx'].append(ci)
-        chunk_loss_history['chunk_file'].append(os.path.basename(chunk_paths[ci]))
+        chunk_loss_history['chunk_file'].append(os.path.basename(chunk_path_by_idx[int(ci)]))
         chunk_loss_history['recon_loss'].append(chunk_avg_recon)
         chunk_loss_history['KL_loss'].append(chunk_avg_kl)
         chunk_loss_history['total_loss'].append(chunk_avg_total)
@@ -379,7 +416,7 @@ def train_chunk_ddp(model_type='hes', dim_z=8, hidden_dims=None, batch_size=1024
                 torch.cuda.reset_peak_memory_stats(local_device)
 
             dataset = _load_chunk_dataset(
-                chunk_paths[ci],
+                chunk_path_by_idx[int(ci)],
                 etas,
                 eta_min,
                 eta_max,

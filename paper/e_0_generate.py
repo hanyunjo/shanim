@@ -219,7 +219,7 @@ def generate_dataset(eta_path, chunk_dir, model_type='hes', S0=1.0, B=0,
     with h5py.File(eta_path, "r") as f1:
         paras = f1["etas"][:] # (2**16)*100 x 7 or 3
 
-    for i in range(9,10):
+    for i in range(0,10):
         print(f'round:{i}')
         true  = 0
         fail  = 0 # bs : 1,742,902 / hes: 11,111
@@ -229,13 +229,12 @@ def generate_dataset(eta_path, chunk_dir, model_type='hes', S0=1.0, B=0,
         eta_offset = i * target_per_round
 
         with ProcessPoolExecutor(max_workers=n_workers) as executor:
-            for j in range(0, target_per_round, BATCH_SIZE):
-                eta_batch = paras[eta_offset + j : eta_offset + j + BATCH_SIZE]
+            for batch_start in range(0, target_per_round, BATCH_SIZE):
+                eta_batch = paras[eta_offset + batch_start : eta_offset + batch_start + BATCH_SIZE]
                         
                 futures = {
                     executor.submit(_worker, (eta, S0, B, 2**10, 0.001)): 
-                    (eta_offset + j + k, eta)
-                    for k, eta in enumerate(eta_batch)
+                    (eta_offset + batch_start + k, eta) for k, eta in enumerate(eta_batch)
                     }
 
                 for future in as_completed(futures):
@@ -276,13 +275,15 @@ def generate_dataset(eta_path, chunk_dir, model_type='hes', S0=1.0, B=0,
                     f2["etas"].resize(old_size + len(extra_paras), axis=0)
                     f2["etas"][-len(extra_paras):] = extra_paras
 
-                for k in range(0, len(extra_paras), BATCH_SIZE):
-                    eta_batch = extra_paras[k : k + BATCH_SIZE]
+                for batch_start in range(0, len(extra_paras), BATCH_SIZE):
+                    eta_batch = extra_paras[batch_start : batch_start + BATCH_SIZE]
+
+                    if true >= target_per_round:
+                        break
 
                     extra_futures = {
                         executor.submit(_worker, (eta, S0, B, 2**10, 0.001)):
-                        (old_size + k, eta)
-                        for k, eta in enumerate(eta_batch)
+                        (old_size + batch_start + j, eta) for j, eta in enumerate(eta_batch)
                     }
 
                     for future in as_completed(extra_futures):

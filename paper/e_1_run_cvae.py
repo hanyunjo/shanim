@@ -64,18 +64,27 @@ def _chunk_sort_key(chunk_path):
     return int(numbers[-1]) if numbers else -1
 
 
+def _chunk_file_idx(chunk_path):
+    idx = _chunk_sort_key(chunk_path)
+    if idx < 0:
+        raise ValueError(f"Cannot parse chunk index from filename: {chunk_path}")
+    return idx
+
+
 # ─────────────
 # 2.train
 # ─────────────
 def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
                 lr=1e-3, beta=1.0, warmup_chunks=None, use_bn=False, bn_chunks=None, 
-                num_chunks=None, shuffle_chunks=True, save_path=None, resume_path=None):
+                num_chunks=None, shuffle_chunks=True, save_path=None, resume_path=None,
+                exclude_chunk_idxs=None):
     
     def chunk_order_for_epoch(epoch):
+        chunk_indices = np.array(trainable_chunk_idxs, dtype=int)
         if shuffle_chunks:
             rng = np.random.default_rng(epoch)
-            return rng.permutation(total_chunks)
-        return np.arange(total_chunks)
+            return rng.permutation(chunk_indices)
+        return chunk_indices
 
     def chunk_info(global_chunk):
         epoch = global_chunk // total_chunks + 1
@@ -85,7 +94,7 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
         return epoch, chunk_pos, ci
 
     def load_chunk(ci):
-        dataset = ChunkDataset(chunk_paths[ci], etas, eta_min, eta_max)
+        dataset = ChunkDataset(chunk_path_by_idx[int(ci)], etas, eta_min, eta_max)
         return dataset
 
     def apply_bn_mode(global_chunk):
@@ -173,6 +182,9 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
             'trained_chunks': current_chunks,
             'total_chunks': total_chunks,
             'shuffle_chunks': shuffle_chunks,
+            'excluded_chunk_idxs': sorted(exclude_chunk_idxs),
+            'num_all_chunks': num_all_chunks,
+            'all_chunk_idxs': all_chunk_idxs,
             'epoch'          : completed_epochs,
             'epoch_accum'    : epoch_accum,
             'optimizer_state': optimizer.state_dict(),
@@ -185,7 +197,7 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
         chunk_loss_history['global_chunk'].append(global_chunk)
         chunk_loss_history['chunk_pos'].append(chunk_pos) # 학습 chunk 개수
         chunk_loss_history['chunk_idx'].append(int(ci)) # 학습 chunk 파일 인덱스
-        chunk_loss_history['chunk_file'].append(os.path.basename(chunk_paths[int(ci)]))
+        chunk_loss_history['chunk_file'].append(os.path.basename(chunk_path_by_idx[int(ci)]))
         chunk_loss_history['recon_loss'].append(chunk_avg_recon)
         chunk_loss_history['KL_loss'].append(chunk_avg_kl)
         chunk_loss_history['total_loss'].append(chunk_avg_total)
@@ -241,9 +253,27 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
     dim_x = 2   # (X_T, M_T)
 
     chunk_paths = sorted(glob.glob(os.path.join(chunk_dir, "*.h5")), key=_chunk_sort_key)
-    total_chunks = len(chunk_paths)
-    if total_chunks == 0:
+    num_all_chunks = len(chunk_paths)
+    if num_all_chunks == 0:
         raise FileNotFoundError(f"No chunk files found in {chunk_dir}")
+
+    all_chunk_idxs = [_chunk_file_idx(path) for path in chunk_paths]
+    if len(set(all_chunk_idxs)) != len(all_chunk_idxs):
+        raise ValueError(f"Duplicate chunk indices found in {chunk_dir}: {all_chunk_idxs}")
+    chunk_path_by_idx = dict(zip(all_chunk_idxs, chunk_paths))
+
+    if exclude_chunk_idxs is None:
+        exclude_chunk_idxs = set()
+    else:
+        exclude_chunk_idxs = {int(idx) for idx in exclude_chunk_idxs}
+    invalid_excludes = sorted(idx for idx in exclude_chunk_idxs if idx not in chunk_path_by_idx)
+    if invalid_excludes:
+        raise ValueError(f"exclude_chunk_idxs contains indices not found in filenames: {invalid_excludes}")
+
+    trainable_chunk_idxs = [idx for idx in all_chunk_idxs if idx not in exclude_chunk_idxs]
+    total_chunks = len(trainable_chunk_idxs)
+    if total_chunks == 0:
+        raise ValueError("All chunk files are excluded. At least one chunk must remain for training.")
     if num_chunks is None:
         raise ValueError("Input num_chunks")
     if num_chunks < 1:
@@ -321,6 +351,12 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
         completed_chunks = int(resume_checkpoint.get("trained_chunks", len(chunk_loss_history.get('chunk_idx', [])))) # 전에 실행된 chunk파일 
         checkpoint_bn_chunks = resume_checkpoint.get('bn_chunks', None)
         checkpoint_warmup_chunks = resume_checkpoint.get('warmup_chunks', warmup_chunks)
+        checkpoint_excluded_chunk_idxs = set(map(int, resume_checkpoint.get('excluded_chunk_idxs', [])))
+        if checkpoint_excluded_chunk_idxs != exclude_chunk_idxs:
+            raise ValueError(
+                f"exclude_chunk_idxs가 checkpoint 설정({sorted(checkpoint_excluded_chunk_idxs)})과 다릅니다. "
+                f"resume 입력값: {sorted(exclude_chunk_idxs)}"
+            )
         if checkpoint_bn_chunks is None:
             if use_bn and bn_chunks is not None and completed_chunks > bn_chunks:
                 raise ValueError(
@@ -352,6 +388,7 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
     print(
         f"학습 시작 | 이번 실행 chunks={num_chunks} | "
         f"진행 chunks={completed_chunks}->{target_chunks} | files/epoch={total_chunks} | "
+        f"excluded={sorted(exclude_chunk_idxs)} | "
         f"bn_chunks={bn_chunks} | warmup_chunks={warmup_chunks}"
     )
 
