@@ -59,7 +59,6 @@ def compute_eta_stats(eta_path):
     return etas, eta_min, eta_max
 
 
-
 def _chunk_sort_key(chunk_path):
     numbers = re.findall(r"\d+", os.path.basename(chunk_path))
     return int(numbers[-1]) if numbers else -1
@@ -69,8 +68,8 @@ def _chunk_sort_key(chunk_path):
 # 2.train
 # ─────────────
 def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
-                lr=1e-3, beta=1.0, warmup_chunks=None, use_bn=False, bn_chunks=None, num_chunks=None,
-                shuffle_chunks=True, save_path=None, resume_path=None):
+                lr=1e-3, beta=1.0, warmup_chunks=None, use_bn=False, bn_chunks=None, 
+                num_chunks=None, shuffle_chunks=True, save_path=None, resume_path=None):
     
     def chunk_order_for_epoch(epoch):
         if shuffle_chunks:
@@ -177,7 +176,6 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
             'epoch'          : completed_epochs,
             'epoch_accum'    : epoch_accum,
             'optimizer_state': optimizer.state_dict(),
-            'scheduler_state': scheduler.state_dict(),
         }, save_path)
 
     def record_chunk_loss(global_chunk, epoch, chunk_pos, ci, chunk_losses):
@@ -211,8 +209,6 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
         loss_history['KL_loss'].append(avg_kl)
         loss_history['total_loss'].append(avg_total)
 
-        scheduler.step()
-
         epoch_time = time.perf_counter() - epoch_start
         gpu_mem = torch.cuda.max_memory_allocated() / 1024**3
         print(f"Epoch {epoch:4d} 완료 |\n"
@@ -230,25 +226,26 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
             save_checkpoint(current_chunks)
             print(f"  중간 저장 완료 (epoch {epoch})")
 
-
     if hidden_dims is None:
         hidden_dims = [128, 128, 64]
 
     if model_type == 'hes':
         chunk_dir = HES_CHUNK_DIR
         eta_path  = HES_ETA_PATH
-    else:  # bs
+    elif model_type == 'bs':
         chunk_dir = BS_CHUNK_DIR
         eta_path  = BS_ETA_PATH
+    else:
+        raise ValueError("model_type must be 'hes' or 'bs'")
 
-    dim_x = 2   # always train (X_T, M_T); vanilla pricing ignores M_T
+    dim_x = 2   # (X_T, M_T)
 
     chunk_paths = sorted(glob.glob(os.path.join(chunk_dir, "*.h5")), key=_chunk_sort_key)
     total_chunks = len(chunk_paths)
     if total_chunks == 0:
         raise FileNotFoundError(f"No chunk files found in {chunk_dir}")
     if num_chunks is None:
-        num_chunks = total_chunks
+        raise ValueError("Input num_chunks")
     if num_chunks < 1:
         raise ValueError("num_chunks must be >= 1")
     if bn_chunks is not None:
@@ -259,36 +256,13 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
         warmup_chunks = int(warmup_chunks)
         if warmup_chunks < 0:
             raise ValueError("warmup_chunks must be >= 0")
-
     if save_path is None:
-        save_path = f"result/cvae/{model_type}/cvae_{model_type}_{dim_z}_{hidden_dims[0]}_{batch_size}_{bn_chunks}_{lr}_{beta}_{warmup_chunks}_chunk{num_chunks}.pt"
-    save_path = os.path.expanduser(save_path)
-    save_dir = os.path.dirname(save_path)
-    if save_dir:
-        os.makedirs(save_dir, exist_ok=True)
-    resume_path = os.path.expanduser(resume_path) if resume_path is not None else None
-
-    # 기존 모델 확인
-    if resume_path is None and os.path.exists(save_path):
-        choice = input(f"{save_path} 존재합니다. (1:불러오기 / 2:덮어쓰기 / 3:중지): ")
-
+        raise ValueError("Input save_path")
+    if os.path.exists(save_path) and resume_path is None:
+        choice = input(f"{save_path} 존재합니다. (1:덮어쓰기 / 2:중지): ")
         if choice == '1':
-            existing_model = torch.load(save_path, map_location=device, weights_only=False)
-            cvae = CVAE(dim_x=existing_model['dim_x'], 
-                        dim_eta=existing_model['dim_eta'],
-                        dim_z=existing_model['dim_z'], 
-                        hidden_dims=existing_model['hidden_dims'],
-                        use_bn=existing_model.get('use_bn', False)
-                        )
-            cvae.load_state_dict(existing_model['model_state'])
-            cvae.to(device)
-            cvae.eval()
-            print("모델 불러오기 완료")
-            return cvae, existing_model['loss_history'], existing_model['eta_min'], existing_model['eta_max']
-
-        elif choice == '2':
             print("덮어쓰기 학습")
-        elif choice == '3':
+        elif choice == '2':
             raise ValueError("중지")
 
     etas, eta_min, eta_max = compute_eta_stats(eta_path)
@@ -298,25 +272,34 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
     if resume_path is not None:
         resume_checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
 
-    checkpoint = resume_checkpoint
-    if checkpoint is not None:
-        checkpoint_use_bn = bool(checkpoint.get('use_bn', False))
+        checkpoint_use_bn = bool(resume_checkpoint.get('use_bn', False))
         if checkpoint_use_bn != bool(use_bn):
             print(f"use_bn을 checkpoint 설정({checkpoint_use_bn})으로 맞춥니다.")
         use_bn = checkpoint_use_bn
-        checkpoint_bn_chunks = checkpoint.get('bn_chunks', None)
-        checkpoint_warmup_chunks = checkpoint.get('warmup_chunks', warmup_chunks)
-    else:
-        use_bn = bool(use_bn)
+
+        checkpoint_hidden_dims = resume_checkpoint.get('hidden_dims', hidden_dims)
+        if checkpoint_hidden_dims != hidden_dims:
+            print(f"hidden_dims를 checkpoint 설정({checkpoint_hidden_dims})으로 맞춥니다.")
+        hidden_dims = checkpoint_hidden_dims
+
+        checkpoint_dim_z = int(resume_checkpoint.get('dim_z', dim_z))
+        if checkpoint_dim_z != dim_z:
+            print(f"dim_z를 checkpoint 설정({checkpoint_dim_z})으로 맞춥니다.")
+        dim_z = checkpoint_dim_z
+
+        checkpoint_dim_x = int(resume_checkpoint.get('dim_x', dim_x))
+        if checkpoint_dim_x != dim_x:
+            raise ValueError(f"checkpoint dim_x={checkpoint_dim_x}, current dim_x={dim_x}")
+
+        checkpoint_dim_eta = int(resume_checkpoint.get('dim_eta', dim_eta))
+        if checkpoint_dim_eta != dim_eta:
+            raise ValueError(f"checkpoint dim_eta={checkpoint_dim_eta}, current eta dim={dim_eta}")
 
     # 모델 생성
     cvae = CVAE(dim_x=dim_x, dim_eta=dim_eta, dim_z=dim_z, hidden_dims=hidden_dims, use_bn=use_bn)
     cvae.bn_chunks = bn_chunks
-
-    # 학습
     cvae.to(device)
-    optimizer    = torch.optim.Adam(cvae.parameters(), lr=lr)
-    scheduler    = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
+    optimizer = torch.optim.Adam(cvae.parameters(), lr=lr)
 
     completed_chunks = 0
     epoch_accum = {'recon_sum': 0.0, 'kl_sum': 0.0, 'total_sum': 0.0, 'n_batches': 0}
@@ -324,19 +307,20 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
         'epoch': [], 'global_chunk': [], 'chunk_pos': [], 'chunk_idx': [], 'chunk_file': [],
         'recon_loss': [], 'KL_loss': [], 'total_loss': [], 'beta_eff': []
     }
-    if resume_path is not None: # chunk 진행량을 이어서 학습
-        ckpt = resume_checkpoint
-        cvae.load_state_dict(ckpt["model_state"])
-        optimizer.load_state_dict(ckpt["optimizer_state"])
-        scheduler.load_state_dict(ckpt["scheduler_state"])
-        loss_history = ckpt["loss_history"]
-        chunk_loss_history = ckpt.get('chunk_loss_history', empty_chunk_history.copy())
+
+    if resume_path is not None: # load resume model
+        cvae.load_state_dict(resume_checkpoint["model_state"])
+        optimizer.load_state_dict(resume_checkpoint["optimizer_state"])
+        loss_history = resume_checkpoint["loss_history"]
+        chunk_loss_history = resume_checkpoint.get('chunk_loss_history', empty_chunk_history.copy())
         chunk_loss_history.setdefault('global_chunk', [])
         if len(chunk_loss_history['global_chunk']) < len(chunk_loss_history.get('chunk_idx', [])):
             chunk_loss_history['global_chunk'] = list(range(len(chunk_loss_history.get('chunk_idx', []))))
-        eta_min = ckpt["eta_min"]
-        eta_max = ckpt["eta_max"]
-        completed_chunks = int(ckpt.get("trained_chunks", len(chunk_loss_history.get('chunk_idx', [])))) # 전에 실행된 chunk파일 
+        eta_min = resume_checkpoint["eta_min"]
+        eta_max = resume_checkpoint["eta_max"]
+        completed_chunks = int(resume_checkpoint.get("trained_chunks", len(chunk_loss_history.get('chunk_idx', [])))) # 전에 실행된 chunk파일 
+        checkpoint_bn_chunks = resume_checkpoint.get('bn_chunks', None)
+        checkpoint_warmup_chunks = resume_checkpoint.get('warmup_chunks', warmup_chunks)
         if checkpoint_bn_chunks is None:
             if use_bn and bn_chunks is not None and completed_chunks > bn_chunks:
                 raise ValueError(
@@ -355,23 +339,21 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
                 f"warmup_chunks가 checkpoint 설정({checkpoint_warmup_chunks})과 다릅니다. "
                 f"resume 입력값: {warmup_chunks}"
             )
-        epoch_accum = ckpt.get('epoch_accum', epoch_accum)
+        epoch_accum = resume_checkpoint.get('epoch_accum', epoch_accum)
         epoch_accum.setdefault('total_sum', 0.0)
         print(f"체크포인트 재개: {resume_path} | 완료 chunks={completed_chunks}")
     else:
         loss_history = {'recon_loss': [], 'KL_loss': [], 'total_loss': []}
         chunk_loss_history = empty_chunk_history.copy()
 
+    # start train
     train_start = time.perf_counter()
-    run_start_chunk = completed_chunks
     target_chunks = completed_chunks + num_chunks
     print(
         f"학습 시작 | 이번 실행 chunks={num_chunks} | "
-        f"진행 chunks={run_start_chunk}->{target_chunks} | files/epoch={total_chunks} | "
+        f"진행 chunks={completed_chunks}->{target_chunks} | files/epoch={total_chunks} | "
         f"bn_chunks={bn_chunks} | warmup_chunks={warmup_chunks}"
     )
-
-    
 
     current_epoch_start = time.perf_counter()
     with ThreadPoolExecutor(max_workers=1) as prefetcher:
@@ -449,7 +431,6 @@ def benchmark_one_chunk(model_type='hes', barr_type='barr', dim_z=8, hidden_dims
         prefetch_factor=2,
     )
 
-    # 정확한 GPU 시간 측정을 위해 synchronize 사용
     torch.cuda.synchronize()
     train_start = time.perf_counter()
 
@@ -488,36 +469,3 @@ def benchmark_one_chunk(model_type='hes', barr_type='barr', dim_z=8, hidden_dims
     print(f"GPU memory      : {torch.cuda.max_memory_allocated() / 1024**3:.2f} GB")
 
     return train_time
-
-
-# ─────────────
-# 3. 가격 출력
-# ─────────────
-def compare_prices(cvae, B, K, eta_min, eta_max, eta, eta_keys, bench_price,
-                   opt_type='call', barr_type='barr', n_samples=10000):
-
-    print("\n" + "="*70)
-    header = " | ".join(f"{k:>6}" for k in eta_keys)
-    print(f"{header} | {'CVAE':>8} | {'bench':>8} | {'오차%':>7}")
-    print("="*70)
-
-    eta      = np.array(eta, dtype=np.float32)
-    r        = eta[0]
-    T        = eta[-1]
-    eta_norm = (eta - eta_min) / (eta_max - eta_min + 1e-8)
-    eta_t    = torch.tensor(eta_norm, dtype=torch.float32).to(device)
-
-    start = time.time()
-    if barr_type == 'barr':
-        cvae_price = cvae.price_barrier(eta_t, B, K, float(r), float(T),
-                                        opt_type, n_samples)
-    else:
-        cvae_price = cvae.price_vanilla(eta_t, K, float(r), float(T),
-                                        opt_type, n_samples)
-    print(f"Pricing time: {time.time() - start:.6f}s")
-
-    err      = (cvae_price - bench_price) / (bench_price + 1e-10) * 100
-    eta_vals = " | ".join(f"{v:>6.3f}" for v in eta)
-    print(f"{eta_vals} | {cvae_price:>8.7f} | {bench_price:>8.7f} | {err:>+6.2f}%")
-
-    print("="*70)

@@ -11,7 +11,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-from e_1_run_cvae_ajoufe1 import (
+from e_1_run_cvae_ddp import (
     BS_CHUNK_DIR,
     BS_ETA_PATH,
     HES_CHUNK_DIR,

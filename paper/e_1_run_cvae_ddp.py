@@ -111,7 +111,7 @@ def _load_chunk_dataset(chunk_path, etas, eta_min, eta_max, rank, epoch, chunk_p
 
 def train_chunk_ddp(model_type='hes', dim_z=8, hidden_dims=None, batch_size=1024,
                     lr=1e-3, beta=1.0, warmup_chunks=None, save_path=None,
-                    use_bn=False, bn_chunks=None, num_chunks=None, shuffle_chunks=True, num_workers=4, prefetch_factor=2, seed=1234, overwrite=False,
+                    use_bn=False, bn_chunks=None, num_chunks=None, shuffle_chunks=True, num_workers=8, prefetch_factor=2, seed=1234, overwrite=False,
                     resume_path=None):
     # batch size is batch_size * number_of_gpus.
 
@@ -123,11 +123,13 @@ def train_chunk_ddp(model_type='hes', dim_z=8, hidden_dims=None, batch_size=1024
     if model_type == 'hes':
         chunk_dir = HES_CHUNK_DIR
         eta_path  = HES_ETA_PATH
-    else:
+    elif model_type == 'bs':
         chunk_dir = BS_CHUNK_DIR
         eta_path  = BS_ETA_PATH
+    else:
+        raise ValueError("model_type must be 'hes' or 'bs'")
 
-    dim_x = 2   # always train (X_T, M_T); vanilla pricing ignores M_T
+    dim_x = 2   # (X_T, M_T)
 
     chunk_paths = sorted(
         glob.glob(os.path.join(os.path.expanduser(chunk_dir), "*.h5")),
@@ -137,7 +139,7 @@ def train_chunk_ddp(model_type='hes', dim_z=8, hidden_dims=None, batch_size=1024
     if total_chunks == 0:
         raise FileNotFoundError(f"No chunk files found in {chunk_dir}")
     if num_chunks is None:
-        num_chunks = total_chunks
+        raise ValueError("Input num_chunks")
     if num_chunks < 1:
         raise ValueError("num_chunks must be >= 1")
     if bn_chunks is not None:
@@ -148,17 +150,14 @@ def train_chunk_ddp(model_type='hes', dim_z=8, hidden_dims=None, batch_size=1024
         warmup_chunks = int(warmup_chunks)
         if warmup_chunks < 0:
             raise ValueError("warmup_chunks must be >= 0")
-
     if save_path is None:
-        save_path = f"result/cvae/{model_type}/cvae_{model_type}_{dim_z}_{hidden_dims[0]}_{batch_size}_{bn_chunks}_{lr}_{beta}_{warmup_chunks}_chunk{num_chunks}.pt"
+        raise ValueError("Input save_path")
+
     save_path = os.path.expanduser(save_path)
-    save_dir = os.path.dirname(save_path)
-    if save_dir:
-        os.makedirs(save_dir, exist_ok=True)
     resume_path = os.path.expanduser(resume_path) if resume_path is not None else None
-    if os.path.exists(save_path) and not overwrite and save_path != resume_path:
+    if os.path.exists(save_path) and not overwrite and resume_path is None:
         raise FileExistsError(
-            f"{save_path} already exists. Use overwrite=True or choose a different save_path."
+            f"{save_path} already exists. Use --overwrite or choose a different save_path."
         )
 
     etas, eta_min, eta_max = compute_eta_stats(os.path.expanduser(eta_path))
@@ -168,14 +167,28 @@ def train_chunk_ddp(model_type='hes', dim_z=8, hidden_dims=None, batch_size=1024
     if resume_path is not None:
         resume_checkpoint = torch.load(resume_path, map_location=local_device, weights_only=False)
 
-    checkpoint = resume_checkpoint
-    if checkpoint is not None:
-        checkpoint_use_bn = bool(checkpoint.get('use_bn', False))
+        checkpoint_use_bn = bool(resume_checkpoint.get('use_bn', False))
         if checkpoint_use_bn != bool(use_bn):
             _rank0_print(rank, f"use_bn을 checkpoint 설정({checkpoint_use_bn})으로 맞춥니다.")
         use_bn = checkpoint_use_bn
-        checkpoint_bn_chunks = checkpoint.get('bn_chunks', None)
-        checkpoint_warmup_chunks = checkpoint.get('warmup_chunks', warmup_chunks)
+
+        checkpoint_hidden_dims = resume_checkpoint.get('hidden_dims', hidden_dims)
+        if checkpoint_hidden_dims != hidden_dims:
+            _rank0_print(rank, f"hidden_dims를 checkpoint 설정({checkpoint_hidden_dims})으로 맞춥니다.")
+        hidden_dims = checkpoint_hidden_dims
+
+        checkpoint_dim_z = int(resume_checkpoint.get('dim_z', dim_z))
+        if checkpoint_dim_z != dim_z:
+            _rank0_print(rank, f"dim_z를 checkpoint 설정({checkpoint_dim_z})으로 맞춥니다.")
+        dim_z = checkpoint_dim_z
+
+        checkpoint_dim_x = int(resume_checkpoint.get('dim_x', dim_x))
+        if checkpoint_dim_x != dim_x:
+            raise ValueError(f"checkpoint dim_x={checkpoint_dim_x}, current dim_x={dim_x}")
+
+        checkpoint_dim_eta = int(resume_checkpoint.get('dim_eta', dim_eta))
+        if checkpoint_dim_eta != dim_eta:
+            raise ValueError(f"checkpoint dim_eta={checkpoint_dim_eta}, current eta dim={dim_eta}")
     else:
         use_bn = bool(use_bn)
 
@@ -192,6 +205,8 @@ def train_chunk_ddp(model_type='hes', dim_z=8, hidden_dims=None, batch_size=1024
     if resume_checkpoint is not None:
         _load_plain_state_dict(cvae, resume_checkpoint['model_state'])
         completed_chunks = int(resume_checkpoint.get('trained_chunks', len(resume_checkpoint.get('chunk_loss_history', {}).get('chunk_idx', []))))
+        checkpoint_bn_chunks = resume_checkpoint.get('bn_chunks', None)
+        checkpoint_warmup_chunks = resume_checkpoint.get('warmup_chunks', warmup_chunks)
         if checkpoint_bn_chunks is None:
             if use_bn and bn_chunks is not None and completed_chunks > bn_chunks:
                 raise ValueError(
@@ -216,13 +231,10 @@ def train_chunk_ddp(model_type='hes', dim_z=8, hidden_dims=None, batch_size=1024
 
     cvae = DDP(cvae, device_ids=[local_rank], output_device=local_rank)
     optimizer = torch.optim.Adam(cvae.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
 
     if resume_checkpoint is not None:
         if 'optimizer_state' in resume_checkpoint:
             optimizer.load_state_dict(resume_checkpoint['optimizer_state'])
-        if 'scheduler_state' in resume_checkpoint:
-            scheduler.load_state_dict(resume_checkpoint['scheduler_state'])
         loss_history = resume_checkpoint.get('loss_history', {'recon_loss': [], 'KL_loss': [], 'total_loss': []})
         chunk_loss_history = resume_checkpoint.get('chunk_loss_history', empty_chunk_history.copy())
     else:
@@ -247,44 +259,14 @@ def train_chunk_ddp(model_type='hes', dim_z=8, hidden_dims=None, batch_size=1024
         ci = int(chunk_order[chunk_pos])
         return epoch, chunk_pos, ci
 
-    def trained_chunk_indices_for_epoch(epoch):
-        epochs = chunk_loss_history.get('epoch', [])
-        chunk_indices = chunk_loss_history.get('chunk_idx', [])
-        return {
-            int(ci)
-            for ep, ci in zip(epochs, chunk_indices)
-            if int(ep) == int(epoch)
-        }
+    planned_chunks = []
+    for offset in range(num_chunks):
+        global_chunk = completed_chunks + offset
+        epoch, chunk_pos, ci = chunk_info(global_chunk)
+        planned_chunks.append((global_chunk, epoch, chunk_pos, ci))
 
-    def select_chunk_plan(start_chunk, n_chunks):
-        plan = []
-        selected_by_epoch = {}
-        current_chunk = start_chunk
-
-        while len(plan) < n_chunks:
-            epoch = current_chunk // total_chunks + 1
-            chunk_pos = current_chunk % total_chunks
-            used = trained_chunk_indices_for_epoch(epoch) | selected_by_epoch.get(epoch, set())
-            remaining_order = [
-                int(ci)
-                for ci in chunk_order_for_epoch(epoch)
-                if int(ci) not in used
-            ]
-
-            if not remaining_order:
-                current_chunk = epoch * total_chunks
-                continue
-
-            ci = remaining_order[0]
-            plan.append((current_chunk, epoch, chunk_pos, ci))
-            selected_by_epoch.setdefault(epoch, set()).add(ci)
-            current_chunk += 1
-
-        return plan
-
-    planned_chunks = select_chunk_plan(completed_chunks, num_chunks)
     run_start_chunk = completed_chunks
-    target_chunks = planned_chunks[-1][0] + 1
+    target_chunks = completed_chunks + num_chunks
     _rank0_print(
         rank,
         f"DDP 학습 시작 | world_size={world_size} | per_gpu_batch={batch_size} | "
@@ -304,7 +286,6 @@ def train_chunk_ddp(model_type='hes', dim_z=8, hidden_dims=None, batch_size=1024
             'trained_chunks' : current_chunks,
             'model_state'    : cvae.module.state_dict(),
             'optimizer_state': optimizer.state_dict(),
-            'scheduler_state': scheduler.state_dict(),
             'eta_min'        : eta_min,
             'eta_max'        : eta_max,
             'dim_x'          : dim_x,
@@ -364,7 +345,6 @@ def train_chunk_ddp(model_type='hes', dim_z=8, hidden_dims=None, batch_size=1024
         return float(beta) * ratio
 
     def finish_epoch(epoch, epoch_start, current_chunks):
-        scheduler.step()
         if rank == 0:
             n_batches = max(float(epoch_accum['n_batches']), 1.0)
             avg_recon = epoch_accum['recon_sum'] / n_batches
@@ -418,17 +398,18 @@ def train_chunk_ddp(model_type='hes', dim_z=8, hidden_dims=None, batch_size=1024
                 seed=seed + epoch * total_chunks + chunk_pos,
                 drop_last=True,
             )
-            dataloader = DataLoader(
-                dataset,
+            loader_kwargs = dict(
                 batch_size=batch_size,
                 sampler=sampler,
                 shuffle=False,
                 num_workers=num_workers,
-                persistent_workers=(num_workers > 0),
-                prefetch_factor=prefetch_factor if num_workers > 0 else None,
                 pin_memory=True,
                 drop_last=True,
             )
+            if num_workers > 0:
+                loader_kwargs["persistent_workers"] = True
+                loader_kwargs["prefetch_factor"] = prefetch_factor
+            dataloader = DataLoader(dataset, **loader_kwargs)
 
             _ddp_log(rank, f"epoch={epoch} chunk_pos={chunk_pos} dataloader ready batches={len(dataloader)}")
 
