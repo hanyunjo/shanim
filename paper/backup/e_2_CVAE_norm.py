@@ -11,15 +11,16 @@ if not torch.cuda.is_available():
 device = torch.device("cuda")
 
 
-
 # ────────────
-# Sub-networks
+# BatchNorm utility
 # ────────────
 def freeze_batchnorm(model: nn.Module, freeze_affine: bool = True):
-    # BN layer는 계속 forward에 사용하고, gamma/beta만 업데이트를 멈춘다.
+    """
+    BatchNorm layer는 계속 forward에 사용하고, affine parameter(gamma/beta)만 고정한다.
+    running mean/var는 train mode에서 계속 업데이트된다.
+    """
     for m in model.modules():
         if isinstance(m, nn.BatchNorm1d):
-            m.eval()
             if freeze_affine:
                 if m.weight is not None:
                     m.weight.requires_grad_(False)
@@ -27,6 +28,18 @@ def freeze_batchnorm(model: nn.Module, freeze_affine: bool = True):
                     m.bias.requires_grad_(False)
 
 
+def set_batchnorm_eval(model: nn.Module):
+    """
+    cvae.train() 호출 후에도 BatchNorm만 eval 모드로 유지하기 위한 함수.
+    """
+    for m in model.modules():
+        if isinstance(m, nn.BatchNorm1d):
+            m.eval()
+
+
+# ────────────
+# Sub-networks
+# ────────────
 def _hidden_mlp(in_dim: int, hidden_dims: list, activation=nn.Tanh, use_bn: bool = False) -> nn.Sequential:
     layers = []
     prev_dim = in_dim
@@ -110,7 +123,9 @@ class CVAE(nn.Module):
                  dim_eta: int = 7,     # BS=3, Heston=7
                  dim_z: int = 8,       # latent dim
                  hidden_dims: list = None,
-                 use_bn: bool = False):
+                 use_bn: bool = False,
+                 x_mean=None,
+                 x_std=None):
         super().__init__()
 
         if hidden_dims is None:
@@ -121,6 +136,22 @@ class CVAE(nn.Module):
         self.dim_z = dim_z
         self.hidden_dims = hidden_dims
         self.use_bn = use_bn
+
+        if x_mean is None:
+            x_mean = torch.zeros(dim_x, dtype=torch.float32)
+        else:
+            x_mean = torch.as_tensor(x_mean, dtype=torch.float32)
+
+        if x_std is None:
+            x_std = torch.ones(dim_x, dtype=torch.float32)
+        else:
+            x_std = torch.as_tensor(x_std, dtype=torch.float32)
+
+        if x_mean.numel() != dim_x or x_std.numel() != dim_x:
+            raise ValueError(f"x_mean and x_std must have dim_x={dim_x} values")
+
+        self.register_buffer('x_mean', x_mean.reshape(dim_x))
+        self.register_buffer('x_std', x_std.reshape(dim_x))
 
         self.recognition = RecognitionNet(dim_x, dim_eta, dim_z, hidden_dims, use_bn=use_bn)
         self.prior = PriorNet(dim_eta, dim_z, hidden_dims, use_bn=use_bn)
@@ -133,6 +164,12 @@ class CVAE(nn.Module):
         if eps is None:
             eps = torch.randn_like(std)
         return mu + eps * std
+
+    def normalize_x(self, x):
+        return (x - self.x_mean.to(x.device)) / (self.x_std.to(x.device) + 1e-8)
+
+    def unnormalize_x(self, x):
+        return x * (self.x_std.to(x.device) + 1e-8) + self.x_mean.to(x.device)
 
     # forward + ELBO
     def forward(self, x, eta, return_kl_dim=False):
@@ -191,6 +228,7 @@ class CVAE(nn.Module):
                       n_samples: int = 10000):
 
         samples = self.sample(eta, n_samples)
+        samples = self.unnormalize_x(samples)
         X_T = samples[:, 0]
         S_T = torch.exp(X_T)
 
@@ -209,6 +247,7 @@ class CVAE(nn.Module):
                       n_samples: int = 10000):
 
         samples = self.sample(eta, n_samples)
+        samples = self.unnormalize_x(samples)
         X_T = samples[:, 0]
         S_T = torch.exp(X_T)
         M_T = samples[:, 1]

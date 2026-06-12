@@ -64,16 +64,16 @@ def compute_eta_stats(eta_path):
 
 
 
-def _chunk_sort_key(chunk_path):
-    numbers = re.findall(r"\d+", os.path.basename(chunk_path))
-    return int(numbers[-1]) if numbers else -1
-
-
 def _chunk_file_idx(chunk_path):
-    idx = _chunk_sort_key(chunk_path)
-    if idx < 0:
-        raise ValueError(f"Cannot parse chunk index from filename: {chunk_path}")
-    return idx
+    filename = os.path.basename(chunk_path)
+    match = re.search(r"chunk_(\d+)", filename)
+    if match is None:
+        raise ValueError(f"Cannot parse chunk index from filename: {filename}")
+    return int(match.group(1))
+
+
+def _chunk_sort_key(chunk_path):
+    return _chunk_file_idx(chunk_path)
 
 
 # ─────────────
@@ -119,7 +119,8 @@ def _load_chunk_dataset(chunk_path, etas, eta_min, eta_max, rank, epoch, chunk_p
 def train_chunk_ddp(model_type='hes', dim_z=8, hidden_dims=None, batch_size=1024,
                     lr=1e-3, beta=1.0, warmup_chunks=None, save_path=None,
                     use_bn=False, bn_chunks=None, num_chunks=None, shuffle_chunks=True,
-                    exclude_chunk_idxs=None, num_workers=8, prefetch_factor=2, seed=1234, overwrite=False,
+                    exclude_chunk_idxs=None, validation_chunk_idxs=None, val_every_chunks=10,
+                    num_workers=8, prefetch_factor=2, seed=1234, overwrite=False,
                     resume_path=None):
     # batch size is batch_size * number_of_gpus.
 
@@ -156,9 +157,17 @@ def train_chunk_ddp(model_type='hes', dim_z=8, hidden_dims=None, batch_size=1024
         exclude_chunk_idxs = set()
     else:
         exclude_chunk_idxs = {int(idx) for idx in exclude_chunk_idxs}
+    if validation_chunk_idxs is None:
+        validation_chunk_idxs = set()
+    else:
+        validation_chunk_idxs = {int(idx) for idx in validation_chunk_idxs}
     invalid_excludes = sorted(idx for idx in exclude_chunk_idxs if idx not in chunk_path_by_idx)
     if invalid_excludes:
         raise ValueError(f"exclude_chunk_idxs contains indices not found in filenames: {invalid_excludes}")
+    invalid_validation = sorted(idx for idx in validation_chunk_idxs if idx not in chunk_path_by_idx)
+    if invalid_validation:
+        raise ValueError(f"validation_chunk_idxs contains indices not found in filenames: {invalid_validation}")
+    exclude_chunk_idxs = exclude_chunk_idxs | validation_chunk_idxs
 
     trainable_chunk_idxs = [idx for idx in all_chunk_idxs if idx not in exclude_chunk_idxs]
     total_chunks = len(trainable_chunk_idxs)
@@ -176,6 +185,10 @@ def train_chunk_ddp(model_type='hes', dim_z=8, hidden_dims=None, batch_size=1024
         warmup_chunks = int(warmup_chunks)
         if warmup_chunks < 0:
             raise ValueError("warmup_chunks must be >= 0")
+    if val_every_chunks is not None:
+        val_every_chunks = int(val_every_chunks)
+        if val_every_chunks < 1:
+            raise ValueError("val_every_chunks must be >= 1")
     if save_path is None:
         raise ValueError("Input save_path")
 
@@ -225,7 +238,9 @@ def train_chunk_ddp(model_type='hes', dim_z=8, hidden_dims=None, batch_size=1024
     epoch_accum = {'recon_sum': 0.0, 'kl_sum': 0.0, 'total_sum': 0.0, 'n_batches': 0.0}
     empty_chunk_history = {
         'epoch': [], 'global_chunk': [], 'chunk_pos': [], 'chunk_idx': [], 'chunk_file': [],
-        'recon_loss': [], 'KL_loss': [], 'total_loss': [], 'beta_eff': []
+        'recon_loss': [], 'KL_loss': [], 'total_loss': [], 'beta_eff': [],
+        'val_global_chunk': [], 'val_recon_loss': [], 'val_KL_loss': [], 'val_total_loss': [],
+        'val_beta_eff': [], 'val_kl_dim_mean': [], 'val_chunk_idxs': [], 'val_chunk_files': []
     }
 
     if resume_checkpoint is not None:
@@ -234,10 +249,16 @@ def train_chunk_ddp(model_type='hes', dim_z=8, hidden_dims=None, batch_size=1024
         checkpoint_bn_chunks = resume_checkpoint.get('bn_chunks', None)
         checkpoint_warmup_chunks = resume_checkpoint.get('warmup_chunks', warmup_chunks)
         checkpoint_excluded_chunk_idxs = set(map(int, resume_checkpoint.get('excluded_chunk_idxs', [])))
+        checkpoint_validation_chunk_idxs = set(map(int, resume_checkpoint.get('validation_chunk_idxs', [])))
         if checkpoint_excluded_chunk_idxs != exclude_chunk_idxs:
             raise ValueError(
                 f"exclude_chunk_idxs가 checkpoint 설정({sorted(checkpoint_excluded_chunk_idxs)})과 다릅니다. "
                 f"resume 입력값: {sorted(exclude_chunk_idxs)}"
+            )
+        if checkpoint_validation_chunk_idxs != validation_chunk_idxs:
+            raise ValueError(
+                f"validation_chunk_idxs가 checkpoint 설정({sorted(checkpoint_validation_chunk_idxs)})과 다릅니다. "
+                f"resume 입력값: {sorted(validation_chunk_idxs)}"
             )
         if checkpoint_bn_chunks is None:
             if use_bn and bn_chunks is not None and completed_chunks > bn_chunks:
@@ -274,6 +295,8 @@ def train_chunk_ddp(model_type='hes', dim_z=8, hidden_dims=None, batch_size=1024
         chunk_loss_history = empty_chunk_history.copy()
 
     if rank == 0:
+        for key, default_value in empty_chunk_history.items():
+            chunk_loss_history.setdefault(key, default_value.copy())
         chunk_loss_history.setdefault('global_chunk', [])
         if len(chunk_loss_history['global_chunk']) < len(chunk_loss_history.get('chunk_idx', [])):
             chunk_loss_history['global_chunk'] = list(range(len(chunk_loss_history.get('chunk_idx', []))))
@@ -305,8 +328,9 @@ def train_chunk_ddp(model_type='hes', dim_z=8, hidden_dims=None, batch_size=1024
         f"DDP 학습 시작 | world_size={world_size} | per_gpu_batch={batch_size} | "
         f"global_batch={batch_size * world_size} | 이번 실행 chunks={len(planned_chunks)} | "
         f"진행 chunks={run_start_chunk}->{target_chunks} | files/epoch={total_chunks} | "
-        f"excluded={sorted(exclude_chunk_idxs)} | "
-        f"shuffle_chunks={shuffle_chunks} | bn_chunks={bn_chunks} | warmup_chunks={warmup_chunks}"
+        f"excluded={sorted(exclude_chunk_idxs)} | validation={sorted(validation_chunk_idxs)} | "
+        f"val_every_chunks={val_every_chunks} | shuffle_chunks={shuffle_chunks} | "
+        f"bn_chunks={bn_chunks} | warmup_chunks={warmup_chunks}"
     )
 
     train_start = time.perf_counter()
@@ -335,6 +359,8 @@ def train_chunk_ddp(model_type='hes', dim_z=8, hidden_dims=None, batch_size=1024
             'total_chunks'   : total_chunks,
             'shuffle_chunks' : shuffle_chunks,
             'excluded_chunk_idxs': sorted(exclude_chunk_idxs),
+            'validation_chunk_idxs': sorted(validation_chunk_idxs),
+            'val_every_chunks': val_every_chunks,
             'num_all_chunks'  : num_all_chunks,
             'all_chunk_idxs'  : all_chunk_idxs,
             'epoch_accum'    : epoch_accum,
@@ -366,6 +392,27 @@ def train_chunk_ddp(model_type='hes', dim_z=8, hidden_dims=None, batch_size=1024
             flush=True,
         )
 
+    def record_validation_loss(val_result):
+        if rank != 0 or val_result is None:
+            return
+        chunk_loss_history['val_global_chunk'].append(val_result['global_chunk'])
+        chunk_loss_history['val_recon_loss'].append(val_result['recon_loss'])
+        chunk_loss_history['val_KL_loss'].append(val_result['KL_loss'])
+        chunk_loss_history['val_total_loss'].append(val_result['total_loss'])
+        chunk_loss_history['val_beta_eff'].append(val_result['beta_eff'])
+        chunk_loss_history['val_kl_dim_mean'].append(val_result['kl_dim_mean'])
+        chunk_loss_history['val_chunk_idxs'].append(sorted(validation_chunk_idxs))
+        chunk_loss_history['val_chunk_files'].append(
+            [os.path.basename(chunk_path_by_idx[int(ci)]) for ci in sorted(validation_chunk_idxs)]
+        )
+        print(
+            f"Validation @ chunk {val_result['global_chunk']:5d} | "
+            f"Recon: {val_result['recon_loss']:.4f} | KL: {val_result['KL_loss']:.4f} | "
+            f"Total: {val_result['total_loss']:.4f} | "
+            f"KL_dim: {[round(v, 6) for v in val_result['kl_dim_mean']]}",
+            flush=True,
+        )
+
     def apply_bn_mode(global_chunk):
         if not use_bn:
             return "off"
@@ -380,6 +427,79 @@ def train_chunk_ddp(model_type='hes', dim_z=8, hidden_dims=None, batch_size=1024
             return float(beta)
         ratio = min(1.0, float(global_chunk + 1) / float(warmup_chunks))
         return float(beta) * ratio
+
+    def validate_chunks(current_chunks):
+        if len(validation_chunk_idxs) == 0:
+            return None
+
+        was_training = cvae.training
+        cvae.eval()
+        beta_eff = beta_eff_for_chunk(current_chunks - 1)
+        val_recon = 0.0
+        val_kl = 0.0
+        val_total = 0.0
+        val_batches = 0.0
+        val_kl_dim_sum = torch.zeros(dim_z, device=local_device, dtype=torch.float64)
+
+        with torch.no_grad():
+            for ci in sorted(validation_chunk_idxs):
+                dataset = _load_chunk_dataset(
+                    chunk_path_by_idx[int(ci)], etas, eta_min, eta_max,
+                    rank, 0, 0, len(validation_chunk_idxs), ci,
+                )
+                sampler = DistributedSampler(
+                    dataset,
+                    num_replicas=world_size,
+                    rank=rank,
+                    shuffle=False,
+                    drop_last=True,
+                )
+                loader_kwargs = dict(
+                    batch_size=batch_size,
+                    sampler=sampler,
+                    shuffle=False,
+                    num_workers=num_workers,
+                    pin_memory=True,
+                    drop_last=True,
+                )
+                if num_workers > 0:
+                    loader_kwargs['persistent_workers'] = True
+                    loader_kwargs['prefetch_factor'] = prefetch_factor
+                dataloader = DataLoader(dataset, **loader_kwargs)
+
+                for x_batch, eta_batch in dataloader:
+                    x_batch = x_batch.to(local_device, non_blocking=True)
+                    eta_batch = eta_batch.to(local_device, non_blocking=True)
+
+                    recon_loss, kl_loss, kl_dim_mean = cvae(x_batch, eta_batch, return_kl_dim=True)
+                    loss = recon_loss + beta_eff * kl_loss
+
+                    val_recon += recon_loss.item()
+                    val_kl += kl_loss.item()
+                    val_total += loss.item()
+                    val_batches += 1.0
+                    val_kl_dim_sum += kl_dim_mean.detach().to(local_device, dtype=torch.float64)
+
+                del dataloader, sampler, dataset
+
+        val_totals = torch.tensor([val_recon, val_kl, val_total, val_batches], device=local_device, dtype=torch.float64)
+        dist.all_reduce(val_totals, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_kl_dim_sum, op=dist.ReduceOp.SUM)
+        total_batches = max(val_totals[3].item(), 1.0)
+
+        if was_training:
+            cvae.train()
+
+        if rank != 0:
+            return None
+        return {
+            'global_chunk': current_chunks,
+            'recon_loss': val_totals[0].item() / total_batches,
+            'KL_loss': val_totals[1].item() / total_batches,
+            'total_loss': val_totals[2].item() / total_batches,
+            'beta_eff': beta_eff,
+            'kl_dim_mean': (val_kl_dim_sum / total_batches).cpu().tolist(),
+        }
 
     def finish_epoch(epoch, epoch_start, current_chunks):
         if rank == 0:
@@ -501,6 +621,15 @@ def train_chunk_ddp(model_type='hes', dim_z=8, hidden_dims=None, batch_size=1024
             del dataloader, sampler, dataset
 
             current_chunks = global_chunk + 1
+            should_validate = (
+                len(validation_chunk_idxs) > 0
+                and (
+                    (val_every_chunks is not None and current_chunks % val_every_chunks == 0)
+                    or global_chunk == planned_chunks[-1][0]
+                )
+            )
+            if should_validate:
+                record_validation_loss(validate_chunks(current_chunks))
             if current_chunks % total_chunks == 0:
                 finish_epoch(epoch, current_epoch_start, current_chunks)
 

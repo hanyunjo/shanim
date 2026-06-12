@@ -25,6 +25,8 @@ def main():
     parser.add_argument("--shuffle-chunks", dest="shuffle_chunks", action="store_true", default=True, help="Shuffle chunk order within each epoch. Enabled by default.")
     parser.add_argument("--no-shuffle-chunks", dest="shuffle_chunks", action="store_false", help="Read chunk files in sorted order.")
     parser.add_argument("--exclude-chunk-idxs", type=parse_int_list, default=[], help="Comma-separated chunk file indices to exclude from training, e.g. 5,17,42.")
+    parser.add_argument("--validation-chunk-idxs", type=parse_int_list, default=[], help="Comma-separated chunk file indices used only for validation, e.g. 97,98,99.")
+    parser.add_argument("--val-every-chunks", type=int, default=10, help="Run validation every this many global training chunks and at the final chunk.")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--beta", type=float, default=1.0)
     parser.add_argument("--warmup-chunks", type=int, default=None, help="Linearly warm up KL beta over this many global chunk steps.")
@@ -46,6 +48,8 @@ def main():
         num_chunks=args.num_chunks,
         shuffle_chunks=args.shuffle_chunks,
         exclude_chunk_idxs=args.exclude_chunk_idxs,
+        validation_chunk_idxs=args.validation_chunk_idxs,
+        val_every_chunks=args.val_every_chunks,
         lr=args.lr,
         beta=args.beta,
         warmup_chunks=args.warmup_chunks,
