@@ -1,7 +1,3 @@
-"""
-CVAE Architecture (Sohn et al. 2015):
-"""
-
 import torch
 import torch.nn as nn
 import numpy as np
@@ -9,8 +5,6 @@ import numpy as np
 if not torch.cuda.is_available():
     raise ValueError("Cannot use GPU cuda")
 device = torch.device("cuda")
-
-
 
 # ────────────
 # Sub-networks
@@ -186,8 +180,7 @@ class CVAE(nn.Module):
         return samples
 
     @torch.no_grad()
-    def price_vanilla(self, eta: torch.Tensor, K: float,
-                      r: float, T: float, opt_type: str = 'call',
+    def price_vanilla(self, eta: torch.Tensor, K: float, r: float, T: float, opt_type: str = 'call',
                       n_samples: int = 10000):
 
         samples = self.sample(eta, n_samples)
@@ -204,8 +197,7 @@ class CVAE(nn.Module):
         return np.exp(-r * T) * payoff.mean().item()
     
     @torch.no_grad()
-    def price_barrier(self, eta: torch.Tensor, B: float, K: float,
-                      r: float, T: float, opt_type: str = 'call',
+    def price_barrier(self, eta: torch.Tensor, B: float, K: float, r: float, T: float, opt_type: str = 'call',
                       n_samples: int = 10000):
 
         samples = self.sample(eta, n_samples)
@@ -223,3 +215,26 @@ class CVAE(nn.Module):
             raise ValueError("opt_type must be 'call' or 'put'")
 
         return np.exp(-r * T) * payoff.mean().item()
+
+    @torch.no_grad()
+    def total_pricing(self, eta: torch.Tensor, B: float, K: float,
+                      r: float, T: float, n_samples: int = 10000):
+        samples = self.sample(eta, n_samples)
+        if samples.shape[1] < 2:
+            raise ValueError("total_pricing requires samples with [X_T, M_T].")
+
+        X_T = samples[:, 0]
+        M_T = samples[:, 1]
+        S_T = torch.exp(X_T)
+        discount = float(np.exp(-r * T))
+
+        call_payoff = torch.clamp(S_T - K, min=0.0)
+        put_payoff = torch.clamp(K - S_T, min=0.0)
+        alive = (M_T > np.log(B)).float()
+
+        return {
+            "van_call": discount * call_payoff.mean().item(),
+            "van_put": discount * put_payoff.mean().item(),
+            "barr_call": discount * (call_payoff * alive).mean().item(),
+            "barr_put": discount * (put_payoff * alive).mean().item(),
+        }
