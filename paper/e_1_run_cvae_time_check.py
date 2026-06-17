@@ -24,6 +24,7 @@ def _empty_time_profile():
         'chunk_load': 0.0,
         'load_wait': 0.0,
         'dataloader_init': 0.0,
+        'iter_init': 0.0,
         'batch_fetch': 0.0,
         'h2d': 0.0,
         'forward': 0.0,
@@ -31,6 +32,8 @@ def _empty_time_profile():
         'clip': 0.0,
         'step': 0.0,
         'loss_item': 0.0,
+        'worker_cleanup': 0.0,
+        'loop_overhead': 0.0,
         'chunk_total': 0.0,
         'validation': 0.0,
         'batches': 0,
@@ -45,12 +48,15 @@ def _print_time_profile(profile):
         f"chunk_load={profile['chunk_load']:.2f}s | "
         f"load_wait={profile['load_wait']:.2f}s | "
         f"loader_init={profile['dataloader_init']:.2f}s | "
+        f"iter_init={profile['iter_init']:.2f}s | "
         f"batch_fetch={profile['batch_fetch']:.2f}s ({profile['batch_fetch']/batches:.4f}/batch) | "
         f"h2d={profile['h2d']:.2f}s ({profile['h2d']/batches:.4f}/batch) | "
         f"fwd={profile['forward']:.2f}s ({profile['forward']/batches:.4f}/batch) | "
         f"bwd={profile['backward']:.2f}s ({profile['backward']/batches:.4f}/batch) | "
         f"clip={profile['clip']:.2f}s ({profile['clip']/batches:.4f}/batch) | "
         f"step={profile['step']:.2f}s ({profile['step']/batches:.4f}/batch) | "
+        f"cleanup={profile['worker_cleanup']:.2f}s | "
+        f"loop_overhead={profile['loop_overhead']:.2f}s ({profile['loop_overhead']/batches:.4f}/batch) | "
         f"batches={profile['batches']}",
         flush=True,
     )
@@ -181,7 +187,10 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
         chunk_total = 0.0
         chunk_batches = 0
 
+        t0 = time.perf_counter()
         data_iter = iter(dataloader)
+        profile['iter_init'] = time.perf_counter() - t0
+
         while True:
             t0 = time.perf_counter()
             try:
@@ -235,9 +244,24 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
             chunk_batches += 1
             profile['batches'] += 1
 
-        del dataloader
+        t0 = time.perf_counter()
+        del data_iter, dataloader
+        profile['worker_cleanup'] = time.perf_counter() - t0
 
         profile['chunk_total'] = time.perf_counter() - chunk_t0
+        measured_inside_chunk = (
+            profile['dataloader_init']
+            + profile['iter_init']
+            + profile['batch_fetch']
+            + profile['h2d']
+            + profile['forward']
+            + profile['backward']
+            + profile['clip']
+            + profile['step']
+            + profile['loss_item']
+            + profile['worker_cleanup']
+        )
+        profile['loop_overhead'] = max(profile['chunk_total'] - measured_inside_chunk, 0.0)
         chunk_batches = max(chunk_batches, 1)
         chunk_avg_recon = chunk_recon / chunk_batches
         chunk_avg_kl = chunk_kl / chunk_batches
@@ -532,9 +556,10 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
         'recon_loss': [], 'KL_loss': [], 'total_loss': [], 'beta_eff': [],
         'val_global_chunk': [], 'val_recon_loss': [], 'val_KL_loss': [], 'val_total_loss': [],
         'val_beta_eff': [], 'val_kl_dim_mean': [], 'val_chunk_idxs': [], 'val_chunk_files': [],
-        'time_chunk_load': [], 'time_load_wait': [], 'time_dataloader_init': [],
+        'time_chunk_load': [], 'time_load_wait': [], 'time_dataloader_init': [], 'time_iter_init': [],
         'time_batch_fetch': [], 'time_h2d': [], 'time_forward': [], 'time_backward': [],
-        'time_clip': [], 'time_step': [], 'time_loss_item': [], 'time_chunk_total': [], 'time_batches': [],
+        'time_clip': [], 'time_step': [], 'time_loss_item': [], 'time_worker_cleanup': [],
+        'time_loop_overhead': [], 'time_chunk_total': [], 'time_batches': [],
         'time_validation': []
     }
 
@@ -654,8 +679,9 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
     if run_end_idx > run_start_idx:
         print("\n=== Time summary for this run ===")
         for key in [
-            'chunk_load', 'load_wait', 'dataloader_init', 'batch_fetch', 'h2d',
-            'forward', 'backward', 'clip', 'step', 'loss_item', 'validation', 'chunk_total'
+            'chunk_load', 'load_wait', 'dataloader_init', 'iter_init', 'batch_fetch', 'h2d',
+            'forward', 'backward', 'clip', 'step', 'loss_item', 'worker_cleanup',
+            'loop_overhead', 'validation', 'chunk_total'
         ]:
             values = chunk_loss_history.get(f'time_{key}', [])
             values = values[-num_chunks:]
