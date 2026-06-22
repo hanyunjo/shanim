@@ -449,6 +449,8 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
     if resume_path is not None: # load resume model
         cvae.load_state_dict(resume_checkpoint["model_state"])
         optimizer.load_state_dict(resume_checkpoint["optimizer_state"])
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr
         loss_history = resume_checkpoint["loss_history"]
         chunk_loss_history = resume_checkpoint.get('chunk_loss_history', empty_chunk_history.copy())
         chunk_loss_history.setdefault('global_chunk', [])
