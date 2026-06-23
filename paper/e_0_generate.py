@@ -23,16 +23,24 @@ def generate_BS_params(n_sets, seed=None):
     r = np.random.uniform(0, 0.1, n_sets)      # r ~ U(0, 0.1)
     sigma = np.random.uniform(0.001, 1, n_sets)# σ ~ U(0.001, 1)
     T = np.random.uniform(0.1, 3, n_sets)      # T ~ U(0.1, 3)
-    
 
-    params = np.stack([r, sigma, T], axis=1) # [S0, K, r, sigma, T]은 Greek 계산할 때
+    params = np.stack([r, sigma, T], axis=1)
+    return params
+
+def generate_BS_params_clip(n_sets, seed=None):
+    rng = np.random.default_rng(seed)
+
+    r = rng.integers(0, 1001, size=n_sets) / 10000.0
+    sigma = rng.integers(10, 10001, size=n_sets) / 10000.0
+    T = rng.integers(1000, 30001, size=n_sets) / 10000.0
+
+    params = np.stack([r, sigma, T], axis=1)
     return params
 
 #2) heston
 def generate_heston_params(n_sets, seed=None):
     if seed is not None:
         np.random.seed(seed)
-
     r = np.random.uniform(0, 0.1, n_sets)      # r ~ U(0, 0.1)
     lamb = np.random.beta(2, 18, n_sets) * 20  # λ ~ Beta(2, 18) × 20
     v_bar = np.random.beta(1, 19, n_sets)      # v_bar ~ Beta(1, 19)
@@ -40,6 +48,29 @@ def generate_heston_params(n_sets, seed=None):
     rho = np.random.uniform(-1, 0, n_sets)     # ρ ~ U(-1, 0)
     Y0 = np.random.beta(1, 19, n_sets)         # Y₀ ~ Beta(1, 19)
     T = np.random.uniform(0.1, 3, n_sets)      # T ~ U(0.1, 3)
+        
+    params = np.stack([r, lamb, v_bar, epsilon, rho, Y0, T], axis=1)
+    return params
+
+def generate_heston_params_clip(n_sets, seed=None):
+    rng = np.random.default_rng(seed)
+
+    r = rng.integers(0, 1001, size=n_sets) / 10000.0            # r ~ U(0, 0.1)
+    lamb = np.clip(
+        np.round(rng.beta(2,18,n_sets)*20, 4),                # λ ~ Beta(2, 18) × 20
+        0.0001, 0.9999
+    )
+    v_bar = np.clip(
+        np.round(rng.beta(1,19, n_sets), 4),                 # v_bar ~ Beta(1, 19)
+        0.0001, 0.9999
+    )
+    epsilon = rng.integers(1000, 10001, size=n_sets) / 10000.0  # ξ ~ U(0.1, 1)   
+    rho = rng.integers(-10000, 1, size=n_sets) / 10000.0        # ρ ~ U(-1, 0)
+    Y0 = np.clip(
+        np.round(rng.beta(1,19, n_sets), 4),                    # Y₀ ~ Beta(1, 19)
+        0.0001, 19.9999
+    )
+    T = rng.integers(1000, 30001, size=n_sets) / 10000.0        # T ~ U(0.1, 3)
         
     params = np.stack([r, lamb, v_bar, epsilon, rho, Y0, T], axis=1)
     return params

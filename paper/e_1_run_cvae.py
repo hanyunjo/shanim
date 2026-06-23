@@ -117,7 +117,7 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
             dataset,
             batch_size=batch_size,
             shuffle=True,
-            num_workers=8,
+            num_workers=8, # batch 단위로 데이터를 미리 준비
             persistent_workers=True,
             prefetch_factor=2,
             pin_memory=True, # GPU가 빠르게 가져갈 수 있는 CPU 메모리 영역에 올려둠.
@@ -500,6 +500,7 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
         loss_history = {'recon_loss': [], 'KL_loss': [], 'total_loss': []}
         chunk_loss_history = empty_chunk_history.copy()
 
+    print(f"learning rate : {lr}")
     # start train
     train_start = time.perf_counter()
     target_chunks = completed_chunks + num_chunks
