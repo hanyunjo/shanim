@@ -56,21 +56,21 @@ def generate_heston_params_clip(n_sets, seed=None):
     rng = np.random.default_rng(seed)
 
     r = rng.integers(0, 1001, size=n_sets) / 10000.0            # r ~ U(0, 0.1)
+    epsilon = rng.integers(1000, 10001, size=n_sets) / 10000.0  # ξ, xi ~ U(0.1, 1)   
+    rho = rng.integers(-10000, 1, size=n_sets) / 10000.0        # ρ ~ U(-1, 0)
+    T = rng.integers(1000, 30001, size=n_sets) / 10000.0        # T ~ U(0.1, 3)
     lamb = np.clip(
-        np.round(rng.beta(2,18,n_sets)*20, 4),                # λ ~ Beta(2, 18) × 20
+        np.round(rng.beta(2,18,n_sets)*20, 4),                  # λ, kappa ~ Beta(2, 18) × 20
         0.0001, 19.9999
     )
     v_bar = np.clip(
-        np.round(rng.beta(1,19, n_sets), 4),                 # v_bar ~ Beta(1, 19)
+        np.round(rng.beta(1,19, n_sets), 4),                    # v_bar, theta ~ Beta(1, 19)
         0.0001, 0.9999
     )
-    epsilon = rng.integers(1000, 10001, size=n_sets) / 10000.0  # ξ ~ U(0.1, 1)   
-    rho = rng.integers(-10000, 1, size=n_sets) / 10000.0        # ρ ~ U(-1, 0)
     Y0 = np.clip(
         np.round(rng.beta(1,19, n_sets), 4),                    # Y₀ ~ Beta(1, 19)
         0.0001, 0.9999
     )
-    T = rng.integers(1000, 30001, size=n_sets) / 10000.0        # T ~ U(0.1, 3)
         
     params = np.stack([r, lamb, v_bar, epsilon, rho, Y0, T], axis=1)
     return params
