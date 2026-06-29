@@ -2,6 +2,7 @@ import time
 from pathlib import Path
 
 import cupy as cp
+import h5py
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -19,20 +20,19 @@ from d_FDM import (
 
 ROBUSTNESS_VARIABLES_MAIN = {
     "bs": {
-        "r": [0.0025],
-        # "r": [0.0025, 0.0975],
-        # "sigma": [0.05, 0.95],
-        # "T": [0.25, 2.75],
+        "r": [0.0025, 0.0975],
+        "sigma": [0.05, 0.80], # < 0.812
+        "T": [0.15, 2.85], # σ < root(T)
     },
-    # "hes": {
-    #     "r": [0.0025, 0.0975],
-    #     "kappa": [0.4, 4.5],
-    #     "theta": [0.005, 0.15],
-    #     "xi": [0.15, 0.95],
-    #     "rho": [-0.95, -0.05],
-    #     "Y0": [0.005, 0.15],
-    #     "T": [0.25, 2.75],
-    # },
+    "hes": {
+        "r": [0.0025, 0.0975],
+        "kappa": [1.3, 4.5],    # > 1.25
+        "theta": [0.035, 0.15], # > 0.03125
+        "xi": [0.15, 0.60],     # < 0.632
+        "rho": [-0.95, -0.05],
+        "Y0": [0.005, 0.15],
+        "T": [0.15, 2.85],
+    },
 }
 
 BS_ETA_INDEX = {
@@ -58,6 +58,38 @@ OPTION_LABELS = {
     "barr_call": "Barrier Call",
     "barr_put": "Barrier Put",
 }
+
+def search_chunk_for_eta_indices(
+    chunk_path,
+    target_eta_idxs,
+    row_batch_size=100_000,
+    rdcc_nbytes=1024**2,
+):
+    chunk_path = Path(chunk_path)
+    if not chunk_path.exists():
+        return chunk_path.name, None
+
+    target_eta_idxs = np.asarray(target_eta_idxs, dtype=np.int64)
+    selected_batches = []
+
+    with h5py.File(chunk_path, "r", rdcc_nbytes=rdcc_nbytes) as h5:
+        data = h5["paths"]
+
+        for start in range(0, data.shape[0], row_batch_size):
+            end = min(start + row_batch_size, data.shape[0])
+            eta_idx_batch = data[start:end, 0].astype(np.int64)
+            local_positions = np.flatnonzero(
+                np.isin(eta_idx_batch, target_eta_idxs)
+            )
+            if len(local_positions) == 0:
+                continue
+
+            global_positions = start + local_positions
+            selected_batches.append(data[global_positions, :])
+
+    if not selected_batches:
+        return chunk_path.name, np.empty((0, 3), dtype=np.float64)
+    return chunk_path.name, np.concatenate(selected_batches, axis=0)
 
 
 def _as_numpy(value):

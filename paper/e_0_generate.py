@@ -6,6 +6,7 @@ import glob
 import time
 import h5py
 from concurrent.futures import ProcessPoolExecutor, as_completed
+import matplotlib.pyplot as plt
 from pathlib import Path
 import math
 import re
@@ -438,3 +439,215 @@ def compute_xm_stats(
     print("=" * 64)
 
     return stats
+
+
+
+
+
+# check eta distribution
+
+def collect_eta_indices_from_chunks(
+    chunk_dir="/mnt/d/bs_chunks_correction",
+    eta_path="/mnt/d/bs_eta_basic.h5",
+    chunk_idxs=range(100),
+    row_batch_size=1_000_000,
+):
+    chunk_dir = Path(chunk_dir)
+    eta_path = Path(eta_path)
+
+    with h5py.File(eta_path, "r") as h5:
+        n_etas = h5["etas"].shape[0]
+
+    used_mask = np.zeros(n_etas, dtype=bool)
+
+    for ci in chunk_idxs:
+        chunk_path = chunk_dir / f"bs_chunk_{ci:03d}.h5"
+        print("reading:", chunk_path.name)
+
+        with h5py.File(chunk_path, "r") as h5:
+            data = h5["paths"]
+            n_rows = data.shape[0]
+
+            for start in range(0, n_rows, row_batch_size):
+                end = min(start + row_batch_size, n_rows)
+
+                eta_idxs = data[start:end, 0].astype(np.int64)
+                used_mask[eta_idxs] = True
+
+    eta_indices = np.flatnonzero(used_mask)
+    return eta_indices
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+def plot_eta_3d_density_scatter(
+    etas,
+    max_plot_points=200_000,
+    bins=40,
+    seed=1234,
+    elev=25,
+    azim=45,
+):
+    etas = np.asarray(etas)
+
+    if max_plot_points is not None and len(etas) > max_plot_points:
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(len(etas), size=max_plot_points, replace=False)
+        plot_etas = etas[idx]
+    else:
+        plot_etas = etas
+
+    r = plot_etas[:, 0]
+    sigma = plot_etas[:, 1]
+    T = plot_etas[:, 2]
+
+    counts, edges = np.histogramdd(
+        plot_etas[:, :3],
+        bins=bins,
+    )
+
+    r_bin = np.clip(np.searchsorted(edges[0], r, side="right") - 1, 0, bins - 1)
+    s_bin = np.clip(np.searchsorted(edges[1], sigma, side="right") - 1, 0, bins - 1)
+    t_bin = np.clip(np.searchsorted(edges[2], T, side="right") - 1, 0, bins - 1)
+
+    density = counts[r_bin, s_bin, t_bin]
+
+    fig = plt.figure(figsize=(9, 7))
+    ax = fig.add_subplot(111, projection="3d")
+
+    sc = ax.scatter(
+        r,
+        sigma,
+        T,
+        c=density,
+        cmap="viridis",
+        s=2,
+        alpha=0.35,
+    )
+
+    ax.set_xlabel("r")
+    ax.set_ylabel("sigma")
+    ax.set_zlabel("T")
+    ax.set_title(f"3D eta density scatter | plotted {len(plot_etas):,}")
+    ax.view_init(elev=elev, azim=azim)
+
+    fig.colorbar(sc, ax=ax, shrink=0.6, label="local bin count")
+    plt.tight_layout()
+    plt.show()
+
+    return plot_etas, density
+
+# eta min/max
+def _chunk_used_eta_minmax_worker(args):
+    chunk_path, eta_path, row_batch_size = args
+    chunk_path = Path(chunk_path)
+    eta_path = Path(eta_path)
+
+    used_min = None
+    used_max = None
+    used_count = 0
+
+    with h5py.File(eta_path, "r") as eta_h5:
+        etas = eta_h5["etas"]
+
+        with h5py.File(chunk_path, "r") as chunk_h5:
+            paths = chunk_h5["paths"]
+            n_rows = paths.shape[0]
+
+            for start in range(0, n_rows, row_batch_size):
+                end = min(start + row_batch_size, n_rows)
+
+                eta_idx = paths[start:end, 0].astype(np.int64)
+                eta_idx = np.unique(eta_idx)
+
+                eta_batch = etas[eta_idx].astype(np.float32)
+
+                batch_min = eta_batch.min(axis=0)
+                batch_max = eta_batch.max(axis=0)
+
+                if used_min is None:
+                    used_min = batch_min
+                    used_max = batch_max
+                else:
+                    used_min = np.minimum(used_min, batch_min)
+                    used_max = np.maximum(used_max, batch_max)
+
+                used_count += len(eta_idx)
+
+    return chunk_path.name, used_min, used_max, used_count
+
+def compare_eta_minmax_all_vs_used_parallel(
+    eta_path,
+    chunk_dir,
+    prefix,
+    chunk_idxs=range(100),
+    row_batch_size=1_000_000,
+    max_workers=4,
+):
+    eta_path = Path(eta_path)
+    chunk_dir = Path(chunk_dir)
+
+    chunk_paths = [
+        chunk_dir / f"{prefix}_chunk_{ci:03d}.h5"
+        for ci in chunk_idxs
+    ]
+
+    with h5py.File(eta_path, "r") as h5:
+        etas = h5["etas"][:].astype(np.float32)
+
+    all_min = etas.min(axis=0)
+    all_max = etas.max(axis=0)
+    n_total_etas = len(etas)
+
+    global_used_min = None
+    global_used_max = None
+    used_count_sum = 0
+
+    tasks = [
+        (chunk_path, eta_path, row_batch_size)
+        for chunk_path in chunk_paths
+    ]
+
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(_chunk_used_eta_minmax_worker, task)
+            for task in tasks
+        ]
+
+        for future in as_completed(futures):
+            chunk_name, chunk_min, chunk_max, used_count = future.result()
+
+            print(f"done: {chunk_name} | unique idx in batches sum={used_count:,}")
+
+            if global_used_min is None:
+                global_used_min = chunk_min
+                global_used_max = chunk_max
+            else:
+                global_used_min = np.minimum(global_used_min, chunk_min)
+                global_used_max = np.maximum(global_used_max, chunk_max)
+
+            used_count_sum += used_count
+
+    print("\n전체 eta 개수:", n_total_etas)
+    print("chunk별 unique 합계:", used_count_sum)
+    print("주의: chunk별 unique 합계는 chunk 간 중복 eta index를 제거한 값은 아님")
+
+    print("\nall_min :", all_min)
+    print("used_min:", global_used_min)
+    print("diff_min:", global_used_min - all_min)
+
+    print("\nall_max :", all_max)
+    print("used_max:", global_used_max)
+    print("diff_max:", global_used_max - all_max)
+
+    print("\nmin same:", np.allclose(all_min, global_used_min))
+    print("max same:", np.allclose(all_max, global_used_max))
+
+    return {
+        "all_min": all_min,
+        "all_max": all_max,
+        "used_min": global_used_min,
+        "used_max": global_used_max,
+        "diff_min": global_used_min - all_min,
+        "diff_max": global_used_max - all_max,
+    }

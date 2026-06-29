@@ -16,8 +16,12 @@ device = torch.device("cuda")
 # _basic(eta에 B가 없는 버전), _B
 BS_CHUNK_DIR  = "/mnt/d/bs_chunks_correction/"
 BS_ETA_PATH   = "/mnt/d/bs_eta_basic.h5"
+BS_CLIP_CHUNK_DIR  = "/mnt/d/bs_clip_chunks_correction/"
+BS_CLIP_ETA_PATH   = "/mnt/d/bs_eta_clip.h5"
 HES_CHUNK_DIR = "/mnt/d/heston_chunks_correction/"
 HES_ETA_PATH  = "/mnt/d/heston_eta_basic.h5"
+HES_CLIP_CHUNK_DIR = "/mnt/d/heston_clip_chunks_correction/"
+HES_CLIP_ETA_PATH  = "/mnt/d/heston_eta_clip.h5"
 
 
 # ──────────────────────────────────────────────
@@ -71,6 +75,8 @@ def _chunk_sort_key(chunk_path):
     return _chunk_file_idx(chunk_path)
 
 
+
+
 # ─────────────
 # 2.train
 # ─────────────
@@ -119,7 +125,7 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
             shuffle=True,
             num_workers=8, # batch 단위로 데이터를 미리 준비
             persistent_workers=True,
-            prefetch_factor=2,
+            prefetch_factor=1,
             pin_memory=True, # GPU가 빠르게 가져갈 수 있는 CPU 메모리 영역에 올려둠.
             drop_last=True
         )
@@ -185,7 +191,7 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
                     shuffle=False,
                     num_workers=8,
                     persistent_workers=True,
-                    prefetch_factor=2,
+                    prefetch_factor=1,
                     pin_memory=True,
                     drop_last=False,
                 )
@@ -341,6 +347,12 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
     elif model_type == 'bs':
         chunk_dir = BS_CHUNK_DIR
         eta_path  = BS_ETA_PATH
+    elif model_type == 'bs_clip':
+        chunk_dir = BS_CLIP_CHUNK_DIR
+        eta_path  = BS_CLIP_ETA_PATH
+    elif model_type == 'hes_clip':
+        chunk_dir = HES_CLIP_CHUNK_DIR
+        eta_path  = HES_CLIP_ETA_PATH
     else:
         raise ValueError("model_type must be 'hes' or 'bs'")
 
@@ -564,9 +576,15 @@ def benchmark_one_chunk(model_type='hes', barr_type='barr', dim_z=8, hidden_dims
     if model_type == 'hes':
         chunk_dir = HES_CHUNK_DIR
         eta_path  = HES_ETA_PATH
-    else:
+    elif  model_type == 'bs':
         chunk_dir = BS_CHUNK_DIR
         eta_path  = BS_ETA_PATH
+    elif model_type == 'bs_clip':
+        chunk_dir = BS_CLIP_CHUNK_DIR
+        eta_path  = BS_CLIP_ETA_PATH
+    elif model_type == 'hes_clip':
+        chunk_dir = HES_CLIP_CHUNK_DIR
+        eta_path  = HES_CLIP_ETA_PATH
 
     dim_x = 2
 
@@ -593,7 +611,7 @@ def benchmark_one_chunk(model_type='hes', barr_type='barr', dim_z=8, hidden_dims
         pin_memory=True,
         drop_last=True,
         persistent_workers=True, 
-        prefetch_factor=2,
+        prefetch_factor=1,
     )
 
     torch.cuda.synchronize()
