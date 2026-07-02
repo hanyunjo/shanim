@@ -59,6 +59,24 @@ OPTION_LABELS = {
     "barr_put": "Barrier Put",
 }
 
+MODEL_BACKEND = {
+    "bs": "bs",
+    "bs_clip": "bs",
+    "hes": "hes",
+    "hes_clip": "hes",
+}
+
+# clip 모델은 CVAE checkpoint/결과 라벨만 다르고 closed/FDM/MC 계산식은 원 모델과 같다.
+ROBUSTNESS_VARIABLES_MAIN.setdefault("bs_clip", ROBUSTNESS_VARIABLES_MAIN["bs"])
+ROBUSTNESS_VARIABLES_MAIN.setdefault("hes_clip", ROBUSTNESS_VARIABLES_MAIN["hes"])
+
+
+def _model_backend(model_name):
+    try:
+        return MODEL_BACKEND[model_name]
+    except KeyError as exc:
+        raise ValueError(f"model_name must be one of {sorted(MODEL_BACKEND)}.") from exc
+
 def search_chunk_for_eta_indices(
     chunk_path,
     target_eta_idxs,
@@ -176,7 +194,9 @@ def _mc_total_pricing(
     S0, K, r = float(eta[0]), float(eta[1]), float(eta[2])
     T = float(eta[-1])
 
-    if model_name == "bs":
+    backend_model = _model_backend(model_name)
+
+    if backend_model == "bs":
         if need_barrier:
             S_T, knocked = generate_BS_paths_gpu(
                 eta, n_paths=n_samples, dt=dt, B=barrier
@@ -188,7 +208,7 @@ def _mc_total_pricing(
                 (r - 0.5 * sigma**2) * T + sigma * cp.sqrt(T) * z
             )
             knocked = cp.zeros(n_samples, dtype=bool)
-    elif model_name == "hes":
+    elif backend_model == "hes":
         X_T, knocked = generate_heston_paths_gpu(
             eta,
             n_paths=n_samples,
@@ -197,7 +217,7 @@ def _mc_total_pricing(
         )
         S_T = S0 * cp.exp(X_T)
     else:
-        raise ValueError("model_name must be 'bs' or 'hes'.")
+        raise ValueError(f"Unsupported backend model: {backend_model}")
 
     call_payoff = cp.maximum(S_T - K, 0.0)
     put_payoff = cp.maximum(K - S_T, 0.0)
@@ -276,7 +296,9 @@ def _benchmark_case(model_name, eta, barr_type, option_type, *, barrier, run_fdm
     }
     errors = []
 
-    if model_name == "bs":
+    backend_model = _model_backend(model_name)
+
+    if backend_model == "bs":
         if barr_type == "van":
             closed_fn = lambda: BS_vanilla(eta, option_type)
         else:
@@ -294,7 +316,7 @@ def _benchmark_case(model_name, eta, barr_type, option_type, *, barrier, run_fdm
             if error:
                 errors.append(f"fdm={error}")
 
-    elif model_name == "hes":
+    elif backend_model == "hes":
         if run_fdm:
             if barr_type == "van":
                 fdm_fn = lambda: CS_ADI_heston_vanilla(eta, type=option_type, dv=0.0001)
@@ -306,7 +328,7 @@ def _benchmark_case(model_name, eta, barr_type, option_type, *, barrier, run_fdm
             if error:
                 errors.append(f"fdm={error}")
     else:
-        raise ValueError("model_name must be 'bs' or 'hes'.")
+        raise ValueError(f"Unsupported backend model: {backend_model}")
 
     return row, errors
 
@@ -334,7 +356,7 @@ def run_robustness(
     option_types = tuple(option_types)
     n_samples_list = tuple(int(n) for n in n_samples_list)
 
-    invalid_models = set(models) - {"bs", "hes"}
+    invalid_models = set(models) - set(MODEL_BACKEND)
     if invalid_models:
         raise ValueError(f"Unknown models: {sorted(invalid_models)}")
     if set(barr_types) - {"van", "barr"}:
@@ -359,12 +381,14 @@ def run_robustness(
     largest_n = max(n_samples_list)
 
     for model_name in models:
-        if model_name not in robustness_variables:
+        backend_model = _model_backend(model_name)
+        variable_key = model_name if model_name in robustness_variables else backend_model
+        if variable_key not in robustness_variables:
             raise KeyError(
                 f"No robustness variables configured for model '{model_name}'."
             )
-        base_eta, eta_index = specs[model_name]
-        variable_values = robustness_variables[model_name]
+        base_eta, eta_index = specs[backend_model]
+        variable_values = robustness_variables[variable_key]
 
         for variable, requested_values in variable_values.items():
             index = eta_index[variable]
@@ -381,7 +405,7 @@ def run_robustness(
                         cvae_data = _cvae_cases(
                             cvae,
                             checkpoint,
-                            model_name,
+                            backend_model,
                             eta,
                             barrier=barrier,
                             device=device,
@@ -412,7 +436,7 @@ def run_robustness(
                             f"| {barr_type} {option_type}"
                         )
                         benchmark, errors = _benchmark_case(
-                            model_name,
+                            backend_model,
                             eta,
                             barr_type,
                             option_type,
@@ -472,8 +496,9 @@ def run_robustness(
     results.attrs["n_samples_list"] = n_samples_list
     results.attrs["mc_repeats"] = mc_repeats
     results.attrs["cvae_repeats"] = cvae_repeats
+    is_bs_backend = results["model"].map(lambda name: _model_backend(name) == "bs")
     results["reference"] = np.where(
-        results["model"].eq("bs"), results["closed"], results["fdm"]
+        is_bs_backend, results["closed"], results["fdm"]
     )
 
     for method in ("fdm", "mc", "cvae"):
@@ -592,7 +617,7 @@ def plot_sampling_comparison(results, model_name, variable, value):
             )
 
         reference = float(option_data["reference"].iloc[0])
-        reference_label = "Closed" if model_name == "bs" else "FDM"
+        reference_label = "Closed" if _model_backend(model_name) == "bs" else "FDM"
         ax.axhline(
             reference,
             color="red",
@@ -612,7 +637,12 @@ def plot_sampling_comparison(results, model_name, variable, value):
         ax.grid(True, alpha=0.3)
         ax.legend()
 
-    fig.suptitle(f"{model_name} robustness | {variable}={value:g}")
+    if model_name == 'bs':
+        fig_name = 'BS'
+    elif model_name == 'hes':
+        fig_name = 'Heston'
+
+    fig.suptitle(f"{fig_name} robustness | {variable}={value:g}")
     plt.tight_layout()
     plt.show()
     return fig, axes

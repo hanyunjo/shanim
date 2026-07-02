@@ -7,7 +7,8 @@ import os
 import re
 from torch.utils.data import Dataset, DataLoader
 from concurrent.futures import ThreadPoolExecutor
-from e_2_CVAE import *
+from e_2_CVAE import CVAE as BaseCVAE, freeze_batchnorm
+from e_2_CVAE_barr_weight import CVAEBarrWeight
 
 if not torch.cuda.is_available():
     raise ValueError("Cannot use GPU cuda")
@@ -27,8 +28,36 @@ HES_CLIP_ETA_PATH  = "/mnt/d/heston_eta_clip.h5"
 # ──────────────────────────────────────────────
 # 1. Dataset
 # ──────────────────────────────────────────────
+class GpuChunk:
+    def __init__(self, x, eta):
+        self.x = x
+        self.eta = eta
+
+    def __len__(self):
+        return self.x.shape[0]
+
+
+def load_chunk_file_to_gpu(chunk_path, etas, eta_min, eta_max):
+    with h5py.File(chunk_path, 'r') as f:
+        paths = f['paths'][:] # (N, 3) : [ori_idx, X_T, M_T]
+
+    ori_idx = paths[:, 0].astype(np.int64, copy=False)
+    x_np = paths[:, 1:3].astype(np.float32, copy=True)
+
+    eta_np = etas[ori_idx].astype(np.float32, copy=True)
+    eta_np = (eta_np - eta_min) / (eta_max - eta_min + 1e-8)
+
+    del paths, ori_idx
+
+    x_gpu = torch.from_numpy(x_np).to(device)
+    eta_gpu = torch.from_numpy(eta_np).to(device)
+
+    del x_np, eta_np
+    return GpuChunk(x_gpu, eta_gpu)
+
+
+
 class ChunkDataset(Dataset):
-    # 청크 파일 하나를 RAM에 로드.
     def __init__(self, chunk_path, etas, eta_min, eta_max):
 
         with h5py.File(chunk_path, 'r') as f:
@@ -42,7 +71,6 @@ class ChunkDataset(Dataset):
         eta_matched = (eta_matched - eta_min) / (eta_max - eta_min + 1e-8)
 
         self.x = torch.tensor(np.stack([X_T, M_T], axis=1))  # (N, 2)
-
         self.eta = torch.tensor(eta_matched)   # (N, dim_eta)
 
     def __len__(self):
@@ -75,6 +103,51 @@ def _chunk_sort_key(chunk_path):
     return _chunk_file_idx(chunk_path)
 
 
+def _normalize_cvae_type(cvae_type):
+    aliases = {
+        None: "base",
+        "base": "base",
+        "cvae": "base",
+        "CVAE": "base",
+        "barr_weight": "barr_weight",
+        "barrier_weight": "barr_weight",
+        "cvae_barr_weight": "barr_weight",
+        "CVAE_barr_weight": "barr_weight",
+    }
+    if cvae_type not in aliases:
+        raise ValueError("cvae_type must be 'base' or 'barr_weight'")
+    return aliases[cvae_type]
+
+
+def _make_cvae(cvae_type, dim_x, dim_eta, dim_z, hidden_dims, use_bn,
+               weight_mode, weight_alpha, weight_h, weight_normalize, S0, K, B):
+    cvae_type = _normalize_cvae_type(cvae_type)
+    if cvae_type == "base":
+        return BaseCVAE(
+            dim_x=dim_x,
+            dim_eta=dim_eta,
+            dim_z=dim_z,
+            hidden_dims=hidden_dims,
+            use_bn=use_bn,
+        )
+
+    return CVAEBarrWeight(
+        dim_x=dim_x,
+        dim_eta=dim_eta,
+        dim_z=dim_z,
+        hidden_dims=hidden_dims,
+        use_bn=use_bn,
+        weight_mode=weight_mode,
+        weight_alpha=weight_alpha,
+        weight_h=weight_h,
+        weight_normalize=weight_normalize,
+        S0=S0,
+        K=K,
+        B=B,
+    )
+
+
+CVAE = BaseCVAE
 
 
 # ─────────────
@@ -83,7 +156,10 @@ def _chunk_sort_key(chunk_path):
 def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
                 lr=1e-3, beta=1.0, warmup_chunks=None, use_bn=False, bn_chunks=None, 
                 num_chunks=None, shuffle_chunks=True, save_path=None, resume_path=None,
-                exclude_chunk_idxs=None, validation_chunk_idxs=None, val_every_chunks=10):
+                exclude_chunk_idxs=None, validation_chunk_idxs=None, val_every_chunks=10,
+                memory_on_gpu=False, cvae_type="base", weight_mode="barrier_put",
+                weight_alpha=3.0, weight_h=0.05, weight_normalize=True,
+                S0=1.0, K=1.0, B=0.8):
     
     def chunk_order_for_epoch(epoch):
         chunk_indices = np.array(trainable_chunk_idxs, dtype=int)
@@ -103,6 +179,9 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
         dataset = ChunkDataset(chunk_path_by_idx[int(ci)], etas, eta_min, eta_max)
         return dataset
 
+    def load_chunk_gpu(ci):
+        return load_chunk_file_to_gpu(chunk_path_by_idx[int(ci)], etas, eta_min, eta_max)
+
     def apply_bn_mode(global_chunk):
         if not use_bn:
             return "off"
@@ -119,17 +198,6 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
         return float(beta) * ratio
 
     def train_one_chunk(dataset, global_chunk):
-        dataloader = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=8, # batch 단위로 데이터를 미리 준비
-            persistent_workers=True,
-            prefetch_factor=1,
-            pin_memory=True, # GPU가 빠르게 가져갈 수 있는 CPU 메모리 영역에 올려둠.
-            drop_last=True
-        )
-
         cvae.train()
         bn_mode = apply_bn_mode(global_chunk)
         beta_eff = beta_eff_for_chunk(global_chunk)
@@ -137,31 +205,78 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
         chunk_kl = 0.0
         chunk_total = 0.0
         chunk_batches = 0
-        for x_batch, eta_batch in dataloader:
-            x_batch   = x_batch.to(device,non_blocking=True) # CPU에서 GPU로 비동기식 전송
-            eta_batch = eta_batch.to(device, non_blocking=True)
 
-            recon_loss, kl_loss = cvae(x_batch, eta_batch)
-            loss = recon_loss + beta_eff * kl_loss
+        if memory_on_gpu:
+            n_rows = len(dataset)
+            n_train = (n_rows // batch_size) * batch_size
+            if n_train == 0:
+                raise ValueError(f"batch_size={batch_size} is larger than chunk rows={n_rows}")
 
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(cvae.parameters(), max_norm=5.0)
-            optimizer.step()
+            order = torch.randperm(n_rows, device=device)
+            for start in range(0, n_train, batch_size):
+                end = start + batch_size
+                batch_idx = order[start:end]
+                x_batch = dataset.x[batch_idx]
+                eta_batch = dataset.eta[batch_idx]
 
-            recon_value = recon_loss.item()
-            kl_value = kl_loss.item()
-            total_value = loss.item()
-            epoch_accum['recon_sum'] += recon_value
-            epoch_accum['kl_sum'] += kl_value
-            epoch_accum['total_sum'] += total_value
-            epoch_accum['n_batches'] += 1
-            chunk_recon += recon_value
-            chunk_kl += kl_value
-            chunk_total += total_value
-            chunk_batches += 1
+                recon_loss, kl_loss = cvae(x_batch, eta_batch)
+                loss = recon_loss + beta_eff * kl_loss
 
-        del dataloader
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(cvae.parameters(), max_norm=5.0)
+                optimizer.step()
+
+                recon_value = recon_loss.item()
+                kl_value = kl_loss.item()
+                total_value = loss.item()
+                epoch_accum['recon_sum'] += recon_value
+                epoch_accum['kl_sum'] += kl_value
+                epoch_accum['total_sum'] += total_value
+                epoch_accum['n_batches'] += 1
+                chunk_recon += recon_value
+                chunk_kl += kl_value
+                chunk_total += total_value
+                chunk_batches += 1
+
+            del order
+        else:
+            dataloader = DataLoader(
+                dataset,
+                batch_size=batch_size,
+                shuffle=True,
+                num_workers=8, # batch 단위로 데이터를 미리 준비
+                persistent_workers=True,
+                prefetch_factor=1,
+                pin_memory=True, # GPU가 빠르게 가져갈 수 있는 CPU 메모리 영역에 올려둠.
+                drop_last=True
+            )
+
+            for x_batch, eta_batch in dataloader:
+                x_batch   = x_batch.to(device,non_blocking=True) # CPU에서 GPU로 비동기식 전송
+                eta_batch = eta_batch.to(device, non_blocking=True)
+
+                recon_loss, kl_loss = cvae(x_batch, eta_batch)
+                loss = recon_loss + beta_eff * kl_loss
+
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(cvae.parameters(), max_norm=5.0)
+                optimizer.step()
+
+                recon_value = recon_loss.item()
+                kl_value = kl_loss.item()
+                total_value = loss.item()
+                epoch_accum['recon_sum'] += recon_value
+                epoch_accum['kl_sum'] += kl_value
+                epoch_accum['total_sum'] += total_value
+                epoch_accum['n_batches'] += 1
+                chunk_recon += recon_value
+                chunk_kl += kl_value
+                chunk_total += total_value
+                chunk_batches += 1
+
+            del dataloader
 
         chunk_batches = max(chunk_batches, 1)
         chunk_avg_recon = chunk_recon / chunk_batches
@@ -184,34 +299,57 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
 
         with torch.no_grad():
             for ci in sorted(validation_chunk_idxs):
-                dataset = load_chunk(ci)
-                dataloader = DataLoader(
-                    dataset,
-                    batch_size=batch_size,
-                    shuffle=False,
-                    num_workers=8,
-                    persistent_workers=True,
-                    prefetch_factor=1,
-                    pin_memory=True,
-                    drop_last=False,
-                )
-                for x_batch, eta_batch in dataloader:
-                    x_batch = x_batch.to(device, non_blocking=True)
-                    eta_batch = eta_batch.to(device, non_blocking=True)
+                dataset = load_chunk_gpu(ci) if memory_on_gpu else load_chunk(ci)
 
-                    recon_loss, kl_loss, kl_dim_mean = cvae(x_batch, eta_batch, return_kl_dim=True)
-                    loss = recon_loss + beta_eff * kl_loss
+                if memory_on_gpu:
+                    n_rows = len(dataset)
+                    for start in range(0, n_rows, batch_size):
+                        end = min(start + batch_size, n_rows)
+                        x_batch = dataset.x[start:end]
+                        eta_batch = dataset.eta[start:end]
 
-                    val_recon += recon_loss.item()
-                    val_kl += kl_loss.item()
-                    val_total += loss.item()
-                    val_batches += 1
-                    kl_dim_cpu = kl_dim_mean.detach().cpu()
-                    if val_kl_dim_sum is None:
-                        val_kl_dim_sum = torch.zeros_like(kl_dim_cpu)
-                    val_kl_dim_sum += kl_dim_cpu
+                        recon_loss, kl_loss, kl_dim_mean = cvae(x_batch, eta_batch, return_kl_dim=True)
+                        loss = recon_loss + beta_eff * kl_loss
 
-                del dataloader, dataset
+                        val_recon += recon_loss.item()
+                        val_kl += kl_loss.item()
+                        val_total += loss.item()
+                        val_batches += 1
+                        kl_dim_cpu = kl_dim_mean.detach().cpu()
+                        if val_kl_dim_sum is None:
+                            val_kl_dim_sum = torch.zeros_like(kl_dim_cpu)
+                        val_kl_dim_sum += kl_dim_cpu
+
+                    del dataset
+                    torch.cuda.empty_cache()
+                else:
+                    dataloader = DataLoader(
+                        dataset,
+                        batch_size=batch_size,
+                        shuffle=False,
+                        num_workers=8,
+                        persistent_workers=True,
+                        prefetch_factor=1,
+                        pin_memory=True,
+                        drop_last=False,
+                    )
+                    for x_batch, eta_batch in dataloader:
+                        x_batch = x_batch.to(device, non_blocking=True)
+                        eta_batch = eta_batch.to(device, non_blocking=True)
+
+                        recon_loss, kl_loss, kl_dim_mean = cvae(x_batch, eta_batch, return_kl_dim=True)
+                        loss = recon_loss + beta_eff * kl_loss
+
+                        val_recon += recon_loss.item()
+                        val_kl += kl_loss.item()
+                        val_total += loss.item()
+                        val_batches += 1
+                        kl_dim_cpu = kl_dim_mean.detach().cpu()
+                        if val_kl_dim_sum is None:
+                            val_kl_dim_sum = torch.zeros_like(kl_dim_cpu)
+                        val_kl_dim_sum += kl_dim_cpu
+
+                    del dataloader, dataset
 
         if was_training:
             cvae.train()
@@ -244,6 +382,8 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
             'use_bn'      : use_bn,
             'bn_chunks'   : bn_chunks,
             'warmup_chunks': warmup_chunks,
+            'cvae_type'   : cvae_type,
+            'weight_config': weight_config,
             'loss_history': loss_history, # epoch별 평균 손실 기록
             'chunk_loss_history': chunk_loss_history,
             'num_chunks'  : num_chunks,
@@ -253,6 +393,7 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
             'excluded_chunk_idxs': sorted(exclude_chunk_idxs),
             'validation_chunk_idxs': sorted(validation_chunk_idxs),
             'val_every_chunks': val_every_chunks,
+            'memory_on_gpu': memory_on_gpu,
             'num_all_chunks': num_all_chunks,
             'all_chunk_idxs': all_chunk_idxs,
             'epoch'          : completed_epochs,
@@ -340,6 +481,17 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
 
     if hidden_dims is None:
         hidden_dims = [128, 128, 64]
+
+    cvae_type = _normalize_cvae_type(cvae_type)
+    weight_config = {
+        'weight_mode': weight_mode,
+        'weight_alpha': float(weight_alpha),
+        'weight_h': float(weight_h),
+        'weight_normalize': bool(weight_normalize),
+        'S0': float(S0),
+        'K': float(K),
+        'B': float(B),
+    }
 
     if model_type == 'hes':
         chunk_dir = HES_CHUNK_DIR
@@ -443,8 +595,37 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
         if checkpoint_dim_eta != dim_eta:
             raise ValueError(f"checkpoint dim_eta={checkpoint_dim_eta}, current eta dim={dim_eta}")
 
+        checkpoint_cvae_type = _normalize_cvae_type(resume_checkpoint.get('cvae_type', 'base'))
+        if checkpoint_cvae_type != cvae_type:
+            raise ValueError(
+                f"checkpoint cvae_type={checkpoint_cvae_type}, current cvae_type={cvae_type}. "
+                "다른 CVAE loss로 이어서 학습하려면 새 save_path로 별도 실험을 시작하세요."
+            )
+        if cvae_type == 'barr_weight':
+            checkpoint_weight_config = resume_checkpoint.get('weight_config', {})
+            for key, value in weight_config.items():
+                if key in checkpoint_weight_config and checkpoint_weight_config[key] != value:
+                    raise ValueError(
+                        f"checkpoint weight_config[{key}]={checkpoint_weight_config[key]}, "
+                        f"current {key}={value}"
+                    )
+
     # 모델 생성
-    cvae = CVAE(dim_x=dim_x, dim_eta=dim_eta, dim_z=dim_z, hidden_dims=hidden_dims, use_bn=use_bn)
+    cvae = _make_cvae(
+        cvae_type,
+        dim_x=dim_x,
+        dim_eta=dim_eta,
+        dim_z=dim_z,
+        hidden_dims=hidden_dims,
+        use_bn=use_bn,
+        weight_mode=weight_mode,
+        weight_alpha=weight_alpha,
+        weight_h=weight_h,
+        weight_normalize=weight_normalize,
+        S0=S0,
+        K=K,
+        B=B,
+    )
     cvae.bn_chunks = bn_chunks
     cvae.to(device)
     optimizer = torch.optim.Adam(cvae.parameters(), lr=lr)
@@ -520,13 +701,17 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
         f"학습 시작 | 이번 실행 chunks={num_chunks} | "
         f"진행 chunks={completed_chunks}->{target_chunks} | files/epoch={total_chunks} | "
         f"excluded={sorted(exclude_chunk_idxs)} | validation={sorted(validation_chunk_idxs)} | "
-        f"val_every_chunks={val_every_chunks} | bn_chunks={bn_chunks} | warmup_chunks={warmup_chunks}"
+        f"val_every_chunks={val_every_chunks} | bn_chunks={bn_chunks} | warmup_chunks={warmup_chunks} | "
+        f"memory_on_gpu={memory_on_gpu} | cvae_type={cvae_type}"
     )
+    if cvae_type == 'barr_weight':
+        print(f"weighted recon config: {weight_config}")
 
+    chunk_loader = load_chunk_gpu if memory_on_gpu else load_chunk
     current_epoch_start = time.perf_counter()
     with ThreadPoolExecutor(max_workers=1) as prefetcher:
         _, _, first_ci = chunk_info(completed_chunks)
-        future = prefetcher.submit(load_chunk, first_ci)
+        future = prefetcher.submit(chunk_loader, first_ci)
 
         for offset in range(num_chunks):
             global_chunk = completed_chunks + offset
@@ -538,12 +723,14 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
             dataset = future.result()
             if offset + 1 < num_chunks:
                 _, _, next_ci = chunk_info(global_chunk + 1)
-                future = prefetcher.submit(load_chunk, next_ci)
+                future = prefetcher.submit(chunk_loader, next_ci)
 
             chunk_losses = train_one_chunk(dataset, global_chunk)
             record_chunk_loss(global_chunk, epoch, chunk_pos, ci, chunk_losses)
 
             del dataset
+            if memory_on_gpu:
+                torch.cuda.empty_cache()
 
             current_chunks = global_chunk + 1
             should_validate = (
@@ -568,7 +755,7 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
 # ─────────────
 # 2-1. test one chunk train time
 # ─────────────
-def benchmark_one_chunk(model_type='hes', barr_type='barr', dim_z=8, hidden_dims=None,
+def benchmark_one_chunk(model_type='hes', dim_z=8, hidden_dims=None,
                         batch_size=1024, lr=1e-3, beta=1.0, chunk_idx=0):
     if hidden_dims is None:
         hidden_dims = [128, 128, 64]
@@ -647,8 +834,107 @@ def benchmark_one_chunk(model_type='hes', barr_type='barr', dim_z=8, hidden_dims
     print(f"total time      : {load_time + train_time:.2f} sec")
     print(f"n_batches       : {n_batches}")
     print(f"avg batch time  : {train_time / n_batches:.4f} sec")
-    print(f"recon loss      : {total_recon / n_batches:.6f}")
-    print(f"KL loss         : {total_kl / n_batches:.6f}")
-    print(f"GPU memory      : {torch.cuda.max_memory_allocated() / 1024**3:.2f} GB")
+
+    return train_time
+
+def benchmark_one_chunk_gpu(model_type='hes', dim_z=8, hidden_dims=None,
+                        batch_size=1024, lr=1e-3, beta=1.0, chunk_idx=0,
+                        shuffle_rows=True):
+    if hidden_dims is None:
+        hidden_dims = [128, 128, 64]
+
+    if model_type == 'hes':
+        chunk_dir = HES_CHUNK_DIR
+        eta_path  = HES_ETA_PATH
+    elif  model_type == 'bs':
+        chunk_dir = BS_CHUNK_DIR
+        eta_path  = BS_ETA_PATH
+    elif model_type == 'bs_clip':
+        chunk_dir = BS_CLIP_CHUNK_DIR
+        eta_path  = BS_CLIP_ETA_PATH
+    elif model_type == 'hes_clip':
+        chunk_dir = HES_CLIP_CHUNK_DIR
+        eta_path  = HES_CLIP_ETA_PATH
+    else:
+        raise ValueError("model_type must be 'hes', 'bs', 'bs_clip', or 'hes_clip'")
+
+    dim_x = 2
+
+    chunk_paths = sorted(glob.glob(os.path.join(chunk_dir, "*.h5")), key=_chunk_sort_key)
+    if len(chunk_paths) == 0:
+        raise FileNotFoundError(f"No chunk files found in {chunk_dir}")
+
+    if chunk_idx not in range(len(chunk_paths)):
+        raise ValueError(f"chunk_idx must be between 0 and {len(chunk_paths) - 1}")
+
+    etas, eta_min, eta_max = compute_eta_stats(eta_path)
+    dim_eta = etas.shape[1]
+
+    cvae = CVAE(dim_x=dim_x, dim_eta=dim_eta, dim_z=dim_z, hidden_dims=hidden_dims).to(device)
+    optimizer = torch.optim.Adam(cvae.parameters(), lr=lr)
+
+    torch.cuda.reset_peak_memory_stats()
+
+    # chunk load to GPU time
+    torch.cuda.synchronize()
+    load_start = time.perf_counter()
+    dataset = load_chunk_file_to_gpu(chunk_paths[chunk_idx], etas, eta_min, eta_max)
+    torch.cuda.synchronize()
+    load_time = time.perf_counter() - load_start
+
+    n_rows = len(dataset)
+    n_train = (n_rows // batch_size) * batch_size
+    if n_train == 0:
+        raise ValueError(f"batch_size={batch_size} is larger than chunk rows={n_rows}")
+
+    torch.cuda.synchronize()
+    train_start = time.perf_counter()
+
+    cvae.train()
+    total_recon = 0.0
+    total_kl = 0.0
+    n_batches = 0
+    print("GPU chunk 학습 시작")
+
+    order = torch.randperm(n_rows, device=device) if shuffle_rows else None
+
+    for start in range(0, n_train, batch_size):
+        end = start + batch_size
+        if order is None:
+            x_batch = dataset.x[start:end]
+            eta_batch = dataset.eta[start:end]
+        else:
+            batch_idx = order[start:end]
+            x_batch = dataset.x[batch_idx]
+            eta_batch = dataset.eta[batch_idx]
+
+        recon_loss, kl_loss = cvae(x_batch, eta_batch)
+        loss = recon_loss + beta * kl_loss
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(cvae.parameters(), max_norm=5.0)
+        optimizer.step()
+
+        total_recon += recon_loss.item()
+        total_kl += kl_loss.item()
+        n_batches += 1
+
+    if order is not None:
+        del order
+
+    torch.cuda.synchronize()
+    train_time = time.perf_counter() - train_start
+
+    print(f"chunk file      : {chunk_paths[chunk_idx]}")
+    print(f"load to GPU time: {load_time:.2f} sec")
+    print(f"train time      : {train_time:.2f} sec")
+    print(f"total time      : {load_time + train_time:.2f} sec")
+    print(f"n_rows          : {n_rows:,}")
+    print(f"n_batches       : {n_batches}")
+    print(f"avg batch time  : {train_time / n_batches:.4f} sec")
+
+    del dataset
+    torch.cuda.empty_cache()
 
     return train_time
