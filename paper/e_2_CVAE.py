@@ -21,7 +21,7 @@ def freeze_batchnorm(model: nn.Module, freeze_affine: bool = True):
                     m.bias.requires_grad_(False)
 
 
-def _hidden_mlp(in_dim: int, hidden_dims: list, activation=nn.Tanh, use_bn: bool = False) -> nn.Sequential:
+def _hidden_mlp(in_dim: int, hidden_dims: list, activation=nn.Tanh, use_bn: bool = False):
     layers = []
     prev_dim = in_dim
 
@@ -89,7 +89,8 @@ class CVAE(nn.Module):
                  dim_eta: int = 7,     # BS=3, Heston=7
                  dim_z: int = 8,       # latent dim
                  hidden_dims: list = None,
-                 use_bn: bool = False):
+                 use_bn: bool = False
+                 ):
         super().__init__()
 
         if hidden_dims is None:
@@ -148,7 +149,7 @@ class CVAE(nn.Module):
         return kl_dim_mean
 
     @torch.no_grad()
-    def sample(self, eta: torch.Tensor, n_samples: int = 10000):
+    def sample(self, eta: torch.Tensor, n_samples = 10000):
         self.eval()
         if eta.dim() == 1:
             eta = eta.unsqueeze(0)
@@ -165,9 +166,10 @@ class CVAE(nn.Module):
         return samples
 
     @torch.no_grad()
-    def price_vanilla(self, eta: torch.Tensor, K: float, r: float, T: float, opt_type: str = 'call',
-                      n_samples: int = 10000):
-
+    def price_vanilla(self, eta: torch.Tensor, K, r, T, 
+                      opt_type = 'call',
+                      n_samples = 10000
+                      ):
         samples = self.sample(eta, n_samples)
         X_T = samples[:, 0]
         S_T = torch.exp(X_T)
@@ -182,9 +184,10 @@ class CVAE(nn.Module):
         return np.exp(-r * T) * payoff.mean().item()
     
     @torch.no_grad()
-    def price_barrier(self, eta: torch.Tensor, B: float, K: float, r: float, T: float, opt_type: str = 'call',
-                      n_samples: int = 10000):
-
+    def price_barrier(self, eta: torch.Tensor, B, K, r, T, 
+                      opt_type = 'call',
+                      n_samples = 10000
+                      ):
         samples = self.sample(eta, n_samples)
         X_T = samples[:, 0]
         S_T = torch.exp(X_T)
@@ -202,8 +205,9 @@ class CVAE(nn.Module):
         return np.exp(-r * T) * payoff.mean().item()
 
     @torch.no_grad()
-    def total_pricing(self, eta: torch.Tensor, B: float, K: float,
-                      r: float, T: float, n_samples: int = 10000):
+    def total_pricing(self, eta: torch.Tensor, B, K, r, T, 
+                      n_samples = 10000
+                      ):
         samples = self.sample(eta, n_samples)
         if samples.shape[1] < 2:
             raise ValueError("total_pricing requires samples with [X_T, M_T].")

@@ -7,11 +7,13 @@ import os
 import re
 from torch.utils.data import Dataset, DataLoader
 from concurrent.futures import ThreadPoolExecutor
-from e_2_CVAE import *
+from e_2_CVAE import CVAE as BaseCVAE, freeze_batchnorm
+from e_2_CVAE_barr_weight import CVAEBarrWeight
 
 if not torch.cuda.is_available():
     raise ValueError("Cannot use GPU cuda")
 device = torch.device("cuda")
+
 
 
 def _cuda_sync():
@@ -23,6 +25,7 @@ def _empty_time_profile():
     return {
         'chunk_load': 0.0,
         'load_wait': 0.0,
+        'gpu_move': 0.0,
         'dataloader_init': 0.0,
         'iter_init': 0.0,
         'batch_fetch': 0.0,
@@ -47,6 +50,7 @@ def _print_time_profile(profile):
         f"total={profile['chunk_total']:.2f}s | "
         f"chunk_load={profile['chunk_load']:.2f}s | "
         f"load_wait={profile['load_wait']:.2f}s | "
+        f"gpu_move={profile['gpu_move']:.2f}s | "
         f"loader_init={profile['dataloader_init']:.2f}s | "
         f"iter_init={profile['iter_init']:.2f}s | "
         f"batch_fetch={profile['batch_fetch']:.2f}s ({profile['batch_fetch']/batches:.4f}/batch) | "
@@ -55,6 +59,7 @@ def _print_time_profile(profile):
         f"bwd={profile['backward']:.2f}s ({profile['backward']/batches:.4f}/batch) | "
         f"clip={profile['clip']:.2f}s ({profile['clip']/batches:.4f}/batch) | "
         f"step={profile['step']:.2f}s ({profile['step']/batches:.4f}/batch) | "
+        f"loss_item={profile['loss_item']:.2f}s | "
         f"cleanup={profile['worker_cleanup']:.2f}s | "
         f"loop_overhead={profile['loop_overhead']:.2f}s ({profile['loop_overhead']/batches:.4f}/batch) | "
         f"batches={profile['batches']}",
@@ -64,15 +69,47 @@ def _print_time_profile(profile):
 # _basic(eta에 B가 없는 버전), _B
 BS_CHUNK_DIR  = "/mnt/d/bs_chunks_correction/"
 BS_ETA_PATH   = "/mnt/d/bs_eta_basic.h5"
+BS_CLIP_CHUNK_DIR  = "/mnt/d/bs_clip_chunks_correction/"
+BS_CLIP_ETA_PATH   = "/mnt/d/bs_eta_clip.h5"
 HES_CHUNK_DIR = "/mnt/d/heston_chunks_correction/"
 HES_ETA_PATH  = "/mnt/d/heston_eta_basic.h5"
+HES_CLIP_CHUNK_DIR = "/mnt/d/heston_clip_chunks_correction/"
+HES_CLIP_ETA_PATH  = "/mnt/d/heston_eta_clip.h5"
 
 
 # ──────────────────────────────────────────────
 # 1. Dataset
 # ──────────────────────────────────────────────
+class GpuChunk:
+    def __init__(self, x, eta):
+        self.x = x
+        self.eta = eta
+
+    def __len__(self):
+        return self.x.shape[0]
+
+
+def load_chunk_file_to_gpu(chunk_path, etas, eta_min, eta_max):
+    with h5py.File(chunk_path, 'r') as f:
+        paths = f['paths'][:] # (N, 3) : [ori_idx, X_T, M_T]
+
+    ori_idx = paths[:, 0].astype(np.int64, copy=False)
+    x_np = paths[:, 1:3].astype(np.float32, copy=True)
+
+    eta_np = etas[ori_idx].astype(np.float32, copy=True)
+    eta_np = (eta_np - eta_min) / (eta_max - eta_min + 1e-8)
+
+    del paths, ori_idx
+
+    x_gpu = torch.from_numpy(x_np).to(device)
+    eta_gpu = torch.from_numpy(eta_np).to(device)
+
+    del x_np, eta_np
+    return GpuChunk(x_gpu, eta_gpu)
+
+
+
 class ChunkDataset(Dataset):
-    # 청크 파일 하나를 RAM에 로드.
     def __init__(self, chunk_path, etas, eta_min, eta_max):
 
         with h5py.File(chunk_path, 'r') as f:
@@ -86,7 +123,6 @@ class ChunkDataset(Dataset):
         eta_matched = (eta_matched - eta_min) / (eta_max - eta_min + 1e-8)
 
         self.x = torch.tensor(np.stack([X_T, M_T], axis=1))  # (N, 2)
-
         self.eta = torch.tensor(eta_matched)   # (N, dim_eta)
 
     def __len__(self):
@@ -119,13 +155,63 @@ def _chunk_sort_key(chunk_path):
     return _chunk_file_idx(chunk_path)
 
 
+def _normalize_cvae_type(cvae_type):
+    aliases = {
+        None: "base",
+        "base": "base",
+        "cvae": "base",
+        "CVAE": "base",
+        "barr_weight": "barr_weight",
+        "barrier_weight": "barr_weight",
+        "cvae_barr_weight": "barr_weight",
+        "CVAE_barr_weight": "barr_weight",
+    }
+    if cvae_type not in aliases:
+        raise ValueError("cvae_type must be 'base' or 'barr_weight'")
+    return aliases[cvae_type]
+
+
+def _make_cvae(cvae_type, dim_x, dim_eta, dim_z, hidden_dims, use_bn,
+               weight_mode, weight_alpha, weight_h, weight_normalize, S0, K, B):
+    cvae_type = _normalize_cvae_type(cvae_type)
+    if cvae_type == "base":
+        return BaseCVAE(
+            dim_x=dim_x,
+            dim_eta=dim_eta,
+            dim_z=dim_z,
+            hidden_dims=hidden_dims,
+            use_bn=use_bn,
+        )
+
+    return CVAEBarrWeight(
+        dim_x=dim_x,
+        dim_eta=dim_eta,
+        dim_z=dim_z,
+        hidden_dims=hidden_dims,
+        use_bn=use_bn,
+        weight_mode=weight_mode,
+        weight_alpha=weight_alpha,
+        weight_h=weight_h,
+        weight_normalize=weight_normalize,
+        S0=S0,
+        K=K,
+        B=B,
+    )
+
+
+CVAE = BaseCVAE
+
+
 # ─────────────
 # 2.train
 # ─────────────
 def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
                 lr=1e-3, beta=1.0, warmup_chunks=None, use_bn=False, bn_chunks=None, 
                 num_chunks=None, shuffle_chunks=True, save_path=None, resume_path=None,
-                exclude_chunk_idxs=None, validation_chunk_idxs=None, val_every_chunks=10):
+                exclude_chunk_idxs=None, validation_chunk_idxs=None, val_every_chunks=10,
+                memory_on_gpu=False, cvae_type="base", weight_mode="barrier_put",
+                weight_alpha=3.0, weight_h=0.05, weight_normalize=True,
+                S0=1.0, K=1.0, B=0.8):
     
     def chunk_order_for_epoch(epoch):
         chunk_indices = np.array(trainable_chunk_idxs, dtype=int)
@@ -142,10 +228,23 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
         return epoch, chunk_pos, ci
 
     def load_chunk(ci):
-        t0 = time.perf_counter()
         dataset = ChunkDataset(chunk_path_by_idx[int(ci)], etas, eta_min, eta_max)
-        load_time = time.perf_counter() - t0
-        return dataset, load_time
+        return dataset
+
+    def load_chunk_gpu(ci):
+        return load_chunk_file_to_gpu(chunk_path_by_idx[int(ci)], etas, eta_min, eta_max)
+
+    def load_chunk_timed(ci):
+        t0 = time.perf_counter()
+        dataset = load_chunk(ci)
+        return dataset, time.perf_counter() - t0
+
+    def move_chunk_to_gpu(dataset):
+        _cuda_sync()
+        t0 = time.perf_counter()
+        gpu_dataset = GpuChunk(dataset.x.to(device), dataset.eta.to(device))
+        _cuda_sync()
+        return gpu_dataset, time.perf_counter() - t0
 
     def apply_bn_mode(global_chunk):
         if not use_bn:
@@ -162,22 +261,10 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
         ratio = min(1.0, float(global_chunk + 1) / float(warmup_chunks))
         return float(beta) * ratio
 
-    def train_one_chunk(dataset, global_chunk):
-        profile = _empty_time_profile()
+    def train_one_chunk(dataset, global_chunk, profile=None):
+        if profile is None:
+            profile = _empty_time_profile()
         chunk_t0 = time.perf_counter()
-
-        t0 = time.perf_counter()
-        dataloader = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=8,
-            persistent_workers=True,
-            prefetch_factor=2,
-            pin_memory=True, # GPU가 빠르게 가져갈 수 있는 CPU 메모리 영역에 올려둠.
-            drop_last=True
-        )
-        profile['dataloader_init'] = time.perf_counter() - t0
 
         cvae.train()
         bn_mode = apply_bn_mode(global_chunk)
@@ -187,81 +274,139 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
         chunk_total = 0.0
         chunk_batches = 0
 
-        t0 = time.perf_counter()
-        data_iter = iter(dataloader)
-        profile['iter_init'] = time.perf_counter() - t0
+        if memory_on_gpu:
+            n_rows = len(dataset)
+            n_train = (n_rows // batch_size) * batch_size
+            if n_train == 0:
+                raise ValueError(f"batch_size={batch_size} is larger than chunk rows={n_rows}")
 
-        while True:
+            for start in range(0, n_train, batch_size):
+                end = start + batch_size
+                x_batch = dataset.x[start:end]
+                eta_batch = dataset.eta[start:end]
+
+                t0 = time.perf_counter()
+                recon_loss, kl_loss = cvae(x_batch, eta_batch)
+                loss = recon_loss + beta_eff * kl_loss
+                _cuda_sync()
+                profile['forward'] += time.perf_counter() - t0
+
+                t0 = time.perf_counter()
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                _cuda_sync()
+                profile['backward'] += time.perf_counter() - t0
+
+                t0 = time.perf_counter()
+                torch.nn.utils.clip_grad_norm_(cvae.parameters(), max_norm=5.0)
+                _cuda_sync()
+                profile['clip'] += time.perf_counter() - t0
+
+                t0 = time.perf_counter()
+                optimizer.step()
+                _cuda_sync()
+                profile['step'] += time.perf_counter() - t0
+
+                t0 = time.perf_counter()
+                recon_value = recon_loss.item()
+                kl_value = kl_loss.item()
+                total_value = loss.item()
+                profile['loss_item'] += time.perf_counter() - t0
+
+                epoch_accum['recon_sum'] += recon_value
+                epoch_accum['kl_sum'] += kl_value
+                epoch_accum['total_sum'] += total_value
+                epoch_accum['n_batches'] += 1
+                chunk_recon += recon_value
+                chunk_kl += kl_value
+                chunk_total += total_value
+                chunk_batches += 1
+                profile['batches'] += 1
+
+        else:
             t0 = time.perf_counter()
-            try:
-                x_batch, eta_batch = next(data_iter)
-            except StopIteration:
-                break
-            profile['batch_fetch'] += time.perf_counter() - t0
-
-            _cuda_sync()
-            t0 = time.perf_counter()
-            x_batch = x_batch.to(device, non_blocking=True) # CPU에서 GPU로 비동기식 전송
-            eta_batch = eta_batch.to(device, non_blocking=True)
-            _cuda_sync()
-            profile['h2d'] += time.perf_counter() - t0
-
-            t0 = time.perf_counter()
-            recon_loss, kl_loss = cvae(x_batch, eta_batch)
-            loss = recon_loss + beta_eff * kl_loss
-            _cuda_sync()
-            profile['forward'] += time.perf_counter() - t0
+            dataloader = DataLoader(
+                dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=8,
+                persistent_workers=True,
+                prefetch_factor=1,
+                pin_memory=True,
+                drop_last=True,
+            )
+            profile['dataloader_init'] += time.perf_counter() - t0
 
             t0 = time.perf_counter()
-            optimizer.zero_grad()
-            loss.backward()
-            _cuda_sync()
-            profile['backward'] += time.perf_counter() - t0
+            data_iter = iter(dataloader)
+            profile['iter_init'] += time.perf_counter() - t0
+
+            while True:
+                t0 = time.perf_counter()
+                try:
+                    x_batch, eta_batch = next(data_iter)
+                except StopIteration:
+                    break
+                profile['batch_fetch'] += time.perf_counter() - t0
+
+                t0 = time.perf_counter()
+                x_batch = x_batch.to(device, non_blocking=True)
+                eta_batch = eta_batch.to(device, non_blocking=True)
+                _cuda_sync()
+                profile['h2d'] += time.perf_counter() - t0
+
+                t0 = time.perf_counter()
+                recon_loss, kl_loss = cvae(x_batch, eta_batch)
+                loss = recon_loss + beta_eff * kl_loss
+                _cuda_sync()
+                profile['forward'] += time.perf_counter() - t0
+
+                t0 = time.perf_counter()
+                optimizer.zero_grad()
+                loss.backward()
+                _cuda_sync()
+                profile['backward'] += time.perf_counter() - t0
+
+                t0 = time.perf_counter()
+                torch.nn.utils.clip_grad_norm_(cvae.parameters(), max_norm=5.0)
+                _cuda_sync()
+                profile['clip'] += time.perf_counter() - t0
+
+                t0 = time.perf_counter()
+                optimizer.step()
+                _cuda_sync()
+                profile['step'] += time.perf_counter() - t0
+
+                t0 = time.perf_counter()
+                recon_value = recon_loss.item()
+                kl_value = kl_loss.item()
+                total_value = loss.item()
+                profile['loss_item'] += time.perf_counter() - t0
+
+                epoch_accum['recon_sum'] += recon_value
+                epoch_accum['kl_sum'] += kl_value
+                epoch_accum['total_sum'] += total_value
+                epoch_accum['n_batches'] += 1
+                chunk_recon += recon_value
+                chunk_kl += kl_value
+                chunk_total += total_value
+                chunk_batches += 1
+                profile['batches'] += 1
 
             t0 = time.perf_counter()
-            torch.nn.utils.clip_grad_norm_(cvae.parameters(), max_norm=5.0)
-            _cuda_sync()
-            profile['clip'] += time.perf_counter() - t0
-
-            t0 = time.perf_counter()
-            optimizer.step()
-            _cuda_sync()
-            profile['step'] += time.perf_counter() - t0
-
-            t0 = time.perf_counter()
-            recon_value = recon_loss.item()
-            kl_value = kl_loss.item()
-            total_value = loss.item()
-            profile['loss_item'] += time.perf_counter() - t0
-
-            epoch_accum['recon_sum'] += recon_value
-            epoch_accum['kl_sum'] += kl_value
-            epoch_accum['total_sum'] += total_value
-            epoch_accum['n_batches'] += 1
-            chunk_recon += recon_value
-            chunk_kl += kl_value
-            chunk_total += total_value
-            chunk_batches += 1
-            profile['batches'] += 1
-
-        t0 = time.perf_counter()
-        del data_iter, dataloader
-        profile['worker_cleanup'] = time.perf_counter() - t0
+            del data_iter, dataloader
+            profile['worker_cleanup'] += time.perf_counter() - t0
 
         profile['chunk_total'] = time.perf_counter() - chunk_t0
         measured_inside_chunk = (
-            profile['dataloader_init']
-            + profile['iter_init']
-            + profile['batch_fetch']
-            + profile['h2d']
-            + profile['forward']
-            + profile['backward']
-            + profile['clip']
-            + profile['step']
-            + profile['loss_item']
+            profile['chunk_load'] + profile['load_wait'] + profile['gpu_move']
+            + profile['dataloader_init'] + profile['iter_init'] + profile['batch_fetch']
+            + profile['h2d'] + profile['forward'] + profile['backward']
+            + profile['clip'] + profile['step'] + profile['loss_item']
             + profile['worker_cleanup']
         )
         profile['loop_overhead'] = max(profile['chunk_total'] - measured_inside_chunk, 0.0)
+
         chunk_batches = max(chunk_batches, 1)
         chunk_avg_recon = chunk_recon / chunk_batches
         chunk_avg_kl = chunk_kl / chunk_batches
@@ -283,34 +428,57 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
 
         with torch.no_grad():
             for ci in sorted(validation_chunk_idxs):
-                dataset, _ = load_chunk(ci)
-                dataloader = DataLoader(
-                    dataset,
-                    batch_size=batch_size,
-                    shuffle=False,
-                    num_workers=8,
-                    persistent_workers=True,
-                    prefetch_factor=2,
-                    pin_memory=True,
-                    drop_last=False,
-                )
-                for x_batch, eta_batch in dataloader:
-                    x_batch = x_batch.to(device, non_blocking=True)
-                    eta_batch = eta_batch.to(device, non_blocking=True)
+                dataset = load_chunk_gpu(ci) if memory_on_gpu else load_chunk(ci)
 
-                    recon_loss, kl_loss, kl_dim_mean = cvae(x_batch, eta_batch, return_kl_dim=True)
-                    loss = recon_loss + beta_eff * kl_loss
+                if memory_on_gpu:
+                    n_rows = len(dataset)
+                    for start in range(0, n_rows, batch_size):
+                        end = min(start + batch_size, n_rows)
+                        x_batch = dataset.x[start:end]
+                        eta_batch = dataset.eta[start:end]
 
-                    val_recon += recon_loss.item()
-                    val_kl += kl_loss.item()
-                    val_total += loss.item()
-                    val_batches += 1
-                    kl_dim_cpu = kl_dim_mean.detach().cpu()
-                    if val_kl_dim_sum is None:
-                        val_kl_dim_sum = torch.zeros_like(kl_dim_cpu)
-                    val_kl_dim_sum += kl_dim_cpu
+                        recon_loss, kl_loss, kl_dim_mean = cvae(x_batch, eta_batch, return_kl_dim=True)
+                        loss = recon_loss + beta_eff * kl_loss
 
-                del dataloader, dataset
+                        val_recon += recon_loss.item()
+                        val_kl += kl_loss.item()
+                        val_total += loss.item()
+                        val_batches += 1
+                        kl_dim_cpu = kl_dim_mean.detach().cpu()
+                        if val_kl_dim_sum is None:
+                            val_kl_dim_sum = torch.zeros_like(kl_dim_cpu)
+                        val_kl_dim_sum += kl_dim_cpu
+
+                    del dataset
+                    torch.cuda.empty_cache()
+                else:
+                    dataloader = DataLoader(
+                        dataset,
+                        batch_size=batch_size,
+                        shuffle=False,
+                        num_workers=8,
+                        persistent_workers=True,
+                        prefetch_factor=1,
+                        pin_memory=True,
+                        drop_last=False,
+                    )
+                    for x_batch, eta_batch in dataloader:
+                        x_batch = x_batch.to(device, non_blocking=True)
+                        eta_batch = eta_batch.to(device, non_blocking=True)
+
+                        recon_loss, kl_loss, kl_dim_mean = cvae(x_batch, eta_batch, return_kl_dim=True)
+                        loss = recon_loss + beta_eff * kl_loss
+
+                        val_recon += recon_loss.item()
+                        val_kl += kl_loss.item()
+                        val_total += loss.item()
+                        val_batches += 1
+                        kl_dim_cpu = kl_dim_mean.detach().cpu()
+                        if val_kl_dim_sum is None:
+                            val_kl_dim_sum = torch.zeros_like(kl_dim_cpu)
+                        val_kl_dim_sum += kl_dim_cpu
+
+                    del dataloader, dataset
 
         if was_training:
             cvae.train()
@@ -343,6 +511,8 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
             'use_bn'      : use_bn,
             'bn_chunks'   : bn_chunks,
             'warmup_chunks': warmup_chunks,
+            'cvae_type'   : cvae_type,
+            'weight_config': weight_config,
             'loss_history': loss_history, # epoch별 평균 손실 기록
             'chunk_loss_history': chunk_loss_history,
             'num_chunks'  : num_chunks,
@@ -352,6 +522,7 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
             'excluded_chunk_idxs': sorted(exclude_chunk_idxs),
             'validation_chunk_idxs': sorted(validation_chunk_idxs),
             'val_every_chunks': val_every_chunks,
+            'memory_on_gpu': memory_on_gpu,
             'num_all_chunks': num_all_chunks,
             'all_chunk_idxs': all_chunk_idxs,
             'epoch'          : completed_epochs,
@@ -439,13 +610,22 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
         epoch_accum['n_batches'] = 0
 
         if epoch % 10 == 0:
-            t0 = time.perf_counter()
             save_checkpoint(current_chunks)
-            checkpoint_time = time.perf_counter() - t0
-            print(f"  중간 저장 완료 (epoch {epoch}) | checkpoint_time={checkpoint_time:.2f}s")
+            print(f"  중간 저장 완료 (epoch {epoch})")
 
     if hidden_dims is None:
         hidden_dims = [128, 128, 64]
+
+    cvae_type = _normalize_cvae_type(cvae_type)
+    weight_config = {
+        'weight_mode': weight_mode,
+        'weight_alpha': float(weight_alpha),
+        'weight_h': float(weight_h),
+        'weight_normalize': bool(weight_normalize),
+        'S0': float(S0),
+        'K': float(K),
+        'B': float(B),
+    }
 
     if model_type == 'hes':
         chunk_dir = HES_CHUNK_DIR
@@ -453,6 +633,12 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
     elif model_type == 'bs':
         chunk_dir = BS_CHUNK_DIR
         eta_path  = BS_ETA_PATH
+    elif model_type == 'bs_clip':
+        chunk_dir = BS_CLIP_CHUNK_DIR
+        eta_path  = BS_CLIP_ETA_PATH
+    elif model_type == 'hes_clip':
+        chunk_dir = HES_CLIP_CHUNK_DIR
+        eta_path  = HES_CLIP_ETA_PATH
     else:
         raise ValueError("model_type must be 'hes' or 'bs'")
 
@@ -543,8 +729,37 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
         if checkpoint_dim_eta != dim_eta:
             raise ValueError(f"checkpoint dim_eta={checkpoint_dim_eta}, current eta dim={dim_eta}")
 
+        checkpoint_cvae_type = _normalize_cvae_type(resume_checkpoint.get('cvae_type', 'base'))
+        if checkpoint_cvae_type != cvae_type:
+            raise ValueError(
+                f"checkpoint cvae_type={checkpoint_cvae_type}, current cvae_type={cvae_type}. "
+                "다른 CVAE loss로 이어서 학습하려면 새 save_path로 별도 실험을 시작하세요."
+            )
+        if cvae_type == 'barr_weight':
+            checkpoint_weight_config = resume_checkpoint.get('weight_config', {})
+            for key, value in weight_config.items():
+                if key in checkpoint_weight_config and checkpoint_weight_config[key] != value:
+                    raise ValueError(
+                        f"checkpoint weight_config[{key}]={checkpoint_weight_config[key]}, "
+                        f"current {key}={value}"
+                    )
+
     # 모델 생성
-    cvae = CVAE(dim_x=dim_x, dim_eta=dim_eta, dim_z=dim_z, hidden_dims=hidden_dims, use_bn=use_bn)
+    cvae = _make_cvae(
+        cvae_type,
+        dim_x=dim_x,
+        dim_eta=dim_eta,
+        dim_z=dim_z,
+        hidden_dims=hidden_dims,
+        use_bn=use_bn,
+        weight_mode=weight_mode,
+        weight_alpha=weight_alpha,
+        weight_h=weight_h,
+        weight_normalize=weight_normalize,
+        S0=S0,
+        K=K,
+        B=B,
+    )
     cvae.bn_chunks = bn_chunks
     cvae.to(device)
     optimizer = torch.optim.Adam(cvae.parameters(), lr=lr)
@@ -555,17 +770,14 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
         'epoch': [], 'global_chunk': [], 'chunk_pos': [], 'chunk_idx': [], 'chunk_file': [],
         'recon_loss': [], 'KL_loss': [], 'total_loss': [], 'beta_eff': [],
         'val_global_chunk': [], 'val_recon_loss': [], 'val_KL_loss': [], 'val_total_loss': [],
-        'val_beta_eff': [], 'val_kl_dim_mean': [], 'val_chunk_idxs': [], 'val_chunk_files': [],
-        'time_chunk_load': [], 'time_load_wait': [], 'time_dataloader_init': [], 'time_iter_init': [],
-        'time_batch_fetch': [], 'time_h2d': [], 'time_forward': [], 'time_backward': [],
-        'time_clip': [], 'time_step': [], 'time_loss_item': [], 'time_worker_cleanup': [],
-        'time_loop_overhead': [], 'time_chunk_total': [], 'time_batches': [],
-        'time_validation': []
+        'val_beta_eff': [], 'val_kl_dim_mean': [], 'val_chunk_idxs': [], 'val_chunk_files': []
     }
 
     if resume_path is not None: # load resume model
         cvae.load_state_dict(resume_checkpoint["model_state"])
         optimizer.load_state_dict(resume_checkpoint["optimizer_state"])
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr
         loss_history = resume_checkpoint["loss_history"]
         chunk_loss_history = resume_checkpoint.get('chunk_loss_history', empty_chunk_history.copy())
         chunk_loss_history.setdefault('global_chunk', [])
@@ -615,21 +827,25 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
         loss_history = {'recon_loss': [], 'KL_loss': [], 'total_loss': []}
         chunk_loss_history = empty_chunk_history.copy()
 
+    print(f"learning rate : {lr}")
+    print(f"GPU: {torch.cuda.get_device_name(device)} | cuda capability={torch.cuda.get_device_capability(device)}")
     # start train
     train_start = time.perf_counter()
     target_chunks = completed_chunks + num_chunks
-    print(f"GPU: {torch.cuda.get_device_name(device)} | cuda capability={torch.cuda.get_device_capability(device)}")
     print(
         f"학습 시작 | 이번 실행 chunks={num_chunks} | "
         f"진행 chunks={completed_chunks}->{target_chunks} | files/epoch={total_chunks} | "
         f"excluded={sorted(exclude_chunk_idxs)} | validation={sorted(validation_chunk_idxs)} | "
-        f"val_every_chunks={val_every_chunks} | bn_chunks={bn_chunks} | warmup_chunks={warmup_chunks}"
+        f"val_every_chunks={val_every_chunks} | bn_chunks={bn_chunks} | warmup_chunks={warmup_chunks} | "
+        f"memory_on_gpu={memory_on_gpu} | cvae_type={cvae_type}"
     )
+    if cvae_type == 'barr_weight':
+        print(f"weighted recon config: {weight_config}")
 
     current_epoch_start = time.perf_counter()
     with ThreadPoolExecutor(max_workers=1) as prefetcher:
         _, _, first_ci = chunk_info(completed_chunks)
-        future = prefetcher.submit(load_chunk, first_ci)
+        future = prefetcher.submit(load_chunk_timed, first_ci)
 
         for offset in range(num_chunks):
             global_chunk = completed_chunks + offset
@@ -638,19 +854,27 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
                 current_epoch_start = time.perf_counter()
                 torch.cuda.reset_peak_memory_stats()
 
+            profile = _empty_time_profile()
             t0 = time.perf_counter()
             dataset, chunk_load_time = future.result()
-            load_wait_time = time.perf_counter() - t0
+            profile['load_wait'] = time.perf_counter() - t0
+            profile['chunk_load'] = chunk_load_time
             if offset + 1 < num_chunks:
                 _, _, next_ci = chunk_info(global_chunk + 1)
-                future = prefetcher.submit(load_chunk, next_ci)
+                future = prefetcher.submit(load_chunk_timed, next_ci)
 
-            chunk_losses = train_one_chunk(dataset, global_chunk)
-            chunk_losses[-1]['chunk_load'] = chunk_load_time
-            chunk_losses[-1]['load_wait'] = load_wait_time
+            if memory_on_gpu:
+                cpu_dataset = dataset
+                dataset, gpu_move_time = move_chunk_to_gpu(cpu_dataset)
+                profile['gpu_move'] = gpu_move_time
+                del cpu_dataset
+
+            chunk_losses = train_one_chunk(dataset, global_chunk, profile=profile)
             record_chunk_loss(global_chunk, epoch, chunk_pos, ci, chunk_losses)
 
             del dataset
+            if memory_on_gpu:
+                torch.cuda.empty_cache()
 
             current_chunks = global_chunk + 1
             should_validate = (
@@ -666,7 +890,8 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
                 _cuda_sync()
                 validation_time = time.perf_counter() - t0
                 record_validation_loss(val_result)
-                chunk_loss_history['time_validation'][-1] = validation_time
+                if len(chunk_loss_history.get('time_validation', [])) > 0:
+                    chunk_loss_history['time_validation'][-1] = validation_time
                 print(f"Validation time: {validation_time:.2f}s", flush=True)
             if current_chunks % total_chunks == 0:
                 finish_epoch(epoch, current_epoch_start, current_chunks)
@@ -679,9 +904,9 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
     if run_end_idx > run_start_idx:
         print("\n=== Time summary for this run ===")
         for key in [
-            'chunk_load', 'load_wait', 'dataloader_init', 'iter_init', 'batch_fetch', 'h2d',
-            'forward', 'backward', 'clip', 'step', 'loss_item', 'worker_cleanup',
-            'loop_overhead', 'validation', 'chunk_total'
+            'chunk_load', 'load_wait', 'gpu_move', 'dataloader_init', 'iter_init',
+            'batch_fetch', 'h2d', 'forward', 'backward', 'clip', 'step', 'loss_item',
+            'worker_cleanup', 'loop_overhead', 'validation', 'chunk_total'
         ]:
             values = chunk_loss_history.get(f'time_{key}', [])
             values = values[-num_chunks:]
@@ -701,85 +926,3 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
     print(f"총 학습 시간: {total_time/60:.2f}분 ({total_time/3600:.2f}시간)")
 
     return cvae, loss_history, eta_min, eta_max
-
-# ─────────────
-# 2-1. test one chunk train time
-# ─────────────
-def benchmark_one_chunk(model_type='hes', barr_type='barr', dim_z=8, hidden_dims=None,
-                        batch_size=1024, lr=1e-3, beta=1.0, chunk_idx=0):
-    if hidden_dims is None:
-        hidden_dims = [128, 128, 64]
-
-    if model_type == 'hes':
-        chunk_dir = HES_CHUNK_DIR
-        eta_path  = HES_ETA_PATH
-    else:
-        chunk_dir = BS_CHUNK_DIR
-        eta_path  = BS_ETA_PATH
-
-    dim_x = 2
-
-    chunk_paths = sorted(glob.glob(os.path.join(chunk_dir, "*.h5")))
-    if len(chunk_paths) == 0:
-        raise FileNotFoundError(f"No chunk files found in {chunk_dir}")
-
-    etas, eta_min, eta_max = compute_eta_stats(eta_path)
-    dim_eta = etas.shape[1]
-
-    cvae = CVAE(dim_x=dim_x, dim_eta=dim_eta, dim_z=dim_z, hidden_dims=hidden_dims).to(device)
-    optimizer = torch.optim.Adam(cvae.parameters(), lr=lr)
-
-    # chunk load time
-    load_start = time.perf_counter()
-    dataset = ChunkDataset(chunk_paths[chunk_idx], etas, eta_min, eta_max)
-    load_time = time.perf_counter() - load_start
-
-    dataloader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=8,
-        pin_memory=True,
-        drop_last=True,
-        persistent_workers=True, 
-        prefetch_factor=2,
-    )
-
-    torch.cuda.synchronize()
-    train_start = time.perf_counter()
-
-    cvae.train()
-    total_recon = 0.0
-    total_kl = 0.0
-    n_batches = 0
-    print("학습 시작")
-    for x_batch, eta_batch in dataloader:
-        x_batch = x_batch.to(device, non_blocking=True)
-        eta_batch = eta_batch.to(device, non_blocking=True)
-
-        recon_loss, kl_loss = cvae(x_batch, eta_batch)
-        loss = recon_loss + beta * kl_loss
-
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(cvae.parameters(), max_norm=5.0)
-        optimizer.step()
-
-        total_recon += recon_loss.item()
-        total_kl += kl_loss.item()
-        n_batches += 1
-
-    torch.cuda.synchronize()
-    train_time = time.perf_counter() - train_start
-
-    print(f"chunk file      : {chunk_paths[chunk_idx]}")
-    print(f"load time       : {load_time:.2f} sec")
-    print(f"train time      : {train_time:.2f} sec")
-    print(f"total time      : {load_time + train_time:.2f} sec")
-    print(f"n_batches       : {n_batches}")
-    print(f"avg batch time  : {train_time / n_batches:.4f} sec")
-    print(f"recon loss      : {total_recon / n_batches:.6f}")
-    print(f"KL loss         : {total_kl / n_batches:.6f}")
-    print(f"GPU memory      : {torch.cuda.max_memory_allocated() / 1024**3:.2f} GB")
-
-    return train_time
