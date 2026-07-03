@@ -350,6 +350,12 @@ def generate_dataset(eta_path, chunk_dir, model_type='hes', S0=1.0, B=0,
 
 
 
+
+
+#------------------
+# checking
+#------------------
+
 def compute_xm_stats(
     model_type="bs",
     chunk_dir=None,
@@ -442,10 +448,7 @@ def compute_xm_stats(
 
 
 
-
-
 # check eta distribution
-
 def collect_eta_indices_from_chunks(
     chunk_dir="/mnt/d/bs_chunks_correction",
     eta_path="/mnt/d/bs_eta_basic.h5",
@@ -477,8 +480,7 @@ def collect_eta_indices_from_chunks(
     eta_indices = np.flatnonzero(used_mask)
     return eta_indices
 
-import numpy as np
-import matplotlib.pyplot as plt
+
 
 def plot_eta_3d_density_scatter(
     etas,

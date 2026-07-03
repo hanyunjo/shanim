@@ -147,7 +147,7 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
                 lr=1e-3, beta=1.0, warmup_chunks=None, use_bn=False, bn_chunks=None, 
                 num_chunks=None, shuffle_chunks=True, save_path=None, resume_path=None,
                 exclude_chunk_idxs=None, validation_chunk_idxs=None, val_every_chunks=10,
-                memory_on_gpu=False, cvae_type="base", weight_mode="barrier_put",
+                memory_on_gpu=True, cvae_type="base", weight_mode="barrier_put",
                 weight_alpha=3.0, weight_h=0.05, weight_normalize=True,
                 S0=1.0, K=1.0, B=0.8):
     
