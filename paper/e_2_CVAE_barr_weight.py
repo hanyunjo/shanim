@@ -57,26 +57,34 @@ class CVAEBarrWeight(BaseCVAE):
                               weight_mode=None, # validation 할 때 비교하기 위해 존재.
                               ):
         mode = self.weight_mode if weight_mode is None else weight_mode
-        if mode not in ("barrier_put", "barrier_near"):
-            raise ValueError("weight_mode must be one of None, 'none', 'barrier_put', or 'barrier_near'.")
+        if mode not in ("barrier_put", "barrierput", "barrier_near", "barriernear", "all_put"):
+            raise ValueError("weight_mode must be one of 'barrier_put', 'barrier_near', or 'all_put'.")
         if h <= 0:
             raise ValueError("h must be positive.")
-        if x_raw.shape[-1] < 2:
-                raise ValueError("require x_raw with [X_T, M_T].")
-            
-        MT = x_raw[:, 1]
-        b_log = float(np.log(B / S0))
-        near_barrier = torch.exp(-torch.abs(MT - b_log) / h)
+        if x_raw.shape[-1] < 1:
+            raise ValueError("require x_raw with at least X_T.")
 
-        # ITM for put .
-        if mode  in ("barrier_put", "barrierput"):
-            XT = x_raw[:, 0]
-            k_log = float(np.log(K / S0))
-            put_side = (XT < k_log).to(dtype=x_raw.dtype)
-            
+        XT = x_raw[:, 0]
+        k_log = float(np.log(K / S0))
+        put_side = (XT < k_log).to(dtype=x_raw.dtype)
+
+        if mode == "all_put":
+            weight = 1.0 + alpha * put_side
+
+        elif mode in ("barrier_put", "barrierput"):
+            if x_raw.shape[-1] < 2:
+                raise ValueError("require x_raw with [X_T, M_T].")
+            MT = x_raw[:, 1]
+            b_log = float(np.log(B / S0))
+            near_barrier = torch.exp(-torch.abs(MT - b_log) / h)
             weight = 1.0 + alpha * put_side * near_barrier
 
         elif mode in ("barrier_near", "barriernear"):
+            if x_raw.shape[-1] < 2:
+                raise ValueError("require x_raw with [X_T, M_T].")
+            MT = x_raw[:, 1]
+            b_log = float(np.log(B / S0))
+            near_barrier = torch.exp(-torch.abs(MT - b_log) / h)
             weight = 1.0 + alpha * near_barrier
 
         #

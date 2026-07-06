@@ -162,11 +162,14 @@ def _normalize_cvae_type(cvae_type):
         "CVAE": "base",
         "barr_weight": "barr_weight",
         "barrier_weight": "barr_weight",
+        "normal_weight": "normal_weight",
         "cvae_barr_weight": "barr_weight",
         "CVAE_barr_weight": "barr_weight",
+        "cvae_normal_weight": "normal_weight",
+        "CVAE_normal_weight": "normal_weight",
     }
     if cvae_type not in aliases:
-        raise ValueError("cvae_type must be 'base' or 'barr_weight'")
+        raise ValueError("cvae_type must be 'base', 'barr_weight', or 'normal_weight'")
     return aliases[cvae_type]
 
 
@@ -734,7 +737,7 @@ def train_chunk_time_check(model_type = 'hes', dim_z=8, hidden_dims=None, batch_
                 f"checkpoint cvae_type={checkpoint_cvae_type}, current cvae_type={cvae_type}. "
                 "다른 CVAE loss로 이어서 학습하려면 새 save_path로 별도 실험을 시작하세요."
             )
-        if cvae_type == 'barr_weight':
+        if cvae_type in ('barr_weight', 'normal_weight'):
             checkpoint_weight_config = resume_checkpoint.get('weight_config', {})
             for key, value in weight_config.items():
                 if key in checkpoint_weight_config and checkpoint_weight_config[key] != value:
@@ -838,7 +841,7 @@ def train_chunk_time_check(model_type = 'hes', dim_z=8, hidden_dims=None, batch_
         f"val_every_chunks={val_every_chunks} | bn_chunks={bn_chunks} | warmup_chunks={warmup_chunks} | "
         f"memory_on_gpu={memory_on_gpu} | cvae_type={cvae_type}"
     )
-    if cvae_type == 'barr_weight':
+    if cvae_type in ('barr_weight', 'normal_weight'):
         print(f"weighted recon config: {weight_config}")
 
     current_epoch_start = time.perf_counter()
