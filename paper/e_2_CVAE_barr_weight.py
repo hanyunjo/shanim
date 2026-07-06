@@ -57,7 +57,7 @@ class CVAEBarrWeight(BaseCVAE):
                               weight_mode=None, # validation 할 때 비교하기 위해 존재.
                               ):
         mode = self.weight_mode if weight_mode is None else weight_mode
-        if mode in ("barrier_put", "barrier_near"):
+        if mode not in ("barrier_put", "barrier_near"):
             raise ValueError("weight_mode must be one of None, 'none', 'barrier_put', or 'barrier_near'.")
         if h <= 0:
             raise ValueError("h must be positive.")

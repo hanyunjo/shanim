@@ -15,6 +15,15 @@ if not torch.cuda.is_available():
 device = torch.device("cuda")
 
 
+BS_CHUNK_DIR  = "/mnt/d/bs_chunks_correction/"
+BS_ETA_PATH   = "/mnt/d/bs_eta_basic.h5"
+BS_CLIP_CHUNK_DIR  = "/mnt/d/bs_clip_chunks_correction/"
+BS_CLIP_ETA_PATH   = "/mnt/d/bs_eta_clip.h5"
+HES_CHUNK_DIR = "/mnt/d/heston_chunks_correction/"
+HES_ETA_PATH  = "/mnt/d/heston_eta_basic.h5"
+HES_CLIP_CHUNK_DIR = "/mnt/d/heston_clip_chunks_correction/"
+HES_CLIP_ETA_PATH  = "/mnt/d/heston_eta_clip.h5"
+
 
 def _cuda_sync():
     if torch.cuda.is_available():
@@ -65,16 +74,6 @@ def _print_time_profile(profile):
         f"batches={profile['batches']}",
         flush=True,
     )
-
-# _basic(eta에 B가 없는 버전), _B
-BS_CHUNK_DIR  = "/mnt/d/bs_chunks_correction/"
-BS_ETA_PATH   = "/mnt/d/bs_eta_basic.h5"
-BS_CLIP_CHUNK_DIR  = "/mnt/d/bs_clip_chunks_correction/"
-BS_CLIP_ETA_PATH   = "/mnt/d/bs_eta_clip.h5"
-HES_CHUNK_DIR = "/mnt/d/heston_chunks_correction/"
-HES_ETA_PATH  = "/mnt/d/heston_eta_basic.h5"
-HES_CLIP_CHUNK_DIR = "/mnt/d/heston_clip_chunks_correction/"
-HES_CLIP_ETA_PATH  = "/mnt/d/heston_eta_clip.h5"
 
 
 # ──────────────────────────────────────────────

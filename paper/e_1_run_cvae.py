@@ -5,10 +5,13 @@ import h5py
 import glob
 import os
 import re
+import requests
 from torch.utils.data import Dataset, DataLoader
 from concurrent.futures import ThreadPoolExecutor
 from e_2_CVAE import CVAE as BaseCVAE, freeze_batchnorm
 from e_2_CVAE_barr_weight import CVAEBarrWeight
+
+
 
 if not torch.cuda.is_available():
     raise ValueError("Cannot use GPU cuda")
@@ -25,6 +28,22 @@ HES_ETA_PATH  = "/mnt/d/heston_eta_basic.h5"
 HES_CLIP_CHUNK_DIR = "/mnt/d/heston_clip_chunks_correction/"
 HES_CLIP_ETA_PATH  = "/mnt/d/heston_eta_clip.h5"
 
+
+def alarm(message:str = "Jupyter 셀 실행 완료!"):
+    webhook_url = "https://discord.com/api/webhooks/1522844432762671256/4h2AkQfGcD84AFu6FJSSFyV9FzQwsu0mFKTkTJ6ndUwD5MpfvdmXEDJJiA8tzM4Ba0P6"
+
+    response = requests.post(
+        webhook_url,
+        json={
+            "content": f"<@{427332366843772940}> {message}",
+            "allowed_mentions": {
+                "users": [427332366843772940]
+            }
+        },
+        timeout=10
+    )
+
+    print(response.status_code)
 
 # ──────────────────────────────────────────────
 # 1. Dataset
