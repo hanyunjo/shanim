@@ -169,6 +169,7 @@ def _make_cvae(cvae_type, dim_x, dim_eta, dim_z, hidden_dims, use_bn,
 def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
                 lr=1e-3, beta=1.0, warmup_chunks=None, use_bn=False, bn_chunks=None, 
                 num_chunks=None, shuffle_chunks=True, save_path=None, resume_path=None,
+                init_path=None,
                 exclude_chunk_idxs=None, validation_chunk_idxs=None, val_every_chunks=10,
                 memory_on_gpu=True, cvae_type="base", weight_mode="barrier_put",
                 weight_alpha=3.0, weight_h=0.05, weight_normalize=True,
@@ -394,6 +395,7 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
             'warmup_chunks': warmup_chunks,
             'cvae_type'   : cvae_type,
             'weight_config': weight_config,
+            'weight_config_history': weight_config_history,
             'loss_history': loss_history, # epoch별 평균 손실 기록
             'chunk_loss_history': chunk_loss_history,
             'num_chunks'  : num_chunks,
@@ -502,6 +504,8 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
         'K': float(K),
         'B': float(B),
     }
+    weight_config_history = [{'trained_chunks': 0, 'weight_config': weight_config.copy()}]
+    weight_alpha_changed_on_resume = False
 
     if model_type == 'hes':
         chunk_dir = HES_CHUNK_DIR
@@ -566,6 +570,8 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
         val_every_chunks = int(val_every_chunks)
         if val_every_chunks < 1:
             raise ValueError("val_every_chunks must be >= 1")
+    if resume_path is not None and init_path is not None:
+        raise ValueError("resume_path and init_path cannot be used together.")
     if save_path is None:
         raise ValueError("Input save_path")
     if os.path.exists(save_path) and resume_path is None:
@@ -614,11 +620,22 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
         if cvae_type in ('barr_weight', 'normal_weight', 'add_put_loss'):
             checkpoint_weight_config = resume_checkpoint.get('weight_config', {})
             for key, value in weight_config.items():
+                if key == 'weight_alpha':
+                    continue
                 if key in checkpoint_weight_config and checkpoint_weight_config[key] != value:
                     raise ValueError(
                         f"checkpoint weight_config[{key}]={checkpoint_weight_config[key]}, "
                         f"current {key}={value}"
                     )
+            if (
+                'weight_alpha' in checkpoint_weight_config
+                and checkpoint_weight_config['weight_alpha'] != weight_config['weight_alpha']
+            ):
+                weight_alpha_changed_on_resume = True
+                print(
+                    f"weight_alpha 변경 resume: "
+                    f"{checkpoint_weight_config['weight_alpha']} -> {weight_config['weight_alpha']}"
+                )
 
     # 모델 생성
     cvae = _make_cvae(
@@ -639,6 +656,21 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
     cvae.bn_chunks = bn_chunks
     cvae.to(device)
     optimizer = torch.optim.Adam(cvae.parameters(), lr=lr)
+
+    if init_path is not None:
+        init_checkpoint = torch.load(init_path, map_location=device, weights_only=False)
+        init_state_dict = init_checkpoint["model_state"]
+        if any(key.startswith("module.") for key in init_state_dict):
+            init_state_dict = {
+                key.replace("module.", "", 1): value
+                for key, value in init_state_dict.items()
+            }
+        cvae.load_state_dict(init_state_dict, strict=True)
+        print(
+            f"초기 가중치 로드: {init_path} | "
+            f"source cvae_type={init_checkpoint.get('cvae_type', 'base')} -> "
+            f"target cvae_type={cvae_type}"
+        )
 
     completed_chunks = 0
     epoch_accum = {'recon_sum': 0.0, 'kl_sum': 0.0, 'total_sum': 0.0, 'n_batches': 0}
@@ -662,6 +694,18 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
         eta_min = resume_checkpoint["eta_min"]
         eta_max = resume_checkpoint["eta_max"]
         completed_chunks = int(resume_checkpoint.get("trained_chunks", len(chunk_loss_history.get('chunk_idx', [])))) # 전에 실행된 chunk파일 
+        weight_config_history = list(resume_checkpoint.get('weight_config_history', []))
+        if not weight_config_history and 'weight_config' in resume_checkpoint:
+            weight_config_history = [{
+                'trained_chunks': 0,
+                'weight_config': dict(resume_checkpoint['weight_config']),
+            }]
+        if weight_alpha_changed_on_resume:
+            weight_config_history.append({
+                'trained_chunks': completed_chunks,
+                'weight_config': weight_config.copy(),
+                'note': 'weight_alpha changed on resume',
+            })
         checkpoint_bn_chunks = resume_checkpoint.get('bn_chunks', None)
         checkpoint_warmup_chunks = resume_checkpoint.get('warmup_chunks', warmup_chunks)
         checkpoint_excluded_chunk_idxs = set(map(int, resume_checkpoint.get('excluded_chunk_idxs', [])))
@@ -717,47 +761,65 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
     if cvae_type in ('barr_weight', 'normal_weight', 'add_put_loss'):
         print(f"weighted recon config: {weight_config}")
 
+    current_chunks = completed_chunks
     current_epoch_start = time.perf_counter()
-    with ThreadPoolExecutor(max_workers=1) as prefetcher:
-        _, _, first_ci = chunk_info(completed_chunks)
-        future = prefetcher.submit(load_chunk, first_ci)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as prefetcher:
+            _, _, first_ci = chunk_info(completed_chunks)
+            future = prefetcher.submit(load_chunk, first_ci)
 
-        for offset in range(num_chunks):
-            global_chunk = completed_chunks + offset
-            epoch, chunk_pos, ci = chunk_info(global_chunk)
-            if chunk_pos == 0:
-                current_epoch_start = time.perf_counter()
-                torch.cuda.reset_peak_memory_stats()
+            for offset in range(num_chunks):
+                global_chunk = completed_chunks + offset
+                epoch, chunk_pos, ci = chunk_info(global_chunk)
+                if chunk_pos == 0:
+                    current_epoch_start = time.perf_counter()
+                    torch.cuda.reset_peak_memory_stats()
 
-            dataset = future.result()
-            if offset + 1 < num_chunks:
-                _, _, next_ci = chunk_info(global_chunk + 1)
-                future = prefetcher.submit(load_chunk, next_ci)
+                dataset = future.result()
+                if offset + 1 < num_chunks:
+                    _, _, next_ci = chunk_info(global_chunk + 1)
+                    future = prefetcher.submit(load_chunk, next_ci)
 
-            if memory_on_gpu:
-                cpu_dataset = dataset
-                dataset = GpuChunk(cpu_dataset.x.to(device), cpu_dataset.eta.to(device))
-                del cpu_dataset
+                if memory_on_gpu:
+                    cpu_dataset = dataset
+                    dataset = GpuChunk(cpu_dataset.x.to(device), cpu_dataset.eta.to(device))
+                    del cpu_dataset
 
-            chunk_losses = train_one_chunk(dataset, global_chunk)
-            record_chunk_loss(global_chunk, epoch, chunk_pos, ci, chunk_losses)
+                chunk_losses = train_one_chunk(dataset, global_chunk)
+                record_chunk_loss(global_chunk, epoch, chunk_pos, ci, chunk_losses)
 
-            del dataset
-            if memory_on_gpu:
-                torch.cuda.empty_cache()
+                del dataset
+                if memory_on_gpu:
+                    torch.cuda.empty_cache()
 
-            current_chunks = global_chunk + 1
-            should_validate = (
-                len(validation_chunk_idxs) > 0
-                and (
-                    (val_every_chunks is not None and current_chunks % val_every_chunks == 0)
-                    or offset == num_chunks - 1
+                current_chunks = global_chunk + 1
+                should_validate = (
+                    len(validation_chunk_idxs) > 0
+                    and (
+                        (val_every_chunks is not None and current_chunks % val_every_chunks == 0)
+                        or offset == num_chunks - 1
+                    )
                 )
-            )
-            if should_validate:
-                record_validation_loss(validate_chunks(current_chunks))
-            if current_chunks % total_chunks == 0:
-                finish_epoch(epoch, current_epoch_start, current_chunks)
+                if should_validate:
+                    record_validation_loss(validate_chunks(current_chunks))
+                if current_chunks % total_chunks == 0:
+                    finish_epoch(epoch, current_epoch_start, current_chunks)
+    except KeyboardInterrupt:
+        total_time = time.perf_counter() - train_start
+        print(
+            f"\n학습 interrupt 감지 | 저장 기준 완료 chunks={current_chunks}/{target_chunks}",
+            flush=True,
+        )
+        if current_chunks > completed_chunks:
+            save_checkpoint(current_chunks)
+            print(f"interrupt checkpoint 저장 완료: {save_path}", flush=True)
+        else:
+            print("이번 실행에서 완료된 새 chunk가 없어 새 checkpoint를 저장하지 않았습니다.", flush=True)
+        print(
+            f"중단 전 학습 시간: {total_time/60:.2f}분 ({total_time/3600:.2f}시간)",
+            flush=True,
+        )
+        raise
 
     total_time = time.perf_counter() - train_start
     save_checkpoint(target_chunks)
