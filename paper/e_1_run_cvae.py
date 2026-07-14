@@ -380,8 +380,16 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
             'kl_dim_mean': val_kl_dim_mean,
         }
 
-    def save_checkpoint(current_chunks):
+    def _checkpoint_path_with_suffix(path, suffix):
+        root, ext = os.path.splitext(path)
+        if ext:
+            return f"{root}{suffix}{ext}"
+        return f"{path}{suffix}"
+
+    def save_checkpoint(current_chunks, checkpoint_path=None):
         completed_epochs = current_chunks // total_chunks
+        if checkpoint_path is None:
+            checkpoint_path = save_path
         torch.save({
             'model_state' : cvae.state_dict(),
             'eta_min'     : eta_min,
@@ -411,7 +419,7 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
             'epoch'          : completed_epochs,
             'epoch_accum'    : epoch_accum,
             'optimizer_state': optimizer.state_dict(),
-        }, save_path)
+        }, checkpoint_path)
 
     def record_chunk_loss(global_chunk, epoch, chunk_pos, ci, chunk_losses):
         chunk_avg_recon, chunk_avg_kl, chunk_avg_total, bn_mode, beta_eff = chunk_losses
@@ -811,8 +819,9 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
             flush=True,
         )
         if current_chunks > completed_chunks:
-            save_checkpoint(current_chunks)
-            print(f"interrupt checkpoint 저장 완료: {save_path}", flush=True)
+            interrupt_save_path = _checkpoint_path_with_suffix(save_path, f"_interrupt{current_chunks}")
+            save_checkpoint(current_chunks, interrupt_save_path)
+            print(f"interrupt checkpoint 저장 완료: {interrupt_save_path}", flush=True)
         else:
             print("이번 실행에서 완료된 새 chunk가 없어 새 checkpoint를 저장하지 않았습니다.", flush=True)
         print(
