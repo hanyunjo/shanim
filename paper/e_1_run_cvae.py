@@ -135,7 +135,8 @@ def _normalize_cvae_type(cvae_type):
 
 
 def _make_cvae(cvae_type, dim_x, dim_eta, dim_z, hidden_dims, use_bn,
-               weight_mode, weight_alpha, weight_h, weight_normalize, S0, K, B):
+               weight_mode, weight_alpha, weight_mode2, weight_alpha2,
+               weight_h, weight_normalize, S0, K, B):
     cvae_type = _normalize_cvae_type(cvae_type)
     if cvae_type == "base":
         return BaseCVAE(
@@ -154,6 +155,8 @@ def _make_cvae(cvae_type, dim_x, dim_eta, dim_z, hidden_dims, use_bn,
         use_bn=use_bn,
         weight_mode=weight_mode,
         weight_alpha=weight_alpha,
+        weight_mode2=weight_mode2,
+        weight_alpha2=weight_alpha2,
         weight_h=weight_h,
         weight_normalize=weight_normalize,
         cvae_type=cvae_type,
@@ -172,7 +175,8 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
                 init_path=None,
                 exclude_chunk_idxs=None, validation_chunk_idxs=None, val_every_chunks=10,
                 memory_on_gpu=True, cvae_type="base", weight_mode="barrier_put",
-                weight_alpha=3.0, weight_h=0.05, weight_normalize=True,
+                weight_alpha=3.0, weight_mode2=None, weight_alpha2=0.0,
+                weight_h=0.05, weight_normalize=True,
                 S0=1.0, K=1.0, B=0.8):
     
     def chunk_order_for_epoch(epoch):
@@ -506,6 +510,8 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
     weight_config = {
         'weight_mode': weight_mode,
         'weight_alpha': float(weight_alpha),
+        'weight_mode2': weight_mode2,
+        'weight_alpha2': float(weight_alpha2),
         'weight_h': float(weight_h),
         'weight_normalize': bool(weight_normalize),
         'S0': float(S0),
@@ -628,7 +634,7 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
         if cvae_type in ('barr_weight', 'normal_weight', 'add_put_loss'):
             checkpoint_weight_config = resume_checkpoint.get('weight_config', {})
             for key, value in weight_config.items():
-                if key == 'weight_alpha':
+                if key in ('weight_alpha', 'weight_alpha2'):
                     continue
                 if key in checkpoint_weight_config and checkpoint_weight_config[key] != value:
                     raise ValueError(
@@ -636,13 +642,21 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
                         f"current {key}={value}"
                     )
             if (
-                'weight_alpha' in checkpoint_weight_config
-                and checkpoint_weight_config['weight_alpha'] != weight_config['weight_alpha']
+                (
+                    'weight_alpha' in checkpoint_weight_config
+                    and checkpoint_weight_config['weight_alpha'] != weight_config['weight_alpha']
+                )
+                or (
+                    'weight_alpha2' in checkpoint_weight_config
+                    and checkpoint_weight_config['weight_alpha2'] != weight_config['weight_alpha2']
+                )
             ):
                 weight_alpha_changed_on_resume = True
                 print(
                     f"weight_alpha 변경 resume: "
-                    f"{checkpoint_weight_config['weight_alpha']} -> {weight_config['weight_alpha']}"
+                    f"{checkpoint_weight_config.get('weight_alpha')} -> {weight_config['weight_alpha']}, "
+                    f"weight_alpha2: "
+                    f"{checkpoint_weight_config.get('weight_alpha2')} -> {weight_config['weight_alpha2']}"
                 )
 
     # 모델 생성
@@ -655,6 +669,8 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
         use_bn=use_bn,
         weight_mode=weight_mode,
         weight_alpha=weight_alpha,
+        weight_mode2=weight_mode2,
+        weight_alpha2=weight_alpha2,
         weight_h=weight_h,
         weight_normalize=weight_normalize,
         S0=S0,

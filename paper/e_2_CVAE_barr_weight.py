@@ -25,6 +25,8 @@ class CVAEBarrWeight(BaseCVAE):
                 use_bn: bool = False,
                 weight_mode: str = "barrier_put",
                 weight_alpha: float = 3.0,
+                weight_mode2: str = None,
+                weight_alpha2: float = 0.0,
                 weight_h: float = 0.05,
                 weight_normalize: bool = True,
                 S0: float = 1.0,
@@ -41,6 +43,8 @@ class CVAEBarrWeight(BaseCVAE):
         )
         self.weight_mode = weight_mode
         self.weight_alpha = float(weight_alpha)
+        self.weight_mode2 = weight_mode2
+        self.weight_alpha2 = float(weight_alpha2)
         self.weight_h = float(weight_h)
         self.weight_normalize = bool(weight_normalize)
         self.S0 = float(S0)
@@ -50,11 +54,19 @@ class CVAEBarrWeight(BaseCVAE):
 
     def reconstruction_weight(self, x_raw):
         mode = self.weight_mode
+        mode2 = self.weight_mode2
+        if mode2 in ("", "none", "None"):
+            mode2 = None
         cvae_type = self.cvae_type
         if cvae_type not in ("barr_weight", "barrweight", "normal_weight", "normalweight"):
             raise ValueError("reconstruction_weight supports cvae_type 'barr_weight' or 'normal_weight'.")
         if mode not in ("barrier_put", "barrierput", "barrier_near", "barriernear", "all_put"):
             raise ValueError("weight_mode must be one of 'barrier_put', 'barrier_near', or 'all_put'.")
+        if mode2 is not None:
+            if cvae_type not in ("normal_weight", "normalweight"):
+                raise ValueError("weight_mode2 is only supported for cvae_type='normal_weight'.")
+            if mode2 not in ("barrier_put", "barrierput", "all_put"):
+                raise ValueError("weight_mode2 must be one of 'barrier_put' or 'all_put' for cvae_type='normal_weight'.")
         if self.weight_h <= 0:
             raise ValueError("weight_h must be positive.")
         if x_raw.shape[-1] < 1:
@@ -79,17 +91,21 @@ class CVAEBarrWeight(BaseCVAE):
                 raise ValueError("weight_mode must be one of 'barrier_put' or 'barrier_near' for cvae_type='barr_weight'.")
 
         elif cvae_type in ("normal_weight", "normalweight"):
-            if mode in ("barrier_put", "barrierput"):
-                if x_raw.shape[-1] < 2:
-                    raise ValueError("require x_raw with [X_T, M_T].")
-                MT = x_raw[:, 1]
-                b_log = float(np.log(self.B / self.S0))
-                in_barrier = (MT > b_log).to(dtype=x_raw.dtype)
-                weight = 1.0 + self.weight_alpha * put_side * in_barrier
-            elif mode == "all_put":
-                weight = 1.0 + self.weight_alpha * put_side
-            else:
+            def normal_component(component_mode, component_alpha):
+                if component_mode in ("barrier_put", "barrierput"):
+                    if x_raw.shape[-1] < 2:
+                        raise ValueError("require x_raw with [X_T, M_T].")
+                    MT = x_raw[:, 1]
+                    b_log = float(np.log(self.B / self.S0))
+                    in_barrier = (MT > b_log).to(dtype=x_raw.dtype)
+                    return component_alpha * put_side * in_barrier
+                if component_mode == "all_put":
+                    return component_alpha * put_side
                 raise ValueError("weight_mode must be one of 'barrier_put' or 'all_put' for cvae_type='normal_weight'.")
+
+            weight = 1.0 + normal_component(mode, self.weight_alpha)
+            if mode2 is not None:
+                weight = weight + normal_component(mode2, self.weight_alpha2)
 
         weight = weight.detach()
         if self.weight_normalize:
