@@ -920,9 +920,6 @@ def train_chunk_time_check(model_type = 'hes', dim_z=8, hidden_dims=None, batch_
                 dataset, chunk_load_time = future.result()
                 profile['load_wait'] = time.perf_counter() - t0
                 profile['chunk_load'] = chunk_load_time
-                if offset + 1 < num_chunks:
-                    _, _, next_ci = chunk_info(global_chunk + 1)
-                    future = prefetcher.submit(load_chunk_timed, next_ci)
 
                 if memory_on_gpu:
                     cpu_dataset = dataset
@@ -946,6 +943,7 @@ def train_chunk_time_check(model_type = 'hes', dim_z=8, hidden_dims=None, batch_
                     )
                 )
                 if should_validate:
+                    print(f"Validation 시작 @ chunk {current_chunks}", flush=True)
                     t0 = time.perf_counter()
                     val_result = validate_chunks(current_chunks)
                     _cuda_sync()
@@ -956,16 +954,23 @@ def train_chunk_time_check(model_type = 'hes', dim_z=8, hidden_dims=None, batch_
                     print(f"Validation time: {validation_time:.2f}s", flush=True)
                 if current_chunks % total_chunks == 0:
                     finish_epoch(epoch, current_epoch_start, current_chunks)
-    except KeyboardInterrupt:
+                if offset + 1 < num_chunks:
+                    _, _, next_ci = chunk_info(global_chunk + 1)
+                    future = prefetcher.submit(load_chunk_timed, next_ci)
+    except (KeyboardInterrupt, Exception) as exc:
         total_time = time.perf_counter() - train_start
         print(
-            f"\n학습 interrupt 감지 | 저장 기준 완료 chunks={current_chunks}/{target_chunks}",
+            f"\n학습 중단/에러 감지 ({type(exc).__name__}) | "
+            f"저장 기준 완료 chunks={current_chunks}/{target_chunks}",
             flush=True,
         )
         if current_chunks > completed_chunks:
             interrupt_save_path = _checkpoint_path_with_suffix(save_path, f"_interrupt{current_chunks}")
-            save_checkpoint(current_chunks, interrupt_save_path)
-            print(f"interrupt checkpoint 저장 완료: {interrupt_save_path}", flush=True)
+            try:
+                save_checkpoint(current_chunks, interrupt_save_path)
+                print(f"interrupt checkpoint 저장 완료: {interrupt_save_path}", flush=True)
+            except Exception as save_exc:
+                print(f"interrupt checkpoint 저장 실패: {save_exc!r}", flush=True)
         else:
             print("이번 실행에서 완료된 새 chunk가 없어 새 checkpoint를 저장하지 않았습니다.", flush=True)
         print(
