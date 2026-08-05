@@ -21,8 +21,8 @@ from d_FDM import (
 ROBUSTNESS_VARIABLES_MAIN = {
     "bs": {
         "r": [0.0025, 0.0975],
-        "sigma": [0.05, 0.80], # < 0.812
-        #"sigma": [0.05, 0.75],
+        #"sigma": [0.05, 0.80], # < 0.812
+        "sigma": [0.05, 0.75],
         "T": [0.15, 2.85], # σ < root(T)
     },
     "hes": {
@@ -640,7 +640,7 @@ def plot_sampling_comparison(results, model_name, variable, value):
 
     if model_name == 'bs':
         fig_name = 'BS'
-    elif model_name == 'hes':
+    elif model_name == 'hes' or model_name == 'hes_clip':
         fig_name = 'Heston'
 
     fig.suptitle(f"{fig_name} robustness | {variable}={value:g}")

@@ -230,7 +230,10 @@ def _solve_v_sweep(r_side, v_grid, kappa, theta, xi, dv, dt, th, NS, Nv):
     return Y
  
  
-def CS_ADI_heston_vanilla(eta, type='call', S_max=4.0, v_max=1.5, dS=0.01, dv=0.001, dt=0.01):
+def CS_ADI_heston_vanilla(
+    eta, type='call', S_max=4.0, v_max=1.5, dS=0.01, dv=0.001,
+    dt=0.01, return_surface=False, snapshot_steps=(),
+):
     S0, K, r, kappa, theta, xi, rho, v0, T = eta
 
     S_grid = np.arange(0, S_max + dS, dS)
@@ -239,7 +242,9 @@ def CS_ADI_heston_vanilla(eta, type='call', S_max=4.0, v_max=1.5, dS=0.01, dv=0.
     dv = v_grid[1] - v_grid[0]
     NS = len(S_grid)
     Nv = len(v_grid)
-    steps = int(T / dt)
+    steps = int(round(T / dt))
+    if steps <= 0 or not np.isclose(steps * dt, T, rtol=0.0, atol=1e-10):
+        raise ValueError("T must be a positive integer multiple of dt.")
     th = 0.5  # Crank-Nicolson
  
     # initial condition
@@ -249,6 +254,11 @@ def CS_ADI_heston_vanilla(eta, type='call', S_max=4.0, v_max=1.5, dS=0.01, dv=0.
     elif type == 'put':
         U = np.maximum(K - S2D, 0.0)
  
+    snapshot_steps = {int(step) for step in snapshot_steps}
+    if any(step < 0 or step > steps for step in snapshot_steps):
+        raise ValueError('snapshot_steps must lie between 0 and the final time step.')
+    snapshots = {0: U.copy()} if 0 in snapshot_steps else {}
+
     for t in range(steps):
         tau = (t + 1) * dt
  
@@ -293,7 +303,13 @@ def CS_ADI_heston_vanilla(eta, type='call', S_max=4.0, v_max=1.5, dS=0.01, dv=0.
         U_new[-1, :] = bc_high
  
         U = U_new
- 
+        if t + 1 in snapshot_steps:
+            snapshots[t + 1] = U.copy() # 만기 T까지의 결과
+
+    if return_surface:
+        snapshots[steps] = U
+        return snapshots, S_grid, v_grid
+
     idx = S0 / dS;  i = int(idx);  wi = idx - i
     jdx = v0 / dv;  j = int(jdx);  wj = jdx - j
     price = ((1-wi)*(1-wj) * U[i, j]   + wi*(1-wj) * U[i+1, j]
@@ -433,7 +449,10 @@ def CN_BS_barrier(eta, type='call', B=0.8, S_max=4.0, dS=0.01, dt=0.01):
 
 # 2-2) Heston
 # CS
-def CS_ADI_heston_barrier(eta, type='call', B=0.8, S_max=4.0, v_max=1.5, dS=0.01, dv=0.001, dt=0.01):
+def CS_ADI_heston_barrier(
+    eta, type='call', B=0.8, S_max=4.0, v_max=1.5, dS=0.01, dv=0.001,
+    dt=0.01, return_surface=False, snapshot_steps=(),
+):
     S0, K, r, kappa, theta, xi, rho, v0, T = eta
 
     S_grid = np.arange(B, S_max + dS, dS)
@@ -442,7 +461,9 @@ def CS_ADI_heston_barrier(eta, type='call', B=0.8, S_max=4.0, v_max=1.5, dS=0.01
     dv = v_grid[1] - v_grid[0]
     NS = len(S_grid)
     Nv = len(v_grid)
-    steps = int(T / dt)
+    steps = int(round(T / dt))
+    if steps <= 0 or not np.isclose(steps * dt, T, rtol=0.0, atol=1e-10):
+        raise ValueError("T must be a positive integer multiple of dt.")
     th = 0.5
     
     has_discontinuity = (type == 'call' and K < B) or (type == 'put' and B < K)
@@ -456,6 +477,11 @@ def CS_ADI_heston_barrier(eta, type='call', B=0.8, S_max=4.0, v_max=1.5, dS=0.01
     # S_min = B : knock-out
     U[0, :] = 0.0
  
+    snapshot_steps = {int(step) for step in snapshot_steps}
+    if any(step < 0 or step > steps for step in snapshot_steps):
+        raise ValueError('snapshot_steps must lie between 0 and the final time step.')
+    snapshots = {0: U.copy()} if 0 in snapshot_steps else {}
+
     for t in range(steps):
         tau = (t + 1) * dt
         th = 1.0 if t < t_rannacher else 0.5
@@ -493,9 +519,284 @@ def CS_ADI_heston_barrier(eta, type='call', B=0.8, S_max=4.0, v_max=1.5, dS=0.01
         U_new[-1, :] = bc_high
  
         U = U_new
- 
+        if t + 1 in snapshot_steps:
+            snapshots[t + 1] = U.copy()
+
+    if return_surface:
+        snapshots[steps] = U
+        return snapshots, S_grid, v_grid
+
     idx = (S0 - B) / dS;  i = int(idx);  wi = idx - i
     jdx = v0 / dv;        j = int(jdx);  wj = jdx - j
     price = ((1-wi)*(1-wj) * U[i, j]   + wi*(1-wj) * U[i+1, j]
            + (1-wi)*wj     * U[i, j+1] + wi*wj     * U[i+1, j+1])
     return price
+
+
+
+
+
+
+
+
+
+
+
+
+# =========================================================
+# Greeks: FDM bump-and-revalue finite differences
+# =========================================================
+def _fdm_check_opt_type(opt_type):
+    if opt_type not in ("call", "put"):
+        raise ValueError("opt_type must be 'call' or 'put'.")
+
+def _fdm_aligned_step(raw_step, grid_step):
+    if raw_step <= 0 or grid_step <= 0:
+        raise ValueError("raw_step and grid_step must be positive.")
+    return max(1, int(round(raw_step / grid_step))) * grid_step
+
+def _fdm_default_bs_steps(eta, relative_step=0.01, dS=0.01, dt=0.01):
+    S0, _, r, sigma, T = map(float, eta)
+    return {
+        "S0": _fdm_aligned_step(max(abs(S0) * relative_step, dS), dS),
+        "r": max(abs(r) * relative_step, 1e-5),
+        "sigma": max(abs(sigma) * relative_step, 1e-5),
+        "T": _fdm_aligned_step(max(abs(T) * relative_step, dt), dt),
+    }
+
+def _fdm_default_heston_steps(eta, relative_step=0.01, dS=0.01, dv=0.001, dt=0.01):
+    S0, _, r, _, _, _, _, v0, T = map(float, eta)
+    return {
+        "S0": _fdm_aligned_step(max(abs(S0) * relative_step, dS), dS),
+        "r": max(abs(r) * relative_step, 1e-5),
+        "v0": _fdm_aligned_step(max(abs(v0) * relative_step, dv), dv),
+        "T": _fdm_aligned_step(max(abs(T) * relative_step, dt), dt),
+    }
+
+def _fdm_first_derivative(price, eta_base, index, h, is_valid):
+    eta_up = eta_base.copy()
+    eta_up[index] += h
+    if not is_valid(eta_up):
+        raise ValueError(
+            "No valid forward bump is available. Reduce h or check parameter bounds."
+        )
+
+    base_price = price(eta_base)
+    price_up = price(eta_up)
+    return (price_up - base_price) / h, {
+        "scheme": "forward",
+        "base_price": base_price,
+        "price_up": price_up,
+        "h": h,
+    }
+
+
+def _fdm_bilinear_price(surface, S_grid, v_grid, S0, v0):
+    i = int(np.searchsorted(S_grid, S0, side="right") - 1)
+    j = int(np.searchsorted(v_grid, v0, side="right") - 1)
+    i = int(np.clip(i, 0, len(S_grid) - 2))
+    j = int(np.clip(j, 0, len(v_grid) - 2))
+    wi = (S0 - S_grid[i]) / (S_grid[i + 1] - S_grid[i])
+    wj = (v0 - v_grid[j]) / (v_grid[j + 1] - v_grid[j])
+    return float(
+        (1 - wi) * (1 - wj) * surface[i, j]
+        + wi * (1 - wj) * surface[i + 1, j]
+        + (1 - wi) * wj * surface[i, j + 1]
+        + wi * wj * surface[i + 1, j + 1]
+    )
+
+
+def FDM_BS_greeks(
+    eta,
+    B=None,
+    opt_type="call",
+    greeks=("delta", "vega", "rho", "theta"),
+    h=None,
+    relative_step=0.01,
+    solver_kwargs=None,
+):
+    _fdm_check_opt_type(opt_type)
+    eta_base = np.asarray(eta, dtype=float)
+    if eta_base.shape != (5,):
+        raise ValueError("BS eta must be (S0, K, r, sigma, T).")
+
+    kwargs = dict(solver_kwargs or {})
+    price_fn = CN_BS_vanilla if B is None else CN_BS_barrier
+    default_dt = 0.001
+
+    dS = float(kwargs.get("dS", 0.01))
+    dt = float(kwargs.get("dt", default_dt))
+    S_max = float(kwargs.get("S_max", 4.0))
+    steps = _fdm_default_bs_steps(eta_base, relative_step, dS, dt)
+    if h is not None:
+        steps.update({key: float(value) for key, value in h.items()})
+    steps["S0"] = _fdm_aligned_step(steps["S0"], dS)
+    steps["T"] = _fdm_aligned_step(steps["T"], dt)
+
+    def is_valid(current_eta):
+        S0, _, _, sigma, T = current_eta
+        s_low = B if B is not None else 0.0
+        return S0 > s_low and S0 < S_max and sigma > 0.0 and T > 0.0
+
+    price_cache = {}
+
+    def price(current_eta):
+        key = tuple(np.round(current_eta, 14))
+        if key not in price_cache:
+            if B is None:
+                price_cache[key] = float(price_fn(current_eta, type=opt_type, **kwargs))
+            else:
+                price_cache[key] = float(price_fn(current_eta, type=opt_type, B=B, **kwargs))
+        return price_cache[key]
+
+    mapping = {
+        "delta" : (0, "S0", 1.0),
+        "rho"   : (2, "r", 1.0),
+        "vega"  : (3, "sigma", 1.0),
+        "theta" : (4, "T", -1.0),
+    }
+    unknown = set(greeks) - set(mapping)
+    if unknown:
+        raise ValueError(f"Unknown BS Greeks: {sorted(unknown)}")
+
+    result = {"price": price(eta_base), "h": steps, "details": {}}
+    for greek in greeks:
+        index, step_name, sign = mapping[greek]
+        value, detail = _fdm_first_derivative(
+            price, eta_base, index, steps[step_name], is_valid
+        )
+        result[greek] = sign * value
+        result["details"][greek] = detail
+    return result
+
+
+def FDM_heston_greeks(
+    eta,
+    B=None,
+    opt_type="call",
+    greeks=("delta", "rho", "v0", "theta"),
+    h=None,
+    relative_step=0.01,
+    solver_kwargs=None,
+):
+    _fdm_check_opt_type(opt_type)
+    eta_base = np.asarray(eta, dtype=float)
+    if eta_base.shape != (9,):
+        raise ValueError("Heston eta must be (S0, K, r, kappa, theta, xi, rho, v0, T).")
+
+    kwargs = dict(solver_kwargs or {})
+    kwargs.pop("return_surface", None)
+    kwargs.pop("snapshot_steps", None)
+    dS = float(kwargs.get("dS", 0.01))
+    dv = float(kwargs.get("dv", 0.001))
+    dt = float(kwargs.get("dt", 0.01))
+    S_max = float(kwargs.get("S_max", 4.0))
+    v_max = float(kwargs.get("v_max", 1.5))
+    steps = _fdm_default_heston_steps(eta_base, relative_step, dS, dv, dt)
+    if h is not None:
+        unknown_h = set(h) - set(steps)
+        if unknown_h:
+            raise ValueError(f"Unknown Heston bump variables: {sorted(unknown_h)}")
+        steps.update({key: float(value) for key, value in h.items()})
+    steps["S0"] = _fdm_aligned_step(steps["S0"], dS)
+    steps["v0"] = _fdm_aligned_step(steps["v0"], dv)
+    steps["T"] = _fdm_aligned_step(steps["T"], dt)
+
+    price_fn = CS_ADI_heston_vanilla if B is None else CS_ADI_heston_barrier
+
+    def is_valid(current_eta):
+        S0, _, _, kappa, theta, xi, rho, v0, T = current_eta
+        s_low = B if B is not None else 0.0
+        return (
+            S0 > s_low
+            and S0 < S_max
+            and kappa > 0.0
+            and theta > 0.0
+            and xi > 0.0
+            and -1.0 < rho < 1.0
+            and 0.0 <= v0 < v_max
+            and T > 0.0
+        )
+
+    if not is_valid(eta_base):
+        raise ValueError("Base Heston parameters are outside the FDM domain.")
+
+    S0, _, _, _, _, _, _, v0, T = eta_base
+    eta_extended = eta_base.copy()
+    eta_extended[8] += steps["T"]
+    base_steps = int(round(T / dt))
+    final_steps = int(round(eta_extended[8] / dt))
+
+    print(f"Calculating base")
+    if B is None:
+        snapshots, S_grid, v_grid = price_fn(
+            eta_extended,
+            type=opt_type,
+            return_surface=True,
+            snapshot_steps=(base_steps,),
+            **kwargs,
+        )
+    else:
+        snapshots, S_grid, v_grid = price_fn(
+            eta_extended,
+            type=opt_type,
+            B=B,
+            return_surface=True,
+            snapshot_steps=(base_steps,),
+            **kwargs,
+        )
+    print(f"Calculating base finish")
+
+    surface_T = snapshots[base_steps]
+    surface_T_plus = snapshots[final_steps]
+    base_price = _fdm_bilinear_price(surface_T, S_grid, v_grid, S0, v0)
+
+    mapping = {
+        "delta": (0, "S0", 1.0),
+        "rho": (2, "r", 1.0),
+        "v0": (7, "v0", 1.0),
+        "theta": (8, "T", -1.0),
+    }
+    requested = tuple(greeks)
+    unknown = set(requested) - set(mapping)
+    if unknown:
+        raise ValueError(f"Unknown Heston sensitivities: {sorted(unknown)}")
+
+    result = {"price": base_price, "h": steps, "details": {}}
+    for greek in requested:
+        index, step_name, sign = mapping[greek]
+        step = steps[step_name]
+
+        if greek == "delta":
+            price_up = _fdm_bilinear_price(
+                surface_T, S_grid, v_grid, S0 + step, v0
+            )
+        elif greek == "v0":
+            price_up = _fdm_bilinear_price(
+                surface_T, S_grid, v_grid, S0, v0 + step
+            )
+        elif greek == "theta":
+            price_up = _fdm_bilinear_price(
+                surface_T_plus, S_grid, v_grid, S0, v0
+            )
+        else:
+            print(f"Calculating {greek}")
+            eta_up = eta_base.copy()
+            eta_up[index] += step
+            if not is_valid(eta_up):
+                raise ValueError(
+                    "No valid forward bump is available. Reduce h or check parameter bounds."
+                )
+            if B is None:
+                price_up = float(price_fn(eta_up, type=opt_type, **kwargs))
+            else:
+                price_up = float(price_fn(eta_up, type=opt_type, B=B, **kwargs))
+
+        result[greek] = float(sign * (price_up - base_price) / step)
+        result["details"][greek] = {
+            "scheme": "forward",
+            "base_price": base_price,
+            "price_up": price_up,
+            "h": step,
+        }
+    return result

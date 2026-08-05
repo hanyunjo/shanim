@@ -25,8 +25,8 @@ BS_CLIP_CHUNK_DIR  = "/mnt/d/bs_clip_chunks_correction/"
 BS_CLIP_ETA_PATH   = "/mnt/d/bs_eta_clip.h5"
 HES_CHUNK_DIR = "/mnt/d/heston_chunks_correction/"
 HES_ETA_PATH  = "/mnt/d/heston_eta_basic.h5"
-HES_CLIP_CHUNK_DIR = "/mnt/d/heston_clip_chunks_correction/"
-HES_CLIP_ETA_PATH  = "/mnt/d/heston_eta_clip.h5"
+HES_CLIP_CHUNK_DIR = "/mnt/d/heston_clip_x2_chunks_correction/"
+HES_CLIP_ETA_PATH  = "/mnt/d/heston_eta_clip_x2.h5"
 
 
 def alarm(message:str = "Jupyter 셀 실행 완료!"):
@@ -177,7 +177,7 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
                 memory_on_gpu=True, cvae_type="base", weight_mode="barrier_put",
                 weight_alpha=3.0, weight_mode2=None, weight_alpha2=0.0,
                 weight_h=0.05, weight_normalize=True,
-                S0=1.0, K=1.0, B=0.8):
+                S0=1.0, K=1.0, B=0.8, tmp_save_every_chunks=10):
     
     def chunk_order_for_epoch(epoch):
         chunk_indices = np.array(trainable_chunk_idxs, dtype=int)
@@ -390,11 +390,9 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
             return f"{root}{suffix}{ext}"
         return f"{path}{suffix}"
 
-    def save_checkpoint(current_chunks, checkpoint_path=None):
+    def _checkpoint_payload(current_chunks):
         completed_epochs = current_chunks // total_chunks
-        if checkpoint_path is None:
-            checkpoint_path = save_path
-        torch.save({
+        return {
             'model_state' : cvae.state_dict(),
             'eta_min'     : eta_min,
             'eta_max'     : eta_max,
@@ -423,7 +421,36 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
             'epoch'          : completed_epochs,
             'epoch_accum'    : epoch_accum,
             'optimizer_state': optimizer.state_dict(),
-        }, checkpoint_path)
+            'tmp_save_every_chunks': tmp_save_every_chunks,
+        }
+
+    def save_checkpoint(current_chunks, checkpoint_path=None):
+        if checkpoint_path is None:
+            checkpoint_path = save_path
+        writing_path = f"{checkpoint_path}.writing"
+        try:
+            torch.save(_checkpoint_payload(current_chunks), writing_path)
+            os.replace(writing_path, checkpoint_path)
+        except Exception:
+            if os.path.exists(writing_path):
+                try:
+                    os.remove(writing_path)
+                except OSError:
+                    pass
+            raise
+
+    def save_tmp_checkpoint(current_chunks, tmp_checkpoint_path):
+        save_checkpoint(current_chunks, tmp_checkpoint_path)
+        print(f"tmp checkpoint 저장 완료: {tmp_checkpoint_path} | 완료 chunks={current_chunks}", flush=True)
+
+    def remove_tmp_checkpoint(tmp_checkpoint_path):
+        if not os.path.exists(tmp_checkpoint_path):
+            return
+        try:
+            os.remove(tmp_checkpoint_path)
+            print(f"tmp checkpoint 삭제 완료: {tmp_checkpoint_path}", flush=True)
+        except OSError as exc:
+            print(f"tmp checkpoint 삭제 실패: {exc!r}", flush=True)
 
     def record_chunk_loss(global_chunk, epoch, chunk_pos, ci, chunk_losses):
         chunk_avg_recon, chunk_avg_kl, chunk_avg_total, bn_mode, beta_eff = chunk_losses
@@ -584,6 +611,10 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
         val_every_chunks = int(val_every_chunks)
         if val_every_chunks < 1:
             raise ValueError("val_every_chunks must be >= 1")
+    if tmp_save_every_chunks is not None:
+        tmp_save_every_chunks = int(tmp_save_every_chunks)
+        if tmp_save_every_chunks < 1:
+            raise ValueError("tmp_save_every_chunks must be >= 1 or None")
     if resume_path is not None and init_path is not None:
         raise ValueError("resume_path and init_path cannot be used together.")
     if save_path is None:
@@ -775,12 +806,14 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
     # start train
     train_start = time.perf_counter()
     target_chunks = completed_chunks + num_chunks
+    tmp_save_path = _checkpoint_path_with_suffix(save_path, "_tmp")
     print(
         f"학습 시작 | 이번 실행 chunks={num_chunks} | "
         f"진행 chunks={completed_chunks}->{target_chunks} | files/epoch={total_chunks} | "
         f"excluded={sorted(exclude_chunk_idxs)} | validation={sorted(validation_chunk_idxs)} | "
         f"val_every_chunks={val_every_chunks} | bn_chunks={bn_chunks} | warmup_chunks={warmup_chunks} | "
-        f"memory_on_gpu={memory_on_gpu} | cvae_type={cvae_type}"
+        f"memory_on_gpu={memory_on_gpu} | cvae_type={cvae_type} | "
+        f"tmp_save_every_chunks={tmp_save_every_chunks}"
     )
     if cvae_type in ('barr_weight', 'normal_weight', 'add_put_loss'):
         print(f"weighted recon config: {weight_config}")
@@ -826,6 +859,11 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
                     record_validation_loss(validate_chunks(current_chunks))
                 if current_chunks % total_chunks == 0:
                     finish_epoch(epoch, current_epoch_start, current_chunks)
+                if (
+                    tmp_save_every_chunks is not None
+                    and (current_chunks - completed_chunks) % tmp_save_every_chunks == 0
+                ):
+                    save_tmp_checkpoint(current_chunks, tmp_save_path)
                 if offset + 1 < num_chunks:
                     _, _, next_ci = chunk_info(global_chunk + 1)
                     future = prefetcher.submit(load_chunk, next_ci)
@@ -853,6 +891,7 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
 
     total_time = time.perf_counter() - train_start
     save_checkpoint(target_chunks)
+    remove_tmp_checkpoint(tmp_save_path)
     print(f"모델 저장 완료: {save_path}")
     print(f"총 학습 시간: {total_time/60:.2f}분 ({total_time/3600:.2f}시간)")
 
