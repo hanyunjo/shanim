@@ -57,12 +57,13 @@ class GpuChunk:
         return self.x.shape[0]
 
 
-def load_chunk_file_to_gpu(chunk_path, etas, eta_min, eta_max):
+def load_chunk_file_to_gpu(chunk_path, etas, eta_min, eta_max, include_m=True):
     with h5py.File(chunk_path, 'r') as f:
         paths = f['paths'][:] # (N, 3) : [ori_idx, X_T, M_T]
 
     ori_idx = paths[:, 0].astype(np.int64, copy=False)
-    x_np = paths[:, 1:3].astype(np.float32, copy=True)
+    x_stop = 3 if include_m else 2
+    x_np = paths[:, 1:x_stop].astype(np.float32, copy=True)
 
     eta_np = etas[ori_idx].astype(np.float32, copy=True)
     eta_np = (eta_np - eta_min) / (eta_max - eta_min + 1e-8)
@@ -78,20 +79,20 @@ def load_chunk_file_to_gpu(chunk_path, etas, eta_min, eta_max):
 
 
 class ChunkDataset(Dataset): # for Ram
-    def __init__(self, chunk_path, etas, eta_min, eta_max):
+    def __init__(self, chunk_path, etas, eta_min, eta_max, include_m=True):
 
         with h5py.File(chunk_path, 'r') as f:
             paths = f['paths'][:] # (N, 3) : [ori_idx, X_T, M_T]
 
         ori_idx = paths[:, 0].astype(int)
-        X_T     = paths[:, 1].astype(np.float32)
-        M_T     = paths[:, 2].astype(np.float32)
+        x_stop = 3 if include_m else 2
+        x_np = paths[:, 1:x_stop].astype(np.float32, copy=True)
 
         eta_matched = etas[ori_idx].astype(np.float32)
         eta_matched = (eta_matched - eta_min) / (eta_max - eta_min + 1e-8)
 
-        self.x = torch.tensor(np.stack([X_T, M_T], axis=1))  # (N, 2)
-        self.eta = torch.tensor(eta_matched)   # (N, dim_eta)
+        self.x = torch.from_numpy(x_np)  # include_m=False: (N, 1), True: (N, 2)
+        self.eta = torch.from_numpy(eta_matched)   # (N, dim_eta)
 
     def __len__(self):
         return len(self.x)
@@ -135,6 +136,7 @@ def _normalize_cvae_type(cvae_type):
 
 
 def _make_cvae(cvae_type, dim_x, dim_eta, dim_z, hidden_dims, use_bn,
+               residual_blocks,
                weight_mode, weight_alpha, weight_mode2, weight_alpha2,
                weight_h, weight_normalize, S0, K, B):
     cvae_type = _normalize_cvae_type(cvae_type)
@@ -145,6 +147,7 @@ def _make_cvae(cvae_type, dim_x, dim_eta, dim_z, hidden_dims, use_bn,
             dim_z=dim_z,
             hidden_dims=hidden_dims,
             use_bn=use_bn,
+            residual_blocks=residual_blocks,
         )
 
     return CVAEBarrWeight(
@@ -153,6 +156,7 @@ def _make_cvae(cvae_type, dim_x, dim_eta, dim_z, hidden_dims, use_bn,
         dim_z=dim_z,
         hidden_dims=hidden_dims,
         use_bn=use_bn,
+        residual_blocks=residual_blocks,
         weight_mode=weight_mode,
         weight_alpha=weight_alpha,
         weight_mode2=weight_mode2,
@@ -172,12 +176,12 @@ def _make_cvae(cvae_type, dim_x, dim_eta, dim_z, hidden_dims, use_bn,
 def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
                 lr=1e-3, beta=1.0, warmup_chunks=None, use_bn=False, bn_chunks=None, 
                 num_chunks=None, shuffle_chunks=True, save_path=None, resume_path=None,
-                init_path=None,
-                exclude_chunk_idxs=None, validation_chunk_idxs=None, val_every_chunks=10,
-                memory_on_gpu=True, cvae_type="base", weight_mode="barrier_put",
-                weight_alpha=3.0, weight_mode2=None, weight_alpha2=0.0,
-                weight_h=0.05, weight_normalize=True,
-                S0=1.0, K=1.0, B=0.8, tmp_save_every_chunks=10):
+                init_path=None, exclude_chunk_idxs=None, validation_chunk_idxs=None, 
+                val_every_chunks=10, memory_on_gpu=True, cvae_type="base", 
+                weight_mode="barrier_put", weight_alpha=3.0, weight_mode2=None, 
+                weight_alpha2=0.0, weight_h=0.05, weight_normalize=True,
+                S0=1.0, K=1.0, B=0.8, tmp_save_every_chunks=10,
+                include_m=True, residual_blocks=0):
     
     def chunk_order_for_epoch(epoch):
         chunk_indices = np.array(trainable_chunk_idxs, dtype=int)
@@ -194,11 +198,17 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
         return epoch, chunk_pos, ci
 
     def load_chunk(ci):
-        dataset = ChunkDataset(chunk_path_by_idx[int(ci)], etas, eta_min, eta_max)
+        dataset = ChunkDataset(
+            chunk_path_by_idx[int(ci)], etas, eta_min, eta_max,
+            include_m=include_m,
+        )
         return dataset
 
     def load_chunk_gpu(ci):
-        return load_chunk_file_to_gpu(chunk_path_by_idx[int(ci)], etas, eta_min, eta_max)
+        return load_chunk_file_to_gpu(
+            chunk_path_by_idx[int(ci)], etas, eta_min, eta_max,
+            include_m=include_m,
+        )
 
     def apply_bn_mode(global_chunk):
         if not use_bn:
@@ -397,9 +407,12 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
             'eta_min'     : eta_min,
             'eta_max'     : eta_max,
             'dim_x'       : dim_x,
+            'include_m'   : include_m,
             'dim_eta'     : dim_eta,
             'dim_z'       : dim_z,
             'hidden_dims' : hidden_dims,
+            'residual_blocks': residual_blocks,
+            'residual_layout': cvae.residual_layout,
             'use_bn'      : use_bn,
             'bn_chunks'   : bn_chunks,
             'warmup_chunks': warmup_chunks,
@@ -533,7 +546,36 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
     if hidden_dims is None:
         hidden_dims = [128, 128, 64]
 
+    if not isinstance(residual_blocks, (int, np.integer)) or isinstance(residual_blocks, bool):
+        raise TypeError("residual_blocks must be a non-negative integer.")
+    residual_blocks = int(residual_blocks)
+    if residual_blocks < 0:
+        raise ValueError("residual_blocks must be >= 0.")
+
+    if not isinstance(include_m, (bool, np.bool_)):
+        raise TypeError("include_m must be True or False.")
+    include_m = bool(include_m)
+
     cvae_type = _normalize_cvae_type(cvae_type)
+    barrier_weight_modes = {"barrier_put", "barrierput", "barrier_near", "barriernear"}
+    weight_mode_normalized = str(weight_mode).lower()
+    weight_mode2_normalized = None if weight_mode2 is None else str(weight_mode2).lower()
+    weight_uses_m = (
+        cvae_type == "barr_weight"
+        or (
+            cvae_type in ("normal_weight", "add_put_loss")
+            and weight_mode_normalized in barrier_weight_modes
+        )
+        or (
+            cvae_type == "normal_weight"
+            and weight_mode2_normalized in barrier_weight_modes
+        )
+    )
+    if not include_m and weight_uses_m:
+        raise ValueError(
+            "include_m=False cannot be used with an M_T-dependent reconstruction loss. "
+            "Use cvae_type='base', or choose an X_T-only mode such as weight_mode='all_put'."
+        )
     weight_config = {
         'weight_mode': weight_mode,
         'weight_alpha': float(weight_alpha),
@@ -563,7 +605,7 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
     else:
         raise ValueError("model_type must be 'hes' or 'bs'")
 
-    dim_x = 2   # (X_T, M_T)
+    dim_x = 2 if include_m else 1  # True: (X_T, M_T), False: (X_T,)
 
     chunk_paths = sorted(glob.glob(os.path.join(chunk_dir, "*.h5")), key=_chunk_sort_file_idx)
     num_all_chunks = len(chunk_paths)
@@ -643,6 +685,23 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
             print(f"hidden_dims를 checkpoint 설정({checkpoint_hidden_dims})으로 맞춥니다.")
         hidden_dims = checkpoint_hidden_dims
 
+        checkpoint_residual_blocks = int(resume_checkpoint.get('residual_blocks', 0))
+        if checkpoint_residual_blocks != residual_blocks:
+            print(
+                f"residual_blocks를 checkpoint 설정({checkpoint_residual_blocks})으로 맞춥니다."
+            )
+        residual_blocks = checkpoint_residual_blocks
+        checkpoint_residual_layout = resume_checkpoint.get('residual_layout')
+        if (
+            residual_blocks > 0
+            and checkpoint_residual_layout != BaseCVAE.RESIDUAL_LAYOUT
+        ):
+            raise ValueError(
+                "This checkpoint uses a different residual layout. "
+                "It cannot be resumed with the paired equal-width residual layout; "
+                "start a new experiment instead."
+            )
+
         checkpoint_dim_z = int(resume_checkpoint.get('dim_z', dim_z))
         if checkpoint_dim_z != dim_z:
             print(f"dim_z를 checkpoint 설정({checkpoint_dim_z})으로 맞춥니다.")
@@ -651,6 +710,14 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
         checkpoint_dim_x = int(resume_checkpoint.get('dim_x', dim_x))
         if checkpoint_dim_x != dim_x:
             raise ValueError(f"checkpoint dim_x={checkpoint_dim_x}, current dim_x={dim_x}")
+
+        checkpoint_include_m = bool(
+            resume_checkpoint.get('include_m', checkpoint_dim_x == 2)
+        )
+        if checkpoint_include_m != include_m:
+            raise ValueError(
+                f"checkpoint include_m={checkpoint_include_m}, current include_m={include_m}"
+            )
 
         checkpoint_dim_eta = int(resume_checkpoint.get('dim_eta', dim_eta))
         if checkpoint_dim_eta != dim_eta:
@@ -698,6 +765,7 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
         dim_z=dim_z,
         hidden_dims=hidden_dims,
         use_bn=use_bn,
+        residual_blocks=residual_blocks,
         weight_mode=weight_mode,
         weight_alpha=weight_alpha,
         weight_mode2=weight_mode2,
@@ -709,11 +777,28 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
         B=B,
     )
     cvae.bn_chunks = bn_chunks
+    cvae.include_m = include_m
     cvae.to(device)
     optimizer = torch.optim.Adam(cvae.parameters(), lr=lr)
 
     if init_path is not None:
         init_checkpoint = torch.load(init_path, map_location=device, weights_only=False)
+        init_residual_blocks = int(init_checkpoint.get('residual_blocks', 0))
+        if init_residual_blocks != residual_blocks:
+            raise ValueError(
+                f"init checkpoint residual_blocks={init_residual_blocks}, "
+                f"current residual_blocks={residual_blocks}. "
+                "init_path requires the same residual architecture."
+            )
+        init_residual_layout = init_checkpoint.get('residual_layout')
+        if (
+            residual_blocks > 0
+            and init_residual_layout != cvae.residual_layout
+        ):
+            raise ValueError(
+                "The init checkpoint uses a different residual layout. "
+                "It is incompatible with the paired equal-width residual layout."
+            )
         init_state_dict = init_checkpoint["model_state"]
         if any(key.startswith("module.") for key in init_state_dict):
             init_state_dict = {

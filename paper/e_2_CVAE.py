@@ -9,7 +9,7 @@ device = torch.device("cuda")
 # ────────────
 # Sub-networks
 # ────────────
-def freeze_batchnorm(model: nn.Module, freeze_affine: bool = True):
+def freeze_batchnorm(model, freeze_affine=True):
     # BN layer는 계속 forward에 사용하고, gamma/beta만 업데이트를 멈춘다.
     for m in model.modules():
         if isinstance(m, nn.BatchNorm1d):
@@ -21,24 +21,99 @@ def freeze_batchnorm(model: nn.Module, freeze_affine: bool = True):
                     m.bias.requires_grad_(False)
 
 
-def _hidden_mlp(in_dim: int, hidden_dims: list, activation=nn.Tanh, use_bn: bool = False):
-    layers = []
-    prev_dim = in_dim
+class ResidualBlock(nn.Module):
+    def __init__(self, dim, activation=nn.Tanh, use_bn=False):
+        super().__init__()
+        self.linear1 = nn.Linear(dim, dim)
+        self.bn1 = nn.BatchNorm1d(dim) if use_bn else nn.Identity()
+        self.activation = activation()
+        self.linear2 = nn.Linear(dim, dim)
+        self.bn2 = nn.BatchNorm1d(dim) if use_bn else nn.Identity()
 
-    for h_dim in hidden_dims:
-        layers.append(nn.Linear(prev_dim, h_dim))
-        if use_bn:
-            layers.append(nn.BatchNorm1d(h_dim))
-        layers.append(activation())
-        prev_dim = h_dim
+        # Start as an exact identity mapping and learn the residual gradually.
+        nn.init.zeros_(self.linear2.weight)
+        nn.init.zeros_(self.linear2.bias)
+
+    def forward(self, x):
+        residual = self.linear1(x)
+        residual = self.bn1(residual)
+        residual = self.activation(residual)
+        residual = self.linear2(residual)
+        residual = self.bn2(residual)
+        return x + residual
+
+
+def _hidden_mlp(in_dim, hidden_dims, activation=nn.Tanh,
+                use_bn=False, residual_blocks=0):
+    if not isinstance(residual_blocks, (int, np.integer)) or isinstance(residual_blocks, bool):
+        raise TypeError("residual_blocks must be a non-negative integer.")
+    residual_blocks = int(residual_blocks)
+    if residual_blocks < 0:
+        raise ValueError("residual_blocks must be >= 0.")
+    if not hidden_dims:
+        raise ValueError("hidden_dims must contain at least one hidden width.")
+
+    eligible_blocks = 0
+    layer_idx = 1
+    prev_dim = hidden_dims[0]
+    while layer_idx < len(hidden_dims):
+        if (
+            layer_idx + 1 < len(hidden_dims)
+            and hidden_dims[layer_idx] == prev_dim
+            and hidden_dims[layer_idx + 1] == prev_dim
+        ):
+            eligible_blocks += 1
+            layer_idx += 2
+        else:
+            prev_dim = hidden_dims[layer_idx]
+            layer_idx += 1
+
+    if residual_blocks > eligible_blocks:
+        raise ValueError(
+            f"residual_blocks={residual_blocks}, but hidden_dims={hidden_dims} "
+            f"has only {eligible_blocks} two-layer equal-width block(s)."
+        )
+
+    layers = [nn.Linear(in_dim, hidden_dims[0])]
+    if use_bn:
+        layers.append(nn.BatchNorm1d(hidden_dims[0]))
+    layers.append(activation())
+
+    prev_dim = hidden_dims[0]
+    layer_idx = 1
+    used_residual_blocks = 0
+
+    while layer_idx < len(hidden_dims):
+        use_residual = (
+            used_residual_blocks < residual_blocks
+            and layer_idx + 1 < len(hidden_dims)
+            and hidden_dims[layer_idx] == prev_dim
+            and hidden_dims[layer_idx + 1] == prev_dim
+        )
+        if use_residual:
+            layers.append(ResidualBlock(prev_dim, activation=activation, use_bn=use_bn))
+            used_residual_blocks += 1
+            layer_idx += 2
+        else:
+            h_dim = hidden_dims[layer_idx]
+            layers.append(nn.Linear(prev_dim, h_dim))
+            if use_bn:
+                layers.append(nn.BatchNorm1d(h_dim))
+            layers.append(activation())
+            prev_dim = h_dim
+            layer_idx += 1
 
     return nn.Sequential(*layers)
 
 
 class RecognitionNet(nn.Module):
-    def __init__(self, dim_x, dim_eta, dim_z, hidden_dims, use_bn=False):
+    def __init__(self, dim_x, dim_eta, dim_z, hidden_dims, use_bn=False,
+                 residual_blocks=0):
         super().__init__()
-        self.net = _hidden_mlp(dim_x + dim_eta, hidden_dims, use_bn=use_bn)
+        self.net = _hidden_mlp(
+            dim_x + dim_eta, hidden_dims, use_bn=use_bn,
+            residual_blocks=residual_blocks,
+        )
         self.mu = nn.Linear(hidden_dims[-1], dim_z)
         self.logvar = nn.Linear(hidden_dims[-1], dim_z)
 
@@ -51,9 +126,13 @@ class RecognitionNet(nn.Module):
 
 
 class PriorNet(nn.Module):
-    def __init__(self, dim_eta, dim_z, hidden_dims, use_bn=False):
+    def __init__(self, dim_eta, dim_z, hidden_dims, use_bn=False,
+                 residual_blocks=0):
         super().__init__()
-        self.net = _hidden_mlp(dim_eta, hidden_dims, use_bn=use_bn)
+        self.net = _hidden_mlp(
+            dim_eta, hidden_dims, use_bn=use_bn,
+            residual_blocks=residual_blocks,
+        )
         self.mu = nn.Linear(hidden_dims[-1], dim_z)
         self.logvar = nn.Linear(hidden_dims[-1], dim_z)
 
@@ -66,9 +145,13 @@ class PriorNet(nn.Module):
 
 
 class DecoderNet(nn.Module):
-    def __init__(self, dim_z, dim_eta, dim_x, hidden_dims, use_bn=False):
+    def __init__(self, dim_z, dim_eta, dim_x, hidden_dims, use_bn=False,
+                 residual_blocks=0):
         super().__init__()
-        self.net = _hidden_mlp(dim_z + dim_eta, hidden_dims, use_bn=use_bn)
+        self.net = _hidden_mlp(
+            dim_z + dim_eta, hidden_dims, use_bn=use_bn,
+            residual_blocks=residual_blocks,
+        )
         self.mu = nn.Linear(hidden_dims[-1], dim_x)
         self.logvar = nn.Linear(hidden_dims[-1], dim_x)
 
@@ -84,12 +167,15 @@ class DecoderNet(nn.Module):
 # CVAE
 # ─────────
 class CVAE(nn.Module):
+    RESIDUAL_LAYOUT = "paired_equal_width_v1"
+
     def __init__(self,
-                 dim_x: int = 2,       # (X_T, M_T)=2, (X_T)=1
-                 dim_eta: int = 7,     # BS=3, Heston=7
-                 dim_z: int = 8,       # latent dim
-                 hidden_dims: list = None,
-                 use_bn: bool = False
+                 dim_x=2,       # (X_T, M_T)=2, (X_T)=1
+                 dim_eta=7,     # BS=3, Heston=7
+                 dim_z=8,       # latent dim
+                 hidden_dims=None,
+                 use_bn=False,
+                 residual_blocks=0, # block size가 아니라 block 개수
                  ):
         super().__init__()
 
@@ -99,12 +185,25 @@ class CVAE(nn.Module):
         self.dim_x = dim_x
         self.dim_eta = dim_eta
         self.dim_z = dim_z
-        self.hidden_dims = hidden_dims
-        self.use_bn = use_bn
+        if not isinstance(residual_blocks, (int, np.integer)) or isinstance(residual_blocks, bool):
+            raise TypeError("residual_blocks must be a non-negative integer.")
+        residual_blocks = int(residual_blocks)
+        if residual_blocks < 0:
+            raise ValueError("residual_blocks must be >= 0.")
 
-        self.recognition = RecognitionNet(dim_x, dim_eta, dim_z, hidden_dims, use_bn=use_bn)
-        self.prior = PriorNet(dim_eta, dim_z, hidden_dims, use_bn=use_bn)
-        self.decoder = DecoderNet(dim_z, dim_eta, dim_x, hidden_dims, use_bn=use_bn)
+        self.hidden_dims = list(hidden_dims)
+        self.use_bn = bool(use_bn)
+        self.residual_blocks = residual_blocks
+        self.residual_layout = self.RESIDUAL_LAYOUT
+
+        common_kwargs = {
+            "hidden_dims": self.hidden_dims,
+            "use_bn": self.use_bn,
+            "residual_blocks": self.residual_blocks,
+        }
+        self.recognition = RecognitionNet(dim_x, dim_eta, dim_z, **common_kwargs)
+        self.prior = PriorNet(dim_eta, dim_z, **common_kwargs)
+        self.decoder = DecoderNet(dim_z, dim_eta, dim_x, **common_kwargs)
 
     @staticmethod
     def reparameterize(mu, log_var, eps=None):
@@ -149,7 +248,7 @@ class CVAE(nn.Module):
         return kl_dim_mean
 
     @torch.no_grad()
-    def sample(self, eta: torch.Tensor, n_samples = 10000):
+    def sample(self, eta, n_samples = 10000):
         self.eval()
         if eta.dim() == 1:
             eta = eta.unsqueeze(0)
@@ -166,7 +265,7 @@ class CVAE(nn.Module):
         return samples
 
     @torch.no_grad()
-    def price_vanilla(self, eta: torch.Tensor, K, r, T, 
+    def price_vanilla(self, eta, K, r, T,
                       opt_type = 'call',
                       n_samples = 10000
                       ):
@@ -184,10 +283,15 @@ class CVAE(nn.Module):
         return np.exp(-r * T) * payoff.mean().item()
     
     @torch.no_grad()
-    def price_barrier(self, eta: torch.Tensor, B, K, r, T, 
+    def price_barrier(self, eta, B, K, r, T,
                       opt_type = 'call',
                       n_samples = 10000
                       ):
+        if self.dim_x < 2:
+            raise ValueError(
+                "Barrier pricing is unavailable because this CVAE was trained without M_T."
+            )
+
         samples = self.sample(eta, n_samples)
         X_T = samples[:, 0]
         S_T = torch.exp(X_T)
@@ -205,9 +309,7 @@ class CVAE(nn.Module):
         return np.exp(-r * T) * payoff.mean().item()
 
     @torch.no_grad()
-    def total_pricing(self, eta: torch.Tensor, B, K, r, T, 
-                      n_samples = 10000
-                      ):
+    def total_pricing(self, eta, B, K, r, T, n_samples = 10000):
         samples = self.sample(eta, n_samples)
         if samples.shape[1] < 2:
             raise ValueError("total_pricing requires samples with [X_T, M_T].")

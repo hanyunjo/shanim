@@ -18,21 +18,22 @@ def _normalize_weight(weight, eps=1e-8):
 
 class CVAEBarrWeight(BaseCVAE):
     def __init__(self,
-                dim_x: int = 2,
-                dim_eta: int = 7,
-                dim_z: int = 8,
-                hidden_dims: list = None,
-                use_bn: bool = False,
-                weight_mode: str = "barrier_put",
-                weight_alpha: float = 3.0,
-                weight_mode2: str = None,
-                weight_alpha2: float = 0.0,
-                weight_h: float = 0.05,
-                weight_normalize: bool = True,
-                S0: float = 1.0,
-                K: float = 1.0,
-                B: float = 0.8,
-                cvae_type: str = "barr_weight",
+                dim_x=2,
+                dim_eta=7,
+                dim_z=8,
+                hidden_dims=None,
+                use_bn=False,
+                residual_blocks=0,
+                weight_mode="barrier_put",
+                weight_alpha=3.0,
+                weight_mode2=None,
+                weight_alpha2=0.0,
+                weight_h=0.05,
+                weight_normalize=True,
+                S0=1.0,
+                K=1.0,
+                B=0.8,
+                cvae_type="barr_weight",
                 ):
         super().__init__(
             dim_x=dim_x,
@@ -40,6 +41,7 @@ class CVAEBarrWeight(BaseCVAE):
             dim_z=dim_z,
             hidden_dims=hidden_dims,
             use_bn=use_bn,
+            residual_blocks=residual_blocks,
         )
         self.weight_mode = weight_mode
         self.weight_alpha = float(weight_alpha)
