@@ -143,6 +143,9 @@ def _cvae_cases(
     device,
     n_samples_list,
     repeats,
+    validate_samples,
+    valid_resample,
+    mt_corr,
 ):
     eta_raw = np.asarray(eta[2:], dtype=np.float32)
     eta_min = _as_numpy(checkpoint["eta_min"]).astype(np.float32)
@@ -161,6 +164,19 @@ def _cvae_cases(
         for key in OPTION_KEYS
     }
     seconds = {n: [] for n in n_samples_list}
+    sampling_diagnostics = {n: [] for n in n_samples_list}
+    diagnostic_keys = (
+        "used_sample_count",
+        "discarded_sample_count",
+        "discarded_sample_fraction",
+        "discarded_sample_pct",
+        "regenerated_sample_count",
+        "regenerated_sample_fraction",
+        "regenerated_sample_pct",
+        "mt_corrected_sample_count",
+        "mt_corrected_sample_fraction",
+        "mt_corrected_sample_pct",
+    )
 
     for n_samples in n_samples_list:
         for _ in range(repeats):
@@ -173,14 +189,51 @@ def _cvae_cases(
                 float(eta[2]),
                 float(eta[-1]),
                 int(n_samples),
+                validate_samples=validate_samples,
+                valid_resample=valid_resample,
+                mt_corr=mt_corr,
             )
             _synchronize_torch(device)
             seconds[n_samples].append(time.perf_counter() - started)
+            sampling_diagnostics[n_samples].append({
+                key: prices.get(key) for key in diagnostic_keys
+            })
 
             for key in OPTION_KEYS:
                 option_results[key][n_samples].append(float(prices[key]))
 
-    return {"prices": option_results, "seconds": seconds}
+        diagnostics_for_n = sampling_diagnostics[n_samples]
+        used_mean = _mean_std([
+            item.get("used_sample_count") for item in diagnostics_for_n
+        ])[0]
+        regenerated_pct_mean = _mean_std([
+            item.get("regenerated_sample_pct") for item in diagnostics_for_n
+        ])[0]
+        corrected_pct_mean = _mean_std([
+            item.get("mt_corrected_sample_pct") for item in diagnostics_for_n
+        ])[0]
+        if validate_samples:
+            discarded_pct_mean = _mean_std([
+                item.get("discarded_sample_pct") for item in diagnostics_for_n
+            ])[0]
+            validation_text = (
+                f"discarded={discarded_pct_mean:.4f}% "
+                f"| regenerated={regenerated_pct_mean:.4f}%"
+            )
+        else:
+            validation_text = "discarded=not checked | regenerated=0.0000%"
+        print(
+            f"[barrier samples] n={n_samples:,} | validation={validate_samples} "
+            f"| resample={valid_resample} | mt_corr={mt_corr} "
+            f"| used={used_mean:,.1f} | {validation_text} "
+            f"| mt_corrected={corrected_pct_mean:.4f}%"
+        )
+
+    return {
+        "prices": option_results,
+        "seconds": seconds,
+        "sampling_diagnostics": sampling_diagnostics,
+    }
 
 
 def _mc_total_pricing(
@@ -351,11 +404,23 @@ def run_robustness(
     checkpoint=None,
     device="cpu",
     cvae_repeats=50,
+    validate_samples=True,
+    valid_resample=True,
+    mt_corr=False,
 ):
     models = tuple(models)
     barr_types = tuple(barr_types)
     option_types = tuple(option_types)
     n_samples_list = tuple(int(n) for n in n_samples_list)
+    if not isinstance(validate_samples, (bool, np.bool_)):
+        raise TypeError("validate_samples must be True or False")
+    if not isinstance(valid_resample, (bool, np.bool_)):
+        raise TypeError("valid_resample must be True or False")
+    if not isinstance(mt_corr, (bool, np.bool_)):
+        raise TypeError("mt_corr must be True or False")
+    validate_samples = bool(validate_samples)
+    valid_resample = bool(valid_resample)
+    mt_corr = bool(mt_corr)
 
     invalid_models = set(models) - set(MODEL_BACKEND)
     if invalid_models:
@@ -412,6 +477,9 @@ def run_robustness(
                             device=device,
                             n_samples_list=n_samples_list,
                             repeats=cvae_repeats,
+                            validate_samples=validate_samples,
+                            valid_resample=valid_resample,
+                            mt_corr=mt_corr,
                         )
                     except Exception as exc:
                         cvae_error = f"cvae={type(exc).__name__}: {exc}"
@@ -461,6 +529,11 @@ def run_robustness(
                         )
                         mc_mean, mc_std = _mean_std(mc_results[largest_n])
                         cvae_mean, cvae_std = _mean_std(cvae_results[largest_n])
+                        sampling_diagnostics = (
+                            cvae_data["sampling_diagnostics"]
+                            if cvae_data is not None else {}
+                        )
+                        largest_diagnostics = sampling_diagnostics.get(largest_n, [])
 
                         rows.append({
                             "model": model_name,
@@ -490,6 +563,23 @@ def run_robustness(
                             "cvae_seconds_by_n": (
                                 cvae_data["seconds"] if cvae_data is not None else {}
                             ),
+                            "sampling_diagnostics_by_n": sampling_diagnostics,
+                            "used_sample_count": _mean_std([
+                                item.get("used_sample_count")
+                                for item in largest_diagnostics
+                            ])[0],
+                            "discarded_sample_pct": _mean_std([
+                                item.get("discarded_sample_pct")
+                                for item in largest_diagnostics
+                            ])[0],
+                            "regenerated_sample_pct": _mean_std([
+                                item.get("regenerated_sample_pct")
+                                for item in largest_diagnostics
+                            ])[0],
+                            "mt_corrected_sample_pct": _mean_std([
+                                item.get("mt_corrected_sample_pct")
+                                for item in largest_diagnostics
+                            ])[0],
                             "error": "; ".join(dict.fromkeys(errors)) if errors else None,
                         })
 
@@ -497,6 +587,9 @@ def run_robustness(
     results.attrs["n_samples_list"] = n_samples_list
     results.attrs["mc_repeats"] = mc_repeats
     results.attrs["cvae_repeats"] = cvae_repeats
+    results.attrs["validate_samples"] = validate_samples
+    results.attrs["valid_resample"] = valid_resample
+    results.attrs["mt_corr"] = mt_corr
     is_bs_backend = results["model"].map(lambda name: _model_backend(name) == "bs")
     results["reference"] = np.where(
         is_bs_backend, results["closed"], results["fdm"]
@@ -527,6 +620,8 @@ def build_sampling_summary(results):
                 result["cvae_results"].get(n_samples, [])
             )
             reference = float(result["reference"])
+            diagnostics_by_n = result.get("sampling_diagnostics_by_n", {})
+            diagnostics = diagnostics_by_n.get(n_samples, [])
 
             rows.append({
                 "model": result["model"],
@@ -557,6 +652,27 @@ def build_sampling_summary(results):
                 "cvae_seconds_mean": _mean_std(
                     result["cvae_seconds_by_n"].get(n_samples, [])
                 )[0],
+                "used_sample_count_mean": _mean_std([
+                    item.get("used_sample_count") for item in diagnostics
+                ])[0],
+                "discarded_sample_count_mean": _mean_std([
+                    item.get("discarded_sample_count") for item in diagnostics
+                ])[0],
+                "discarded_sample_pct_mean": _mean_std([
+                    item.get("discarded_sample_pct") for item in diagnostics
+                ])[0],
+                "regenerated_sample_count_mean": _mean_std([
+                    item.get("regenerated_sample_count") for item in diagnostics
+                ])[0],
+                "regenerated_sample_pct_mean": _mean_std([
+                    item.get("regenerated_sample_pct") for item in diagnostics
+                ])[0],
+                "mt_corrected_sample_count_mean": _mean_std([
+                    item.get("mt_corrected_sample_count") for item in diagnostics
+                ])[0],
+                "mt_corrected_sample_pct_mean": _mean_std([
+                    item.get("mt_corrected_sample_pct") for item in diagnostics
+                ])[0],
                 "error": result["error"],
             })
 

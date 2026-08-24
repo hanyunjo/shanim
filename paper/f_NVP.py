@@ -12,6 +12,104 @@ import torch
 import torch.nn as nn
 
 LOG_2PI = math.log(2.0 * math.pi)
+SUPPORT_EPS = 1e-6
+SUPPORT_TOLERANCE = 1e-6
+UT_MODEL_COORDINATES = ["X_T", "U_T"]
+MT_MODEL_COORDINATES = ["X_T", "M_T"]
+PHYSICAL_COORDINATES = ["X_T", "M_T"]
+SUPPORT_PARAMETERIZATION = "M_T = min(0, X_T) - softplus(U_T)"
+
+
+def _canonical_target_parameterization(target_parameterization):
+    aliases = {
+        None: "mt",
+        "mt": "mt",
+        "direct": "mt",
+        "legacy": "mt",
+        "ut": "ut",
+        "transformed": "ut",
+        "support_aware": "ut",
+    }
+    key = (
+        None if target_parameterization is None
+        else str(target_parameterization).strip().lower()
+    )
+    if key not in aliases:
+        raise ValueError("target_parameterization must be 'mt' or 'ut'.")
+    return aliases[key]
+
+
+def _checkpoint_target_parameterization(checkpoint):
+    saved = checkpoint.get("target_parameterization")
+    if saved is not None:
+        return _canonical_target_parameterization(saved)
+    coordinates = checkpoint.get("model_coordinates")
+    if coordinates is None or list(coordinates) == MT_MODEL_COORDINATES:
+        return "mt"
+    if list(coordinates) == UT_MODEL_COORDINATES:
+        return "ut"
+    raise ValueError(f"Unsupported checkpoint model_coordinates: {coordinates!r}")
+
+
+def inverse_softplus_tensor(y):
+    if not torch.is_tensor(y):
+        y = torch.as_tensor(y)
+    if not torch.is_floating_point(y):
+        y = y.to(torch.get_default_dtype())
+    if not torch.isfinite(y).all():
+        raise ValueError("inverse_softplus_tensor requires finite y.")
+    if torch.any(y <= 0):
+        raise ValueError("inverse_softplus_tensor requires y > 0.")
+    return y + torch.log(-torch.expm1(-y))
+
+
+def running_min_to_u_tensor(X_T, M_T, eps=SUPPORT_EPS,
+                            tolerance=SUPPORT_TOLERANCE):
+    if X_T.shape != M_T.shape:
+        raise ValueError("X_T and M_T must have the same shape.")
+    if eps <= 0:
+        raise ValueError("eps must be positive.")
+    finite = torch.isfinite(X_T) & torch.isfinite(M_T)
+    upper = torch.minimum(torch.zeros_like(X_T), X_T)
+    invalid = (~finite) | (M_T > upper + tolerance)
+    invalid_count = int(invalid.sum().item())
+    if invalid_count:
+        raise ValueError(
+            "Raw NVP training data violates M_T <= min(0, X_T) + tolerance: "
+            f"invalid={invalid_count:,}/{X_T.numel():,}. "
+            "The samples were not corrected or dropped."
+        )
+    D_T = upper - M_T
+    return inverse_softplus_tensor(torch.clamp(D_T, min=eps))
+
+
+def mt_to_ut_tensor(x_physical, eps=SUPPORT_EPS,
+                    tolerance=SUPPORT_TOLERANCE):
+    if x_physical.ndim != 2 or x_physical.shape[1] != 2:
+        raise ValueError("Expected [X_T, M_T] with shape (N, 2).")
+    X_T = x_physical[:, 0]
+    U_T = running_min_to_u_tensor(
+        X_T, x_physical[:, 1], eps=eps, tolerance=tolerance,
+    )
+    return torch.stack((X_T, U_T), dim=1)
+
+
+def ut_to_mt_tensor(x_model):
+    if x_model.ndim != 2 or x_model.shape[1] != 2:
+        raise ValueError("Expected [X_T, U_T] with shape (N, 2).")
+    X_T = x_model[:, 0]
+    U_T = x_model[:, 1]
+    M_T = torch.minimum(torch.zeros_like(X_T), X_T) - torch.nn.functional.softplus(U_T)
+    return torch.stack((X_T, M_T), dim=1)
+
+
+def _support_invalid_mask(samples, tolerance=SUPPORT_TOLERANCE):
+    X_T = samples[:, 0]
+    M_T = samples[:, 1]
+    finite = torch.isfinite(samples).all(dim=1)
+    return (~finite) | (
+        M_T > torch.minimum(torch.zeros_like(X_T), X_T) + tolerance
+    )
 
 # The paper defines M_T as a running maximum. In this repository, however,
 # paths[:, 2] is produced by X.min(axis=1), so the trained pair is
@@ -218,7 +316,8 @@ class ConditionalAffineCoupling2D(nn.Module):
 
 class CRealNVP2D(nn.Module):
     def __init__(self, dim_eta, n_coupling=6, hidden_dim=100, n_hidden=4,
-                 t_negative_slope=0.5, use_bn=True, scale_clip=None):
+                 t_negative_slope=0.5, use_bn=True, scale_clip=None,
+                 target_parameterization="mt", support_eps=SUPPORT_EPS):
         super().__init__()
         self.dim_x = 2
         self.dim_eta = dim_eta
@@ -228,6 +327,18 @@ class CRealNVP2D(nn.Module):
         self.t_negative_slope = t_negative_slope
         self.use_bn = use_bn
         self.scale_clip = scale_clip
+        self.target_parameterization = _canonical_target_parameterization(
+            target_parameterization
+        )
+        self.support_eps = float(support_eps)
+        if self.support_eps <= 0:
+            raise ValueError("support_eps must be positive.")
+        self.model_coordinates = (
+            list(UT_MODEL_COORDINATES)
+            if self.target_parameterization == "ut"
+            else list(MT_MODEL_COORDINATES)
+        )
+        self.physical_coordinates = list(PHYSICAL_COORDINATES)
         self.bn_frozen = False
         self.layers = nn.ModuleList([
             ConditionalAffineCoupling2D(
@@ -241,30 +352,75 @@ class CRealNVP2D(nn.Module):
             ) for i in range(n_coupling)
         ])
 
-    def encode(self, x, eta):
-        z = x
-        log_det = torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
+    def checkpoint_metadata(self):
+        return {
+            "target_parameterization": self.target_parameterization,
+            "model_coordinates": list(self.model_coordinates),
+            "physical_coordinates": list(self.physical_coordinates),
+            "support_parameterization": (
+                SUPPORT_PARAMETERIZATION
+                if self.target_parameterization == "ut"
+                else "model output M_T"
+            ),
+            "support_eps": self.support_eps,
+            "path_statistic": "running_minimum",
+        }
+
+    def prepare_training_target(self, x_physical):
+        if self.target_parameterization == "mt":
+            return x_physical
+        return mt_to_ut_tensor(x_physical, eps=self.support_eps)
+
+    def model_to_physical(self, x_model):
+        if self.target_parameterization == "mt":
+            return x_model
+        return ut_to_mt_tensor(x_model)
+
+    def _assert_generated_support(self, physical_samples):
+        if self.target_parameterization != "ut":
+            return
+        invalid_count = int(_support_invalid_mask(physical_samples).sum().item())
+        if invalid_count:
+            raise RuntimeError(
+                "Support-aware NVP reconstruction produced invalid samples: "
+                f"{invalid_count:,}/{physical_samples.shape[0]:,}. "
+                "No samples were rejected or resampled."
+            )
+
+    def encode(self, x_model, eta):
+        z = x_model
+        log_det = torch.zeros(
+            x_model.shape[0], device=x_model.device, dtype=x_model.dtype,
+        )
         for layer in self.layers:
             z, ld = layer(z, eta)
             log_det += ld
         return z, log_det
 
     def decode(self, z, eta):
-        x = z
+        x_model = z
         for layer in reversed(self.layers):
-            x = layer.inverse(x, eta)
-        return x
+            x_model = layer.inverse(x_model, eta)
+        return x_model
 
-    def log_prob(self, x, eta):
-        z, log_det = self.encode(x, eta)
+    def decode_physical(self, z, eta):
+        x_model = self.decode(z, eta)
+        physical_samples = self.model_to_physical(x_model)
+        self._assert_generated_support(physical_samples)
+        return physical_samples
+
+    def log_prob(self, x_physical, eta):
+        x_model = self.prepare_training_target(x_physical)
+        z, log_det = self.encode(x_model, eta)
         log_pz = -0.5 * (z.pow(2) + LOG_2PI).sum(dim=1)
         return log_pz + log_det
 
-    def nll(self, x, eta):
-        return -self.log_prob(x, eta).mean()
+    def nll(self, x_physical, eta):
+        return -self.log_prob(x_physical, eta).mean()
 
     @torch.no_grad()
-    def sample(self, eta, n_samples, antithetic=False, generator=None):
+    def sample(self, eta, n_samples, antithetic=False, generator=None,
+               return_transformed=False):
         self.eval()
         if eta.ndim == 1:
             eta = eta.unsqueeze(0)
@@ -275,11 +431,21 @@ class CRealNVP2D(nn.Module):
 
         if antithetic:
             half = (n_samples + 1) // 2
-            z0 = torch.randn(half, 2, device=eta.device, dtype=eta.dtype, generator=generator)
+            z0 = torch.randn(
+                half, 2, device=eta.device, dtype=eta.dtype, generator=generator,
+            )
             z = torch.cat([z0, -z0], dim=0)[:n_samples]
         else:
-            z = torch.randn(n_samples, 2, device=eta.device, dtype=eta.dtype, generator=generator)
-        return self.decode(z, eta)
+            z = torch.randn(
+                n_samples, 2, device=eta.device, dtype=eta.dtype,
+                generator=generator,
+            )
+        model_samples = self.decode(z, eta)
+        physical_samples = self.model_to_physical(model_samples)
+        self._assert_generated_support(physical_samples)
+        if return_transformed:
+            return model_samples
+        return physical_samples
 
 
 def freeze_batchnorm(model):
@@ -493,6 +659,7 @@ def paper2022_lr_schedule(model_type="hes", target_pair="XT_MIN"):
 
 def train_crealnvp_paper2022(
     *, save_path, chunk_dir=None, eta_path=None, model_type="hes", target_pair="XT_MIN",
+    target_parameterization="mt",
     batch_size=16384, train_chunk_idxs=None, validation_chunk_idxs=None,
     shuffle_chunks=True, seed=1234, device=None, scale_clip=None,
     bn_pretrain_fraction=0.05, drop_last=True, validate_data=True,
@@ -506,10 +673,15 @@ def train_crealnvp_paper2022(
     Set lr and num_epochs=1 for one notebook-controlled epoch, or set
     num_chunks to control the number of chunk files processed in this call.
     val_every_chunks controls intermediate validation without changing the
-    model architecture or objective.
+    model architecture or objective. target_parameterization="mt" learns the
+    raw [X_T, M_T] pair; "ut" validates that raw pair and trains the same flow
+    architecture on [X_T, U_T]. The HDF5 format is unchanged.
     """
     model_type = _canonical_model_type(model_type)
     target_pair = _canonical_target_pair(target_pair)
+    target_parameterization = _canonical_target_parameterization(
+        target_parameterization
+    )
     batch_size = int(batch_size)
     if batch_size < 2:
         raise ValueError("batch_size must be >= 2 because BatchNorm is used during pretraining")
@@ -593,6 +765,15 @@ def train_crealnvp_paper2022(
             raise ValueError(
                 f"checkpoint target_pair={checkpoint_target_pair}, "
                 f"current target_pair={target_pair}"
+            )
+        checkpoint_target_parameterization = _checkpoint_target_parameterization(
+            resume_checkpoint
+        )
+        if checkpoint_target_parameterization != target_parameterization:
+            raise ValueError(
+                "checkpoint target_parameterization="
+                f"{checkpoint_target_parameterization}, current="
+                f"{target_parameterization}. MT and UT checkpoints cannot be mixed."
             )
 
         if chunk_dir is None:
@@ -680,6 +861,7 @@ def train_crealnvp_paper2022(
             t_negative_slope=t_slope,
             use_bn=True,
             scale_clip=scale_clip,
+            target_parameterization=target_parameterization,
         ).to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=lr or paper_lr_schedule[0])
         history = {"epoch_nll": [], "val_nll": [], "lr": [], "epoch_seconds": []}
@@ -702,6 +884,8 @@ def train_crealnvp_paper2022(
             t_negative_slope=t_slope,
             use_bn=bool(resume_checkpoint["use_bn"]),
             scale_clip=scale_clip,
+            target_parameterization=target_parameterization,
+            support_eps=float(resume_checkpoint.get("support_eps", SUPPORT_EPS)),
         ).to(device)
         model.load_state_dict(resume_checkpoint["model_state"], strict=True)
 
@@ -864,7 +1048,10 @@ def train_crealnvp_paper2022(
         for epoch_idx in range(first_epoch_touched, last_epoch_touched + 1)
     ]
 
-    print(f"device={device}, model_type={model_type}, target_pair={target_pair}, dim_eta={dim_eta}")
+    print(
+        f"device={device}, model_type={model_type}, target_pair={target_pair}, "
+        f"target_parameterization={target_parameterization}, dim_eta={dim_eta}"
+    )
     print(f"chunk_dir={chunk_dir}, eta_path={eta_path}")
     print(f"train_chunks={len(train_idxs)}, val_chunks={len(val_idxs)}")
     print(
@@ -955,7 +1142,16 @@ def train_crealnvp_paper2022(
             "paper_preset": "Kim_et_al_2022_architecture_adapted_to_running_minimum",
             "paper_exact_target": False,
             "target_pair": target_pair,
-            "path_statistic": "minimum",
+            "target_parameterization": target_parameterization,
+            "model_coordinates": list(model.model_coordinates),
+            "physical_coordinates": list(model.physical_coordinates),
+            "support_parameterization": (
+                SUPPORT_PARAMETERIZATION
+                if target_parameterization == "ut"
+                else "model output M_T"
+            ),
+            "support_eps": model.support_eps,
+            "path_statistic": "running_minimum",
             "data_columns": ["eta_index", "X_T", "running_minimum"],
             "model_type": model_type,
             "chunk_dir": chunk_dir,
@@ -1317,11 +1513,14 @@ def plot_crealnvp_history(ckpt, window=None, figsize=(9, 7)):
 def load_crealnvp_checkpoint(path, device=None):
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     ckpt = torch.load(path, map_location=device, weights_only=False)
+    target_parameterization = _checkpoint_target_parameterization(ckpt)
     model = CRealNVP2D(
         dim_eta=ckpt["dim_eta"], n_coupling=ckpt["n_coupling"],
         hidden_dim=ckpt["hidden_dim"], n_hidden=ckpt["n_hidden"],
         t_negative_slope=ckpt["t_negative_slope"], use_bn=ckpt["use_bn"],
         scale_clip=ckpt.get("scale_clip"),
+        target_parameterization=target_parameterization,
+        support_eps=float(ckpt.get("support_eps", SUPPORT_EPS)),
     ).to(device)
     model.load_state_dict(ckpt["model_state"])
     freeze_batchnorm(model)
@@ -1355,7 +1554,7 @@ def normalize_eta_tensor(
 @torch.no_grad()
 def sample_crealnvp(
     model, ckpt, eta_raw, n_samples=100_000, antithetic=False, seed=1234,
-    *, allow_extrapolation=False,
+    *, allow_extrapolation=False, return_transformed=False,
 ):
     n_samples = int(n_samples)
     if n_samples < 1:
@@ -1369,61 +1568,117 @@ def sample_crealnvp(
     if seed is not None:
         generator = torch.Generator(device=device)
         generator.manual_seed(seed)
-    return model.sample(eta, n_samples, antithetic=antithetic, generator=generator)
+    return model.sample(
+        eta, n_samples, antithetic=antithetic, generator=generator,
+        return_transformed=return_transformed,
+    )
 
 
 @torch.no_grad()
 def sample_valid_crealnvp(
     model, ckpt, eta_raw, n_samples=100_000, antithetic=False, seed=1234,
-    *, allow_extrapolation=False, max_resample_rounds=100,
+    *, allow_extrapolation=False, max_resample_rounds=100, valid_resample=True,
+    initial_samples=None,
 ):
-    """Return exactly n_samples paths satisfying the running-minimum constraint."""
+    """Validate physical support; UT is diagnostic-only and never resamples."""
     n_samples = int(n_samples)
     if n_samples < 1:
         raise ValueError("n_samples must be >= 1")
     max_resample_rounds = int(max_resample_rounds)
     if max_resample_rounds < 1:
         raise ValueError("max_resample_rounds must be >= 1")
+    if not isinstance(valid_resample, (bool, np.bool_)):
+        raise TypeError("valid_resample must be True or False")
+    valid_resample = bool(valid_resample)
+    target_parameterization = _checkpoint_target_parameterization(ckpt)
+
+    if target_parameterization == "ut":
+        samples = (
+            sample_crealnvp(
+                model, ckpt, eta_raw, n_samples=n_samples,
+                antithetic=antithetic, seed=seed,
+                allow_extrapolation=allow_extrapolation,
+            )
+            if initial_samples is None
+            else initial_samples
+        )
+        if samples.shape != (n_samples, 2):
+            raise ValueError(
+                f"initial/generated samples must have shape ({n_samples}, 2)."
+            )
+        invalid_count = int(_support_invalid_mask(samples).sum().item())
+        if invalid_count:
+            raise RuntimeError(
+                "UT NVP produced support-invalid samples: "
+                f"{invalid_count:,}/{n_samples:,}. No samples were rejected or resampled."
+            )
+        diagnostics = {
+            "validation_applied": True,
+            "target_parameterization": "ut",
+            "valid_resample": False,
+            "valid_resample_requested": valid_resample,
+            "invalid_path_fraction": 0.0,
+            "rejected_path_count": 0,
+            "total_drawn_samples": n_samples,
+            "accepted_path_count": n_samples,
+            "requested_sample_count": n_samples,
+            "used_sample_count": n_samples,
+            "discarded_sample_count": 0,
+            "discarded_sample_fraction": 0.0,
+            "discarded_sample_pct": 0.0,
+            "regenerated_sample_count": 0,
+            "regenerated_sample_fraction": 0.0,
+            "regenerated_sample_pct": 0.0,
+            "support_invalid_count": 0,
+        }
+        return samples, diagnostics
 
     valid_batches = []
     accepted_samples = 0
     attempted_samples = 0
     rejected_samples = 0
-    minimum_retry_size = min(n_samples, 1024)
+    sampling_rounds = max_resample_rounds if valid_resample else 1
 
-    for round_idx in range(max_resample_rounds):
+    for round_idx in range(sampling_rounds):
         remaining = n_samples - accepted_samples
         if remaining <= 0:
             break
-        draw_count = remaining if round_idx == 0 else max(remaining, minimum_retry_size)
+        draw_count = remaining
         round_seed = None if seed is None else int(seed) + round_idx
-        candidates = sample_crealnvp(
-            model,
-            ckpt,
-            eta_raw,
-            n_samples=draw_count,
-            antithetic=antithetic,
-            seed=round_seed,
-            allow_extrapolation=allow_extrapolation,
-        )
-        X_T = candidates[:, 0]
-        running_min = candidates[:, 1]
-        finite = torch.isfinite(candidates).all(dim=1)
-        valid = finite & (
-            running_min
-            <= torch.minimum(torch.zeros_like(X_T), X_T) + 1e-6
-        )
+        if round_idx == 0 and initial_samples is not None:
+            candidates = initial_samples
+            if candidates.shape[0] != n_samples:
+                raise ValueError(
+                    "initial_samples must contain exactly n_samples rows"
+                )
+            draw_count = n_samples
+        else:
+            candidates = sample_crealnvp(
+                model,
+                ckpt,
+                eta_raw,
+                n_samples=draw_count,
+                antithetic=antithetic,
+                seed=round_seed,
+                allow_extrapolation=allow_extrapolation,
+            )
+        invalid = _support_invalid_mask(candidates)
+        valid = ~invalid
 
         attempted_samples += draw_count
-        rejected_samples += int((~valid).sum().item())
+        rejected_samples += int(invalid.sum().item())
         accepted = candidates[valid]
         if accepted.numel() > 0:
             accepted = accepted[:remaining]
             valid_batches.append(accepted)
             accepted_samples += int(accepted.shape[0])
-        del candidates, finite, valid, accepted
+        del candidates, invalid, valid, accepted
 
-    if accepted_samples < n_samples:
+    if accepted_samples == 0:
+        raise RuntimeError(
+            f"No valid CRealNVP paths were found in {attempted_samples:,} draws."
+        )
+    if valid_resample and accepted_samples < n_samples:
         raise RuntimeError(
             f"Could obtain only {accepted_samples:,} valid paths after "
             f"{attempted_samples:,} draws. The model is producing too many "
@@ -1431,21 +1686,137 @@ def sample_valid_crealnvp(
         )
 
     samples = torch.cat(valid_batches, dim=0)
+    regenerated_samples = max(attempted_samples - n_samples, 0)
+    discarded_fraction = rejected_samples / attempted_samples
+    regenerated_fraction = regenerated_samples / n_samples
     diagnostics = {
-        "invalid_path_fraction": rejected_samples / attempted_samples,
+        "validation_applied": True,
+        "target_parameterization": "mt",
+        "valid_resample": valid_resample,
+        "valid_resample_requested": valid_resample,
+        "invalid_path_fraction": discarded_fraction,
         "rejected_path_count": rejected_samples,
         "total_drawn_samples": attempted_samples,
-        "accepted_path_count": n_samples,
+        "accepted_path_count": accepted_samples,
+        "requested_sample_count": n_samples,
+        "used_sample_count": accepted_samples,
+        "discarded_sample_count": rejected_samples,
+        "discarded_sample_fraction": discarded_fraction,
+        "discarded_sample_pct": 100.0 * discarded_fraction,
+        "regenerated_sample_count": regenerated_samples,
+        "regenerated_sample_fraction": regenerated_fraction,
+        "regenerated_sample_pct": 100.0 * regenerated_fraction,
+        "support_invalid_count": rejected_samples,
     }
     return samples, diagnostics
+
+
+@torch.no_grad()
+def diagnose_crealnvp_samples(
+    model, ckpt, eta_raw, n_samples=100_000, antithetic=False, seed=1234,
+    *, allow_extrapolation=False, tolerance=SUPPORT_TOLERANCE,
+    print_output=True,
+):
+    model_samples = sample_crealnvp(
+        model, ckpt, eta_raw, n_samples=n_samples,
+        antithetic=antithetic, seed=seed,
+        allow_extrapolation=allow_extrapolation,
+        return_transformed=True,
+    )
+    physical_samples = model.model_to_physical(model_samples)
+    X_T = physical_samples[:, 0]
+    M_T = physical_samples[:, 1]
+    D_T = torch.minimum(torch.zeros_like(X_T), X_T) - M_T
+    if _checkpoint_target_parameterization(ckpt) == "ut":
+        U_T = model_samples[:, 1]
+    else:
+        U_T = inverse_softplus_tensor(torch.clamp(D_T, min=SUPPORT_EPS))
+
+    finite_rows = (
+        torch.isfinite(X_T) & torch.isfinite(M_T)
+        & torch.isfinite(D_T) & torch.isfinite(U_T)
+    )
+    invalid = _support_invalid_mask(physical_samples, tolerance=tolerance)
+    invalid_count = int(invalid.sum().item())
+    sample_count = int(physical_samples.shape[0])
+    probabilities = [0.001, 0.01, 0.5, 0.99, 0.999]
+
+    def min_max(values):
+        finite = values[torch.isfinite(values)]
+        if finite.numel() == 0:
+            return float("nan"), float("nan")
+        return float(finite.min().item()), float(finite.max().item())
+
+    def quantiles(values):
+        finite = values[torch.isfinite(values)]
+        if finite.numel() == 0:
+            return {str(q): float("nan") for q in probabilities}
+        q = torch.as_tensor(
+            probabilities, device=finite.device, dtype=finite.dtype,
+        )
+        values_q = torch.quantile(finite, q)
+        return {
+            str(probability): float(value.item())
+            for probability, value in zip(probabilities, values_q)
+        }
+
+    x_min, x_max = min_max(X_T)
+    m_min, m_max = min_max(M_T)
+    d_min, d_max = min_max(D_T)
+    u_min, u_max = min_max(U_T)
+    diagnostics = {
+        "generated_sample_count": sample_count,
+        "target_parameterization": _checkpoint_target_parameterization(ckpt),
+        "X_T_min": x_min,
+        "X_T_max": x_max,
+        "M_T_min": m_min,
+        "M_T_max": m_max,
+        "D_T_min": d_min,
+        "D_T_max": d_max,
+        "U_T_min": u_min,
+        "U_T_max": u_max,
+        "support_invalid_count": invalid_count,
+        "support_invalid_fraction": invalid_count / sample_count,
+        "finite_sample_fraction": float(finite_rows.float().mean().item()),
+        "X_T_quantiles": quantiles(X_T),
+        "M_T_quantiles": quantiles(M_T),
+        "D_T_quantiles": quantiles(D_T),
+        "support_tolerance": float(tolerance),
+    }
+    if print_output:
+        print(f"generated sample count : {sample_count:,}")
+        print(f"target parameterization: {diagnostics['target_parameterization']}")
+        print(f"X_T min / max         : {x_min:.8g} / {x_max:.8g}")
+        print(f"M_T min / max         : {m_min:.8g} / {m_max:.8g}")
+        print(f"D_T min / max         : {d_min:.8g} / {d_max:.8g}")
+        print(f"U_T min / max         : {u_min:.8g} / {u_max:.8g}")
+        print(
+            "support invalid        : "
+            f"{invalid_count:,} ({100.0 * invalid_count / sample_count:.6f}%)"
+        )
+        print(
+            "finite sample fraction : "
+            f"{100.0 * diagnostics['finite_sample_fraction']:.6f}%"
+        )
+        print(f"X_T quantiles         : {diagnostics['X_T_quantiles']}")
+        print(f"M_T quantiles         : {diagnostics['M_T_quantiles']}")
+        print(f"D_T quantiles         : {diagnostics['D_T_quantiles']}")
+
+    if diagnostics["target_parameterization"] == "ut" and invalid_count:
+        raise RuntimeError(
+            "UT NVP produced a nonzero support-invalid count. "
+            "No samples were rejected or resampled."
+        )
+    return diagnostics
 
 
 @torch.no_grad()
 def price_current_options(
     model, ckpt, eta_raw, *, S0=1.0, K=1.0, B=0.8, r, T,
     n_samples=100_000, antithetic=True, seed=1234, allow_extrapolation=False,
+    validate_samples=True, valid_resample=True, mt_corr=False,
 ):
-    """Price options from exactly n_samples physically valid generated paths."""
+    """Price options; MT may filter invalid paths, while UT is diagnostic-only."""
     eta_array = np.asarray(eta_raw)
     if eta_array.ndim != 1:
         raise ValueError("price_current_options expects one eta parameter vector")
@@ -1456,8 +1827,14 @@ def price_current_options(
         raise ValueError("S0 and K must be positive, and B must be non-negative")
     if B >= S0:
         raise ValueError("A down barrier must satisfy B < S0 because the path starts at S0")
+    if not isinstance(validate_samples, (bool, np.bool_)):
+        raise TypeError("validate_samples must be True or False")
+    if not isinstance(valid_resample, (bool, np.bool_)):
+        raise TypeError("valid_resample must be True or False")
+    if not isinstance(mt_corr, (bool, np.bool_)):
+        raise TypeError("mt_corr must be True or False")
 
-    samples, diagnostics = sample_valid_crealnvp(
+    raw_samples = sample_crealnvp(
         model,
         ckpt,
         eta_raw,
@@ -1466,29 +1843,82 @@ def price_current_options(
         seed=seed,
         allow_extrapolation=allow_extrapolation,
     )
-    X_T, running_min = samples[:, 0], samples[:, 1]
-    S_T = S0 * torch.exp(X_T)
+
+    if validate_samples:
+        barrier_samples, diagnostics = sample_valid_crealnvp(
+            model,
+            ckpt,
+            eta_raw,
+            n_samples=n_samples,
+            antithetic=antithetic,
+            seed=seed,
+            allow_extrapolation=allow_extrapolation,
+            valid_resample=valid_resample,
+            initial_samples=raw_samples,
+        )
+    else:
+        barrier_samples = raw_samples
+        diagnostics = {
+            "validation_applied": False,
+            "valid_resample": False,
+            "invalid_path_fraction": None,
+            "rejected_path_count": None,
+            "total_drawn_samples": int(n_samples),
+            "accepted_path_count": None,
+            "requested_sample_count": int(n_samples),
+            "used_sample_count": int(n_samples),
+            "discarded_sample_count": None,
+            "discarded_sample_fraction": None,
+            "discarded_sample_pct": None,
+            "regenerated_sample_count": 0,
+            "regenerated_sample_fraction": 0.0,
+            "regenerated_sample_pct": 0.0,
+        }
+    vanilla_X_T = raw_samples[:, 0]
+    vanilla_S_T = S0 * torch.exp(vanilla_X_T)
+    barrier_X_T = barrier_samples[:, 0]
+    running_min = barrier_samples[:, 1]
+    if mt_corr:
+        mt_upper = torch.minimum(torch.zeros_like(barrier_X_T), barrier_X_T)
+        corrected_mask = running_min > mt_upper
+        running_min = torch.minimum(running_min, mt_upper)
+    else:
+        corrected_mask = torch.zeros_like(running_min, dtype=torch.bool)
+    corrected_count = int(corrected_mask.sum().item())
+    corrected_fraction = corrected_count / int(running_min.shape[0])
+    diagnostics.update({
+        "mt_corr_applied": bool(mt_corr),
+        "mt_corrected_sample_count": corrected_count,
+        "mt_corrected_sample_fraction": corrected_fraction,
+        "mt_corrected_sample_pct": 100.0 * corrected_fraction,
+    })
+    barrier_S_T = S0 * torch.exp(barrier_X_T)
     min_S = S0 * torch.exp(running_min)
-    if not (torch.isfinite(S_T).all() and torch.isfinite(min_S).all()):
+    if validate_samples and not (
+        torch.isfinite(barrier_S_T).all() and torch.isfinite(min_S).all()
+    ):
         raise FloatingPointError(
             "A physically valid generated path overflowed during exp(X). "
             "The model's right tail is not stable enough for option pricing."
         )
 
-    call = torch.clamp(S_T - K, min=0.0)
-    put = torch.clamp(K - S_T, min=0.0)
-    alive = (min_S > B).to(samples.dtype)
+    vanilla_call = torch.clamp(vanilla_S_T - K, min=0.0)
+    vanilla_put = torch.clamp(K - vanilla_S_T, min=0.0)
+    barrier_call = torch.clamp(barrier_S_T - K, min=0.0)
+    barrier_put = torch.clamp(K - barrier_S_T, min=0.0)
+    alive = (min_S > B).to(barrier_samples.dtype)
     discount = math.exp(-float(r) * float(T))
-    down_out_call = discount * (call * alive).mean().item()
-    down_out_put = discount * (put * alive).mean().item()
+    down_out_call = discount * (barrier_call * alive).mean().item()
+    down_out_put = discount * (barrier_put * alive).mean().item()
     return {
-        "van_call": discount * call.mean().item(),
-        "van_put": discount * put.mean().item(),
+        "van_call": discount * vanilla_call.mean().item(),
+        "van_put": discount * vanilla_put.mean().item(),
         "down_out_call": down_out_call,
         "down_out_put": down_out_put,
         # Backward-compatible aliases; these are specifically down-and-out prices.
         "barr_call": down_out_call,
         "barr_put": down_out_put,
+        "vanilla_sample_count": int(raw_samples.shape[0]),
         **diagnostics,
     }
 
@@ -1500,6 +1930,7 @@ if __name__ == "__main__":
         save_path=SAVE_PATH,
         model_type="hes",             # resolves the current /mnt/d paths automatically
         target_pair="XT_MIN",         # paths[:, 2] is X.min(axis=1), not the paper's maximum
+        target_parameterization="mt", # use "ut" for support-aware [X_T, U_T] training
         batch_size=16384,              # the paper does not report its exact batch size
         validation_chunk_idxs=[15,24,78],
         scale_clip=None,               # set 5.0 only for an explicitly stabilized run

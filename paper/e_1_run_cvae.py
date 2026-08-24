@@ -10,6 +10,8 @@ from torch.utils.data import Dataset, DataLoader
 from concurrent.futures import ThreadPoolExecutor
 from e_2_CVAE import CVAE as BaseCVAE, freeze_batchnorm
 from e_2_CVAE_barr_weight import CVAEBarrWeight
+from e_2_CVAE_UT import CVAE as UTCVAE
+from e_2_CVAE_UT import CVAEBarrWeight as UTCVAEBarrWeight
 
 
 
@@ -135,13 +137,62 @@ def _normalize_cvae_type(cvae_type):
     return aliases[cvae_type]
 
 
-def _make_cvae(cvae_type, dim_x, dim_eta, dim_z, hidden_dims, use_bn,
-               residual_blocks,
+def _normalize_target_parameterization(target_parameterization):
+    aliases = {
+        None: "mt",
+        "mt": "mt",
+        "direct": "mt",
+        "base": "mt",
+        "legacy": "mt",
+        "ut": "ut",
+        "transformed": "ut",
+        "support_aware": "ut",
+    }
+    normalized = str(target_parameterization).lower() if target_parameterization is not None else None
+    if normalized not in aliases:
+        raise ValueError(
+            "target_parameterization must be 'mt' or 'ut'."
+        )
+    return aliases[normalized]
+
+
+def _checkpoint_target_parameterization(checkpoint):
+    saved_value = checkpoint.get("target_parameterization")
+    if saved_value is not None:
+        return _normalize_target_parameterization(saved_value)
+
+    model_coordinates = checkpoint.get("model_coordinates")
+    if model_coordinates is None:
+        model_state = checkpoint.get("model_state", {})
+        extra_state = model_state.get("_extra_state", {})
+        model_coordinates = extra_state.get("model_coordinates")
+
+    if model_coordinates is None or list(model_coordinates) in (["X_T"], ["X_T", "M_T"]):
+        return "mt"
+    if list(model_coordinates) == ["X_T", "U_T"]:
+        return "ut"
+    raise ValueError(
+        f"Unsupported checkpoint model_coordinates: {model_coordinates!r}"
+    )
+
+
+def _make_cvae(target_parameterization, cvae_type, dim_x, dim_eta, dim_z,
+               hidden_dims, use_bn, residual_blocks,
                weight_mode, weight_alpha, weight_mode2, weight_alpha2,
                weight_h, weight_normalize, S0, K, B):
+    target_parameterization = _normalize_target_parameterization(
+        target_parameterization
+    )
     cvae_type = _normalize_cvae_type(cvae_type)
+    if target_parameterization == "ut":
+        base_class = UTCVAE
+        weighted_class = UTCVAEBarrWeight
+    else:
+        base_class = BaseCVAE
+        weighted_class = CVAEBarrWeight
+
     if cvae_type == "base":
-        return BaseCVAE(
+        return base_class(
             dim_x=dim_x,
             dim_eta=dim_eta,
             dim_z=dim_z,
@@ -150,7 +201,7 @@ def _make_cvae(cvae_type, dim_x, dim_eta, dim_z, hidden_dims, use_bn,
             residual_blocks=residual_blocks,
         )
 
-    return CVAEBarrWeight(
+    return weighted_class(
         dim_x=dim_x,
         dim_eta=dim_eta,
         dim_z=dim_z,
@@ -177,8 +228,9 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
                 lr=1e-3, beta=1.0, warmup_chunks=None, use_bn=False, bn_chunks=None, 
                 num_chunks=None, shuffle_chunks=True, save_path=None, resume_path=None,
                 init_path=None, exclude_chunk_idxs=None, validation_chunk_idxs=None, 
-                val_every_chunks=10, memory_on_gpu=True, cvae_type="base", 
-                weight_mode="barrier_put", weight_alpha=3.0, weight_mode2=None, 
+                val_every_chunks=10, memory_on_gpu=True, cvae_type="base",
+                target_parameterization="mt",
+                weight_mode="barrier_put", weight_alpha=3.0, weight_mode2=None,
                 weight_alpha2=0.0, weight_h=0.05, weight_normalize=True,
                 S0=1.0, K=1.0, B=0.8, tmp_save_every_chunks=10,
                 include_m=True, residual_blocks=0):
@@ -402,7 +454,7 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
 
     def _checkpoint_payload(current_chunks):
         completed_epochs = current_chunks // total_chunks
-        return {
+        payload = {
             'model_state' : cvae.state_dict(),
             'eta_min'     : eta_min,
             'eta_max'     : eta_max,
@@ -417,6 +469,7 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
             'bn_chunks'   : bn_chunks,
             'warmup_chunks': warmup_chunks,
             'cvae_type'   : cvae_type,
+            'target_parameterization': target_parameterization,
             'weight_config': weight_config,
             'weight_config_history': weight_config_history,
             'loss_history': loss_history, # epoch별 평균 손실 기록
@@ -436,6 +489,16 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
             'optimizer_state': optimizer.state_dict(),
             'tmp_save_every_chunks': tmp_save_every_chunks,
         }
+        if hasattr(cvae, "checkpoint_metadata"):
+            payload.update(cvae.checkpoint_metadata())
+        else:
+            payload.update({
+                "model_coordinates": ["X_T", "M_T"] if include_m else ["X_T"],
+                "physical_coordinates": ["X_T", "M_T"] if include_m else ["X_T"],
+                "support_parameterization": "model output M_T" if include_m else None,
+                "path_statistic": "running_minimum" if include_m else None,
+            })
+        return payload
 
     def save_checkpoint(current_chunks, checkpoint_path=None):
         if checkpoint_path is None:
@@ -556,6 +619,15 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
         raise TypeError("include_m must be True or False.")
     include_m = bool(include_m)
 
+    target_parameterization = _normalize_target_parameterization(
+        target_parameterization
+    )
+    if target_parameterization == "ut" and not include_m:
+        raise ValueError(
+            "target_parameterization='ut' requires include_m=True because the raw "
+            "training batch must contain [X_T, M_T]."
+        )
+
     cvae_type = _normalize_cvae_type(cvae_type)
     barrier_weight_modes = {"barrier_put", "barrierput", "barrier_near", "barriernear"}
     weight_mode_normalized = str(weight_mode).lower()
@@ -675,6 +747,17 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
     if resume_path is not None:
         resume_checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
 
+        checkpoint_target_parameterization = _checkpoint_target_parameterization(
+            resume_checkpoint
+        )
+        if checkpoint_target_parameterization != target_parameterization:
+            raise ValueError(
+                "checkpoint target_parameterization="
+                f"{checkpoint_target_parameterization}, current="
+                f"{target_parameterization}. An MT checkpoint cannot be resumed "
+                "as UT, and a UT checkpoint cannot be resumed as MT."
+            )
+
         checkpoint_use_bn = bool(resume_checkpoint.get('use_bn', False))
         if checkpoint_use_bn != bool(use_bn):
             print(f"use_bn을 checkpoint 설정({checkpoint_use_bn})으로 맞춥니다.")
@@ -759,6 +842,7 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
 
     # 모델 생성
     cvae = _make_cvae(
+        target_parameterization,
         cvae_type,
         dim_x=dim_x,
         dim_eta=dim_eta,
@@ -783,6 +867,15 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
 
     if init_path is not None:
         init_checkpoint = torch.load(init_path, map_location=device, weights_only=False)
+        init_target_parameterization = _checkpoint_target_parameterization(
+            init_checkpoint
+        )
+        if init_target_parameterization != target_parameterization:
+            raise ValueError(
+                "init checkpoint target_parameterization="
+                f"{init_target_parameterization}, current={target_parameterization}. "
+                "Weights trained in MT and UT coordinates are not interchangeable."
+            )
         init_residual_blocks = int(init_checkpoint.get('residual_blocks', 0))
         if init_residual_blocks != residual_blocks:
             raise ValueError(
@@ -898,6 +991,7 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
         f"excluded={sorted(exclude_chunk_idxs)} | validation={sorted(validation_chunk_idxs)} | "
         f"val_every_chunks={val_every_chunks} | bn_chunks={bn_chunks} | warmup_chunks={warmup_chunks} | "
         f"memory_on_gpu={memory_on_gpu} | cvae_type={cvae_type} | "
+        f"target_parameterization={target_parameterization} | "
         f"tmp_save_every_chunks={tmp_save_every_chunks}"
     )
     if cvae_type in ('barr_weight', 'normal_weight', 'add_put_loss'):
