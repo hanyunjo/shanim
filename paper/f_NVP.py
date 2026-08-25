@@ -662,6 +662,7 @@ def train_crealnvp_paper2022(
     target_parameterization="mt",
     batch_size=16384, train_chunk_idxs=None, validation_chunk_idxs=None,
     shuffle_chunks=True, seed=1234, device=None, scale_clip=None,
+    hidden_dim=100, n_hidden=4,
     bn_pretrain_fraction=0.05, drop_last=True, validate_data=True,
     memory_on_gpu=True, lr=None, num_epochs=None, num_chunks=None,
     val_every_chunks=None, tmp_save_every_chunks=10, resume_path=None,
@@ -675,7 +676,9 @@ def train_crealnvp_paper2022(
     val_every_chunks controls intermediate validation without changing the
     model architecture or objective. target_parameterization="mt" learns the
     raw [X_T, M_T] pair; "ut" validates that raw pair and trains the same flow
-    architecture on [X_T, U_T]. The HDF5 format is unchanged.
+    architecture on [X_T, U_T]. The HDF5 format is unchanged. hidden_dim is
+    the width of each s/t hidden layer, while n_hidden is the number of hidden
+    layers in each s/t network.
     """
     model_type = _canonical_model_type(model_type)
     target_pair = _canonical_target_pair(target_pair)
@@ -685,6 +688,16 @@ def train_crealnvp_paper2022(
     batch_size = int(batch_size)
     if batch_size < 2:
         raise ValueError("batch_size must be >= 2 because BatchNorm is used during pretraining")
+    if isinstance(hidden_dim, bool) or not isinstance(hidden_dim, (int, np.integer)):
+        raise TypeError("hidden_dim must be a positive integer")
+    hidden_dim = int(hidden_dim)
+    if hidden_dim < 1:
+        raise ValueError("hidden_dim must be >= 1")
+    if isinstance(n_hidden, bool) or not isinstance(n_hidden, (int, np.integer)):
+        raise TypeError("n_hidden must be a positive integer")
+    n_hidden = int(n_hidden)
+    if n_hidden < 1:
+        raise ValueError("n_hidden must be >= 1")
     if not 0.0 <= bn_pretrain_fraction <= 1.0:
         raise ValueError("bn_pretrain_fraction must be between 0 and 1")
 
@@ -775,6 +788,15 @@ def train_crealnvp_paper2022(
                 f"{checkpoint_target_parameterization}, current="
                 f"{target_parameterization}. MT and UT checkpoints cannot be mixed."
             )
+        checkpoint_hidden_dim = int(resume_checkpoint.get("hidden_dim", 100))
+        checkpoint_n_hidden = int(resume_checkpoint.get("n_hidden", 4))
+        if checkpoint_hidden_dim != hidden_dim or checkpoint_n_hidden != n_hidden:
+            raise ValueError(
+                "NVP architecture differs from the resume checkpoint: "
+                f"checkpoint hidden_dim={checkpoint_hidden_dim}, "
+                f"n_hidden={checkpoint_n_hidden}; current hidden_dim={hidden_dim}, "
+                f"n_hidden={n_hidden}. Start a new experiment or pass the saved values."
+            )
 
         if chunk_dir is None:
             chunk_dir = resume_checkpoint.get("chunk_dir")
@@ -856,8 +878,8 @@ def train_crealnvp_paper2022(
         model = CRealNVP2D(
             dim_eta=dim_eta,
             n_coupling=6,
-            hidden_dim=100,
-            n_hidden=4,
+            hidden_dim=hidden_dim,
+            n_hidden=n_hidden,
             t_negative_slope=t_slope,
             use_bn=True,
             scale_clip=scale_clip,
@@ -1050,7 +1072,8 @@ def train_crealnvp_paper2022(
 
     print(
         f"device={device}, model_type={model_type}, target_pair={target_pair}, "
-        f"target_parameterization={target_parameterization}, dim_eta={dim_eta}"
+        f"target_parameterization={target_parameterization}, dim_eta={dim_eta}, "
+        f"hidden_dim={hidden_dim}, n_hidden={n_hidden}"
     )
     print(f"chunk_dir={chunk_dir}, eta_path={eta_path}")
     print(f"train_chunks={len(train_idxs)}, val_chunks={len(val_idxs)}")

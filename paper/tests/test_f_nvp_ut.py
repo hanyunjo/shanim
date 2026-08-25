@@ -168,10 +168,29 @@ class NVPParameterizationTests(unittest.TestCase):
         self.assertEqual(_canonical_target_parameterization(None), "mt")
         self.assertEqual(_canonical_target_parameterization("mt"), "mt")
         self.assertEqual(_canonical_target_parameterization("direct"), "mt")
-        default = inspect.signature(train_crealnvp_paper2022).parameters[
-            "target_parameterization"
-        ].default
-        self.assertEqual(default, "mt")
+        signature = inspect.signature(train_crealnvp_paper2022)
+        self.assertEqual(
+            signature.parameters["target_parameterization"].default, "mt"
+        )
+        self.assertEqual(signature.parameters["hidden_dim"].default, 100)
+        self.assertEqual(signature.parameters["n_hidden"].default, 4)
+
+    def test_custom_hidden_width_and_depth(self):
+        model = CRealNVP2D(
+            dim_eta=3,
+            n_coupling=2,
+            hidden_dim=256,
+            n_hidden=5,
+            use_bn=False,
+            target_parameterization="ut",
+        )
+        self.assertEqual(model.hidden_dim, 256)
+        self.assertEqual(model.n_hidden, 5)
+        for coupling in model.layers:
+            self.assertEqual(len(coupling.s_net.linears), 5)
+            self.assertEqual(coupling.s_net.linears[0].out_features, 256)
+            self.assertEqual(len(coupling.t_net.linears), 5)
+            self.assertEqual(coupling.t_net.linears[0].out_features, 256)
 
 
 if __name__ == "__main__":
