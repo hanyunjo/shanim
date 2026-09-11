@@ -24,6 +24,38 @@ HES_ETA_PATH  = "/mnt/d/heston_eta_basic.h5"
 HES_CLIP_CHUNK_DIR = "/mnt/d/heston_clip_chunks_correction/"
 HES_CLIP_ETA_PATH  = "/mnt/d/heston_eta_clip.h5"
 
+TARGET_COORDINATES = {
+    1: ["X_T"],
+    2: ["X_T", "M_T"],
+    3: ["X_T", "M_T", "M_next"],
+    4: ["X_T", "M_T", "M_next", "v_avg"],
+}
+
+
+def _resolve_dim_x(dim_x):
+    if not isinstance(dim_x, (int, np.integer)) or isinstance(dim_x, bool):
+        raise TypeError("dim_x must be an integer from 1 to 4.")
+    dim_x = int(dim_x)
+    if dim_x not in TARGET_COORDINATES:
+        raise ValueError("dim_x must be one of 1, 2, 3, or 4.")
+    return dim_x
+
+
+def _target_coordinates(dim_x):
+    return list(TARGET_COORDINATES[_resolve_dim_x(dim_x)])
+
+
+def _extract_path_targets(paths, dim_x, chunk_path):
+    dim_x = _resolve_dim_x(dim_x)
+    required_columns = dim_x + 1
+    if paths.ndim != 2 or paths.shape[1] < required_columns:
+        raise ValueError(
+            f"{chunk_path}: paths must have at least {required_columns} columns "
+            f"for dim_x={dim_x} ([eta_index, {', '.join(_target_coordinates(dim_x))}]), "
+            f"but shape is {paths.shape}."
+        )
+    return paths[:, 1:required_columns].astype(np.float32, copy=True)
+
 
 def _cuda_sync():
     if torch.cuda.is_available():
@@ -88,12 +120,13 @@ class GpuChunk:
         return self.x.shape[0]
 
 
-def load_chunk_file_to_gpu(chunk_path, etas, eta_min, eta_max):
+def load_chunk_file_to_gpu(chunk_path, etas, eta_min, eta_max, dim_x=2):
+    dim_x = _resolve_dim_x(dim_x)
     with h5py.File(chunk_path, 'r') as f:
-        paths = f['paths'][:] # (N, 3) : [ori_idx, X_T, M_T]
+        paths = f['paths'][:]
 
     ori_idx = paths[:, 0].astype(np.int64, copy=False)
-    x_np = paths[:, 1:3].astype(np.float32, copy=True)
+    x_np = _extract_path_targets(paths, dim_x, chunk_path)
 
     eta_np = etas[ori_idx].astype(np.float32, copy=True)
     eta_np = (eta_np - eta_min) / (eta_max - eta_min + 1e-8)
@@ -109,20 +142,20 @@ def load_chunk_file_to_gpu(chunk_path, etas, eta_min, eta_max):
 
 
 class ChunkDataset(Dataset):
-    def __init__(self, chunk_path, etas, eta_min, eta_max):
+    def __init__(self, chunk_path, etas, eta_min, eta_max, dim_x=2):
+        dim_x = _resolve_dim_x(dim_x)
 
         with h5py.File(chunk_path, 'r') as f:
-            paths = f['paths'][:] # (N, 3) : [ori_idx, X_T, M_T]
+            paths = f['paths'][:]
 
         ori_idx = paths[:, 0].astype(int)
-        X_T     = paths[:, 1].astype(np.float32)
-        M_T     = paths[:, 2].astype(np.float32)
+        x_np = _extract_path_targets(paths, dim_x, chunk_path)
 
         eta_matched = etas[ori_idx].astype(np.float32)
         eta_matched = (eta_matched - eta_min) / (eta_max - eta_min + 1e-8)
 
-        self.x = torch.tensor(np.stack([X_T, M_T], axis=1))  # (N, 2)
-        self.eta = torch.tensor(eta_matched)   # (N, dim_eta)
+        self.x = torch.from_numpy(x_np)  # (N, dim_x)
+        self.eta = torch.from_numpy(eta_matched)   # (N, dim_eta)
 
     def __len__(self):
         return len(self.x)
@@ -226,7 +259,7 @@ def train_chunk_time_check(model_type = 'hes', dim_z=8, hidden_dims=None, batch_
                 weight_alpha=3.0, weight_mode2=None, weight_alpha2=0.0,
                 weight_h=0.05, weight_normalize=True,
                 S0=1.0, K=1.0, B=0.8, tmp_save_every_chunks=10,
-                residual_blocks=0):
+                residual_blocks=0, dim_x=2, chunk_dir=None, eta_path=None):
     
     def chunk_order_for_epoch(epoch):
         chunk_indices = np.array(trainable_chunk_idxs, dtype=int)
@@ -243,11 +276,15 @@ def train_chunk_time_check(model_type = 'hes', dim_z=8, hidden_dims=None, batch_
         return epoch, chunk_pos, ci
 
     def load_chunk(ci):
-        dataset = ChunkDataset(chunk_path_by_idx[int(ci)], etas, eta_min, eta_max)
+        dataset = ChunkDataset(
+            chunk_path_by_idx[int(ci)], etas, eta_min, eta_max, dim_x=dim_x
+        )
         return dataset
 
     def load_chunk_gpu(ci):
-        return load_chunk_file_to_gpu(chunk_path_by_idx[int(ci)], etas, eta_min, eta_max)
+        return load_chunk_file_to_gpu(
+            chunk_path_by_idx[int(ci)], etas, eta_min, eta_max, dim_x=dim_x
+        )
 
     def load_chunk_timed(ci):
         t0 = time.perf_counter()
@@ -521,7 +558,7 @@ def train_chunk_time_check(model_type = 'hes', dim_z=8, hidden_dims=None, batch_
 
     def _checkpoint_payload(current_chunks):
         completed_epochs = current_chunks // total_chunks
-        return {
+        payload = {
             'model_state' : cvae.state_dict(),
             'eta_min'     : eta_min,
             'eta_max'     : eta_max,
@@ -554,6 +591,15 @@ def train_chunk_time_check(model_type = 'hes', dim_z=8, hidden_dims=None, batch_
             'optimizer_state': optimizer.state_dict(),
             'tmp_save_every_chunks': tmp_save_every_chunks,
         }
+        payload.update({
+            'model_coordinates': _target_coordinates(dim_x),
+            'physical_coordinates': _target_coordinates(dim_x),
+            'support_parameterization': 'direct decoder output',
+            'path_statistic': 'running_minimum_with_BBC_features' if dim_x >= 3 else (
+                'running_minimum' if dim_x >= 2 else None
+            ),
+        })
+        return payload
 
     def save_checkpoint(current_chunks, checkpoint_path=None):
         if checkpoint_path is None:
@@ -675,6 +721,9 @@ def train_chunk_time_check(model_type = 'hes', dim_z=8, hidden_dims=None, batch_
     if residual_blocks < 0:
         raise ValueError("residual_blocks must be >= 0.")
 
+    dim_x = _resolve_dim_x(dim_x)
+    target_coordinates = _target_coordinates(dim_x)
+
     cvae_type = _normalize_cvae_type(cvae_type)
     weight_config = {
         'weight_mode': weight_mode,
@@ -691,26 +740,37 @@ def train_chunk_time_check(model_type = 'hes', dim_z=8, hidden_dims=None, batch_
     weight_alpha_changed_on_resume = False
 
     if model_type == 'hes':
-        chunk_dir = HES_CHUNK_DIR
-        eta_path  = HES_ETA_PATH
+        default_chunk_dir = HES_CHUNK_DIR
+        default_eta_path  = HES_ETA_PATH
     elif model_type == 'bs':
-        chunk_dir = BS_CHUNK_DIR
-        eta_path  = BS_ETA_PATH
+        default_chunk_dir = BS_CHUNK_DIR
+        default_eta_path  = BS_ETA_PATH
     elif model_type == 'bs_clip':
-        chunk_dir = BS_CLIP_CHUNK_DIR
-        eta_path  = BS_CLIP_ETA_PATH
+        default_chunk_dir = BS_CLIP_CHUNK_DIR
+        default_eta_path  = BS_CLIP_ETA_PATH
     elif model_type == 'hes_clip':
-        chunk_dir = HES_CLIP_CHUNK_DIR
-        eta_path  = HES_CLIP_ETA_PATH
+        default_chunk_dir = HES_CLIP_CHUNK_DIR
+        default_eta_path  = HES_CLIP_ETA_PATH
     else:
-        raise ValueError("model_type must be 'hes' or 'bs'")
+        raise ValueError("model_type must be 'hes', 'bs', 'hes_clip', or 'bs_clip'")
 
-    dim_x = 2   # (X_T, M_T)
+    chunk_dir = default_chunk_dir if chunk_dir is None else os.fspath(chunk_dir)
+    eta_path = default_eta_path if eta_path is None else os.fspath(eta_path)
 
     chunk_paths = sorted(glob.glob(os.path.join(chunk_dir, "*.h5")), key=_chunk_sort_key)
     num_all_chunks = len(chunk_paths)
     if num_all_chunks == 0:
         raise FileNotFoundError(f"No chunk files found in {chunk_dir}")
+
+    with h5py.File(chunk_paths[0], 'r') as first_chunk:
+        first_shape = first_chunk['paths'].shape
+    required_columns = dim_x + 1
+    if len(first_shape) != 2 or first_shape[1] < required_columns:
+        raise ValueError(
+            f"{chunk_paths[0]}: paths shape {first_shape} cannot provide dim_x={dim_x}. "
+            f"Expected at least {required_columns} columns: "
+            f"[eta_index, {', '.join(target_coordinates)}]."
+        )
 
     all_chunk_idxs = [_chunk_file_idx(path) for path in chunk_paths]
     if len(set(all_chunk_idxs)) != len(all_chunk_idxs):
@@ -869,6 +929,7 @@ def train_chunk_time_check(model_type = 'hes', dim_z=8, hidden_dims=None, batch_
         B=B,
     )
     cvae.bn_chunks = bn_chunks
+    cvae.include_m = dim_x >= 2
     cvae.to(device)
     optimizer = torch.optim.Adam(cvae.parameters(), lr=lr)
 
@@ -990,6 +1051,7 @@ def train_chunk_time_check(model_type = 'hes', dim_z=8, hidden_dims=None, batch_
         f"excluded={sorted(exclude_chunk_idxs)} | validation={sorted(validation_chunk_idxs)} | "
         f"val_every_chunks={val_every_chunks} | bn_chunks={bn_chunks} | warmup_chunks={warmup_chunks} | "
         f"memory_on_gpu={memory_on_gpu} | cvae_type={cvae_type} | "
+        f"dim_x={dim_x} ({target_coordinates}) | "
         f"tmp_save_every_chunks={tmp_save_every_chunks}"
     )
     if cvae_type in ('barr_weight', 'normal_weight', 'add_put_loss'):

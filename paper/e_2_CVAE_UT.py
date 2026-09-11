@@ -9,6 +9,17 @@ if not torch.cuda.is_available():
     raise ValueError("Cannot use GPU cuda")
 device = torch.device("cuda")
 
+
+def _normalize_tail_multiple(multiple):
+    if isinstance(multiple, (bool, np.bool_)) or not isinstance(
+        multiple, (int, float, np.integer, np.floating)
+    ):
+        raise TypeError("multiple must be a real number")
+    multiple = float(multiple)
+    if not np.isfinite(multiple) or multiple < 0 or (0 < multiple <= 1):
+        raise ValueError("multiple must be 0 (disabled) or greater than 1")
+    return multiple
+
 SUPPORT_EPS = 1e-6
 SUPPORT_TOLERANCE = 1e-6
 UT_MODEL_COORDINATES = ["X_T", "U_T"]
@@ -757,56 +768,136 @@ class CVAE(nn.Module):
 
     @torch.no_grad()
     def sample_valid(self, eta, n_samples=10000, max_resample_rounds=100,
-                     valid_resample=True, initial_samples=None):
-        # Compatibility API: validation is diagnostic-only. No rows are rejected
-        # and no replacement samples are generated in the UT model.
-        del max_resample_rounds
+                     valid_resample=True, initial_samples=None,
+                     validate_support=True, multiple=0):
+        # UT support validation remains diagnostic-only. Tail samples are rejected
+        # and refilled whenever multiple>0, independently of support validation.
+        n_samples = int(n_samples)
+        max_resample_rounds = int(max_resample_rounds)
+        if n_samples < 1:
+            raise ValueError("n_samples must be >= 1")
+        if max_resample_rounds < 1:
+            raise ValueError("max_resample_rounds must be >= 1")
+        if not isinstance(valid_resample, (bool, np.bool_)):
+            raise TypeError("valid_resample must be True or False")
+        if not isinstance(validate_support, (bool, np.bool_)):
+            raise TypeError("validate_support must be True or False")
+        valid_resample = bool(valid_resample)
+        validate_support = bool(validate_support)
+        multiple = _normalize_tail_multiple(multiple)
+        tail_filter_applied = multiple > 0
+        xt_upper = float(np.log(multiple)) if tail_filter_applied else None
+
         if initial_samples is None:
-            samples = self.sample(eta, n_samples=n_samples)
+            initial_samples = self.sample(eta, n_samples=n_samples)
+        elif initial_samples.shape[0] != n_samples:
+            raise ValueError("initial_samples must contain exactly n_samples rows")
+
+        if tail_filter_applied:
+            valid_batches = []
+            accepted_samples = 0
+            attempted_samples = 0
+            tail_rejected_samples = 0
+            for round_idx in range(max_resample_rounds):
+                remaining = n_samples - accepted_samples
+                if remaining <= 0:
+                    break
+                candidates = (
+                    initial_samples if round_idx == 0
+                    else self.sample(eta, n_samples=remaining)
+                )
+                finite = torch.isfinite(candidates).all(dim=1)
+                tail_invalid = (~finite) | (candidates[:, 0] >= xt_upper)
+                attempted_samples += int(candidates.shape[0])
+                tail_rejected_samples += int(tail_invalid.sum().item())
+                accepted = candidates[~tail_invalid][:remaining]
+                if accepted.numel() > 0:
+                    valid_batches.append(accepted)
+                    accepted_samples += int(accepted.shape[0])
+            if accepted_samples == 0:
+                raise RuntimeError(
+                    f"No tail-filtered CVAE samples were found in "
+                    f"{attempted_samples:,} draws."
+                )
+            if accepted_samples < n_samples:
+                raise RuntimeError(
+                    f"Could obtain only {accepted_samples:,} tail-filtered samples "
+                    f"after {attempted_samples:,} draws."
+                )
+            samples = torch.cat(valid_batches, dim=0)
         else:
             samples = initial_samples
-            n_samples = int(samples.shape[0])
-        diagnostics_full = diagnose_cvae_samples(
-            samples, tolerance=SUPPORT_TOLERANCE, print_output=False,
-        )
-        if self.coordinate_system == "transformed" and diagnostics_full["support_invalid_count"]:
-            raise RuntimeError(
-                "The support-aware CVAE produced invalid samples; no rejection or "
-                "resampling was performed."
+            attempted_samples = n_samples
+            tail_rejected_samples = 0
+
+        if validate_support:
+            diagnostics_full = diagnose_cvae_samples(
+                samples, tolerance=SUPPORT_TOLERANCE, print_output=False,
             )
+            support_invalid_count = diagnostics_full["support_invalid_count"]
+            invalid_path_fraction = diagnostics_full["support_invalid_fraction"]
+            if self.coordinate_system == "transformed" and support_invalid_count:
+                raise RuntimeError(
+                    "The support-aware CVAE produced invalid samples; support "
+                    "validation does not reject or resample them."
+                )
+        else:
+            support_invalid_count = None
+            invalid_path_fraction = (
+                tail_rejected_samples / attempted_samples
+                if tail_filter_applied else None
+            )
+
+        regenerated_samples = max(attempted_samples - n_samples, 0)
+        discarded_fraction = tail_rejected_samples / attempted_samples
         diagnostics = {
-            "validation_applied": True,
-            "valid_resample": False,
-            "valid_resample_requested": bool(valid_resample),
-            "invalid_path_fraction": diagnostics_full["support_invalid_fraction"],
-            "rejected_path_count": 0,
-            "total_drawn_samples": n_samples,
+            "validation_applied": validate_support,
+            "valid_resample": tail_filter_applied,
+            "valid_resample_requested": valid_resample,
+            "invalid_path_fraction": invalid_path_fraction,
+            "rejected_path_count": tail_rejected_samples,
+            "total_drawn_samples": attempted_samples,
             "accepted_path_count": n_samples,
             "requested_sample_count": n_samples,
             "used_sample_count": n_samples,
-            "discarded_sample_count": 0,
-            "discarded_sample_fraction": 0.0,
-            "discarded_sample_pct": 0.0,
-            "regenerated_sample_count": 0,
-            "regenerated_sample_fraction": 0.0,
-            "regenerated_sample_pct": 0.0,
-            "support_invalid_count": diagnostics_full["support_invalid_count"],
+            "discarded_sample_count": tail_rejected_samples,
+            "discarded_sample_fraction": discarded_fraction,
+            "discarded_sample_pct": 100.0 * discarded_fraction,
+            "regenerated_sample_count": regenerated_samples,
+            "regenerated_sample_fraction": regenerated_samples / n_samples,
+            "regenerated_sample_pct": 100.0 * regenerated_samples / n_samples,
+            "support_invalid_count": support_invalid_count,
+            "tail_filter_applied": tail_filter_applied,
+            "multiple": multiple,
+            "X_T_upper": xt_upper,
+            "tail_rejected_sample_count": tail_rejected_samples,
+            "tail_rejected_sample_fraction": discarded_fraction,
+            "tail_rejected_sample_pct": 100.0 * discarded_fraction,
         }
         self.last_sampling_diagnostics = diagnostics
         return samples, diagnostics
 
     @torch.no_grad()
     def _samples_for_pricing(self, eta, n_samples, validate_samples=True,
-                             valid_resample=True, initial_samples=None):
+                             valid_resample=True, initial_samples=None,
+                             multiple=0):
+        if not isinstance(validate_samples, (bool, np.bool_)):
+            raise TypeError("validate_samples must be True or False")
+        if not isinstance(valid_resample, (bool, np.bool_)):
+            raise TypeError("valid_resample must be True or False")
+        multiple = _normalize_tail_multiple(multiple)
+        tail_filter_applied = multiple > 0
         if initial_samples is None:
             samples = self.sample(eta, n_samples=n_samples)
         else:
             samples = initial_samples
-        if validate_samples:
+        if validate_samples or tail_filter_applied:
             return self.sample_valid(
                 eta, n_samples=samples.shape[0],
                 valid_resample=valid_resample,
                 initial_samples=samples,
+                validate_support=validate_samples,
+                multiple=multiple,
             )
         diagnostics = {
             "validation_applied": False,
@@ -825,6 +916,12 @@ class CVAE(nn.Module):
             "regenerated_sample_fraction": 0.0,
             "regenerated_sample_pct": 0.0,
             "support_invalid_count": None,
+            "tail_filter_applied": False,
+            "multiple": multiple,
+            "X_T_upper": None,
+            "tail_rejected_sample_count": 0,
+            "tail_rejected_sample_fraction": 0.0,
+            "tail_rejected_sample_pct": 0.0,
         }
         self.last_sampling_diagnostics = diagnostics
         return samples, diagnostics
@@ -849,9 +946,15 @@ class CVAE(nn.Module):
     @torch.no_grad()
     def price_vanilla(self, eta, K, r, T, opt_type="call",
                       n_samples=10000, validate_samples=True,
-                      valid_resample=True):
-        del validate_samples, valid_resample
-        samples = self.sample(eta, n_samples=n_samples)
+                      valid_resample=True, multiple=0):
+        del validate_samples
+        raw_samples = self.sample(eta, n_samples=n_samples)
+        samples, diagnostics = self._samples_for_pricing(
+            eta, n_samples, validate_samples=False,
+            valid_resample=valid_resample, initial_samples=raw_samples,
+            multiple=multiple,
+        )
+        self.last_sampling_diagnostics = diagnostics
         S_T = torch.exp(samples[:, 0])
         if opt_type == "call":
             payoff = torch.clamp(S_T - K, min=0.0)
@@ -864,10 +967,11 @@ class CVAE(nn.Module):
     @torch.no_grad()
     def price_barrier(self, eta, B, K, r, T, opt_type="call",
                       n_samples=10000, validate_samples=True,
-                      valid_resample=True, mt_corr=False):
+                      valid_resample=True, mt_corr=False, multiple=0):
         samples, diagnostics = self._samples_for_pricing(
             eta, n_samples, validate_samples=validate_samples,
             valid_resample=valid_resample,
+            multiple=multiple,
         )
         X_T = samples[:, 0]
         M_T, correction_diagnostics = self._apply_mt_correction(
@@ -890,12 +994,13 @@ class CVAE(nn.Module):
     @torch.no_grad()
     def total_pricing(self, eta, B, K, r, T, n_samples=10000,
                       validate_samples=True, valid_resample=True,
-                      mt_corr=False):
+                      mt_corr=False, multiple=0):
         # Exactly one generated population is shared by all four payoffs.
         samples = self.sample(eta, n_samples=n_samples)
         samples, diagnostics = self._samples_for_pricing(
             eta, n_samples, validate_samples=validate_samples,
             valid_resample=valid_resample, initial_samples=samples,
+            multiple=multiple,
         )
         X_T = samples[:, 0]
         M_T, correction_diagnostics = self._apply_mt_correction(
@@ -917,6 +1022,11 @@ class CVAE(nn.Module):
             "barr_call": discount * (vanilla_call * alive).mean().item(),
             "barr_put": discount * (vanilla_put * alive).mean().item(),
             "vanilla_sample_count": int(samples.shape[0]),
+            "model_output_dim": int(self.dim_x),
+            "has_running_minimum": True,
+            "priced_option_keys": [
+                "van_call", "van_put", "barr_call", "barr_put"
+            ],
             **diagnostics,
         }
 

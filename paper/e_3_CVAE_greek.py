@@ -174,6 +174,10 @@ def prices_from_cvae_samples(
     B,
     r,
     T,
+    sigma = None,
+    dt = 0.001,
+    bbc_correction = True,
+    mt_corr = False,
 ):
     if samples.ndim != 2 or samples.shape[1] < 1:
         raise ValueError("samples must have shape (N, dim_x) with X_T in column 0.")
@@ -202,12 +206,64 @@ def prices_from_cvae_samples(
                 "Barrier pricing requires CVAE output [X_T, M_T]."
             )
         M_T = samples[:, 1]
-        alive = (
-            float(S0) * torch.exp(M_T) > float(B)
-        ).to(dtype=call_payoff.dtype)
+        if not isinstance(mt_corr, (bool, np.bool_)):
+            raise TypeError("mt_corr must be True or False.")
+        if mt_corr:
+            M_T = torch.minimum(
+                M_T,
+                torch.minimum(torch.zeros_like(X_T), X_T),
+            )
 
-        prices["barr_call"] = discount * (call_payoff * alive).mean().item()
-        prices["barr_put"] = discount * (put_payoff * alive).mean().item()
+        barrier_log = float(np.log(float(B) / float(S0)))
+        discrete_alive = M_T > barrier_log
+        survival = discrete_alive.to(dtype=call_payoff.dtype)
+
+        if not isinstance(bbc_correction, (bool, np.bool_)):
+            raise TypeError("bbc_correction must be True or False.")
+        if samples.shape[1] >= 3 and bbc_correction:
+            dt = float(dt)
+            if not np.isfinite(dt) or dt <= 0.0:
+                raise ValueError("dt must be a positive finite number for BBC pricing.")
+
+            M_next_raw = samples[:, 2]
+            finite_pair = torch.isfinite(M_T) & torch.isfinite(M_next_raw)
+            M_next = torch.maximum(M_next_raw, M_T)
+
+            if samples.shape[1] == 3:
+                if sigma is None:
+                    raise ValueError(
+                        "dim_x=3 BBC pricing requires the raw BS sigma."
+                    )
+                sigma = float(sigma)
+                if not np.isfinite(sigma) or sigma <= 0.0:
+                    raise ValueError("sigma must be a positive finite number.")
+                local_variance = torch.full_like(M_T, sigma ** 2)
+            else:
+                v_avg_raw = samples[:, 3]
+                finite_variance = torch.isfinite(v_avg_raw)
+                local_variance = torch.nan_to_num(
+                    v_avg_raw, nan=0.0, posinf=0.0, neginf=0.0
+                ).clamp_min(0.0)
+                finite_pair = finite_pair & finite_variance
+
+            endpoint_alive = finite_pair & discrete_alive & (M_next > barrier_log)
+            distance_min = (M_T - barrier_log).clamp_min(0.0)
+            distance_next = (M_next - barrier_log).clamp_min(0.0)
+            denominator = local_variance * dt + 1e-10
+            exponent = -2.0 * distance_min * distance_next / denominator
+            p_cross = torch.where(
+                endpoint_alive,
+                torch.exp(torch.clamp(exponent, max=0.0)),
+                torch.zeros_like(M_T),
+            ).clamp_(0.0, 1.0)
+            survival = torch.where(
+                endpoint_alive,
+                1.0 - p_cross,
+                torch.zeros_like(M_T),
+            )
+
+        prices["barr_call"] = discount * (call_payoff * survival).mean().item()
+        prices["barr_put"] = discount * (put_payoff * survival).mean().item()
 
     return prices
 
@@ -275,19 +331,31 @@ def CVAE_greeks(
     seed = 1234,
     batch_size = 65536,
     check_training_bounds = True,
+    dt = 0.001,
+    bbc_correction = True,
+    mt_corr = False,
 ):
     aliases = {
         "bs": "bs",
         "bs_clip": "bs",
+        "bs_bbc": "bs",
         "hes": "hes",
         "heston": "hes",
         "hes_clip": "hes",
+        "hes_bbc": "hes",
     }
     if model_type not in aliases:
         raise ValueError(
-            "model_type must be 'bs', 'bs_clip', 'hes', 'heston', or 'hes_clip'."
+            "model_type must be 'bs', 'bs_clip', 'bs_bbc', 'hes', "
+            "'heston', 'hes_clip', or 'hes_bbc'."
         )
     backend = aliases[model_type]
+    expected_bbc_dims = {"bs_bbc": 3, "hes_bbc": 4}
+    if model_type in expected_bbc_dims and cvae.dim_x != expected_bbc_dims[model_type]:
+        raise ValueError(
+            f"model_type='{model_type}' requires dim_x="
+            f"{expected_bbc_dims[model_type]}, got dim_x={cvae.dim_x}."
+        )
 
     eta = np.asarray(eta, dtype=np.float64)
     expected_length = 5 if backend == "bs" else 9
@@ -353,6 +421,10 @@ def CVAE_greeks(
         B=B,
         r=float(eta[2]),
         T=float(eta[-1]),
+        sigma=float(eta[3]) if backend == "bs" else None,
+        dt=dt,
+        bbc_correction=bbc_correction,
+        mt_corr=mt_corr,
     )
 
     sample_cache: dict[tuple[float, ...], torch.Tensor] = {
@@ -379,6 +451,10 @@ def CVAE_greeks(
             B=B,
             r=float(current_eta[2]),
             T=float(current_eta[-1]),
+            sigma=float(current_eta[3]) if backend == "bs" else None,
+            dt=dt,
+            bbc_correction=bbc_correction,
+            mt_corr=mt_corr,
         )
 
     def bump_is_valid(index, step, lower, upper):
@@ -427,9 +503,13 @@ def CVAE_greeks(
 
     return {
         "model_type": backend,
+        "model_variant": model_type,
         "antithetic": bool(antithetic),
         "n_samples": int(n_samples),
         "seed": seed,
+        "bbc_correction": bool(bbc_correction),
+        "bbc_dt": float(dt) if B is not None and cvae.dim_x >= 3 else None,
+        "mt_corr": bool(mt_corr),
         "base_eta": eta.copy(),
         "base_prices": base_prices,
         "h": {name: steps[name] for name in greeks},

@@ -500,6 +500,127 @@ def _prepare_paths_batch(paths, etas, eta_min, eta_max, device, source, validate
     return torch.from_numpy(x_np).to(device), torch.from_numpy(eta_np).to(device)
 
 
+def _validate_eta_balanced_batch_config(
+    batch_size, etas_per_batch, paths_per_eta, stored_paths_per_eta,
+):
+    values = {
+        "batch_size": batch_size,
+        "etas_per_batch": etas_per_batch,
+        "paths_per_eta": paths_per_eta,
+        "stored_paths_per_eta": stored_paths_per_eta,
+    }
+    for name, value in values.items():
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+            raise TypeError(f"{name} must be a positive integer")
+        if int(value) < 1:
+            raise ValueError(f"{name} must be a positive integer")
+    if batch_size != etas_per_batch * paths_per_eta:
+        raise ValueError(
+            "batch_size must equal etas_per_batch * paths_per_eta: "
+            f"{batch_size} != {etas_per_batch} * {paths_per_eta}"
+        )
+    if stored_paths_per_eta % paths_per_eta != 0:
+        raise ValueError(
+            "stored_paths_per_eta must be divisible by paths_per_eta: "
+            f"{stored_paths_per_eta} % {paths_per_eta} != 0"
+        )
+
+
+def _eta_block_ids(
+    raw_idx, stored_paths_per_eta, etas_per_batch, source, validate=True,
+):
+    """Validate contiguous eta blocks and return one eta index per block."""
+    if len(raw_idx) % stored_paths_per_eta != 0:
+        raise ValueError(
+            f"{source}: row count {len(raw_idx):,} is not divisible by "
+            f"stored_paths_per_eta={stored_paths_per_eta}"
+        )
+    rounded_idx = np.rint(raw_idx)
+    if validate and (
+        not np.isfinite(raw_idx).all()
+        or not np.array_equal(raw_idx, rounded_idx)
+    ):
+        raise ValueError(f"{source}: eta indices must be finite integer-valued numbers")
+    index_blocks = rounded_idx.astype(np.int64, copy=False).reshape(
+        -1, stored_paths_per_eta
+    )
+    block_ids = index_blocks[:, 0]
+    if validate and not np.all(index_blocks == block_ids[:, None]):
+        bad_block = int(np.flatnonzero(
+            np.any(index_blocks != block_ids[:, None], axis=1)
+        )[0])
+        raise ValueError(
+            f"{source}: eta block {bad_block} does not contain exactly "
+            f"{stored_paths_per_eta} consecutive paths from one eta"
+        )
+    if validate:
+        for start in range(0, len(block_ids), etas_per_batch):
+            ids = block_ids[start:start + etas_per_batch]
+            if len(ids) == etas_per_batch and len(np.unique(ids)) != etas_per_batch:
+                raise ValueError(
+                    f"{source}: eta blocks {start}:{start + etas_per_batch} "
+                    f"do not contain {etas_per_batch} distinct eta indices"
+                )
+    return block_ids
+
+
+def iter_eta_balanced_chunk_batches(
+    chunk_path, etas, eta_min, eta_max, batch_size, device,
+    *, etas_per_batch=256, paths_per_eta=64, stored_paths_per_eta=2**10,
+    drop_last=False, validate=True,
+) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+    """Yield batches with many eta values while reading HDF5 sequentially.
+
+    The generator stores ``stored_paths_per_eta`` consecutive rows for each eta.
+    A group of ``etas_per_batch`` such blocks is read once and divided into
+    path slices. Every yielded full batch therefore contains exactly
+    ``paths_per_eta`` paths from each of ``etas_per_batch`` distinct eta values.
+    All stored paths are used once per epoch when the chunk has complete groups.
+    """
+    _validate_eta_balanced_batch_config(
+        batch_size, etas_per_batch, paths_per_eta, stored_paths_per_eta,
+    )
+    with h5py.File(chunk_path, "r") as f:
+        if "paths" not in f:
+            raise KeyError(f"{chunk_path} does not contain a 'paths' dataset")
+        paths_ds = f["paths"]
+        if paths_ds.ndim != 2 or paths_ds.shape[1] != 3:
+            raise ValueError(f"{chunk_path}: expected paths shape (N, 3), got {paths_ds.shape}")
+        n_rows = int(paths_ds.shape[0])
+        if n_rows % stored_paths_per_eta != 0:
+            raise ValueError(
+                f"{chunk_path}: rows={n_rows:,} is not divisible by "
+                f"stored_paths_per_eta={stored_paths_per_eta}"
+            )
+        n_eta_blocks = n_rows // stored_paths_per_eta
+        stop_blocks = (
+            (n_eta_blocks // etas_per_batch) * etas_per_batch
+            if drop_last else n_eta_blocks
+        )
+        for block_start in range(0, stop_blocks, etas_per_batch):
+            block_end = min(block_start + etas_per_batch, stop_blocks)
+            row_start = block_start * stored_paths_per_eta
+            row_end = block_end * stored_paths_per_eta
+            source = f"{chunk_path}[eta blocks {block_start}:{block_end}]"
+            group = np.asarray(paths_ds[row_start:row_end]).reshape(
+                block_end - block_start, stored_paths_per_eta, 3
+            )
+            _eta_block_ids(
+                group[:, :, 0].reshape(-1),
+                stored_paths_per_eta,
+                etas_per_batch,
+                source,
+                validate=validate,
+            )
+            for path_start in range(0, stored_paths_per_eta, paths_per_eta):
+                path_end = path_start + paths_per_eta
+                batch = group[:, path_start:path_end, :].reshape(-1, 3)
+                batch_source = f"{source}[paths {path_start}:{path_end}]"
+                yield _prepare_paths_batch(
+                    batch, etas, eta_min, eta_max, device, batch_source, validate
+                )
+
+
 def iter_chunk_batches(
     chunk_path, etas, eta_min, eta_max, batch_size, device,
     *, drop_last=False, validate=True,
@@ -525,7 +646,7 @@ def iter_chunk_batches(
 
 def load_chunk_to_device(
     chunk_path, etas, eta_min, eta_max, device, validate=True,
-    reserve_bytes=1024**3,
+    reserve_bytes=1024**3, *, stored_paths_per_eta=None, etas_per_batch=None,
 ):
     """Load one complete HDF5 chunk as float32 x/eta tensors on a CUDA device."""
     device = torch.device(device)
@@ -560,6 +681,15 @@ def load_chunk_to_device(
             raise ValueError(f"{chunk_path}: eta indices must be finite integer-valued numbers")
         ori_idx = rounded_idx.astype(np.int64, copy=False)
         del raw_idx, rounded_idx
+
+        if stored_paths_per_eta is not None:
+            _eta_block_ids(
+                ori_idx,
+                stored_paths_per_eta,
+                etas_per_batch,
+                chunk_path,
+                validate=validate,
+            )
 
         if ori_idx.size and (ori_idx.min() < 0 or ori_idx.max() >= len(etas)):
             raise IndexError(
@@ -634,6 +764,58 @@ def iter_device_chunk_batches(
         del x_chunk, eta_chunk
 
 
+def iter_eta_balanced_device_chunk_batches(
+    chunk_path, etas, eta_min, eta_max, batch_size, device,
+    *, etas_per_batch=256, paths_per_eta=64, stored_paths_per_eta=2**10,
+    drop_last=False, validate=True,
+):
+    """GPU-resident counterpart of iter_eta_balanced_chunk_batches."""
+    _validate_eta_balanced_batch_config(
+        batch_size, etas_per_batch, paths_per_eta, stored_paths_per_eta,
+    )
+    x_chunk, eta_chunk = load_chunk_to_device(
+        chunk_path,
+        etas,
+        eta_min,
+        eta_max,
+        device,
+        validate=validate,
+        stored_paths_per_eta=stored_paths_per_eta,
+        etas_per_batch=etas_per_batch,
+    )
+    n_rows = x_chunk.shape[0]
+    if n_rows % stored_paths_per_eta != 0:
+        raise ValueError(
+            f"{chunk_path}: rows={n_rows:,} is not divisible by "
+            f"stored_paths_per_eta={stored_paths_per_eta}"
+        )
+    n_eta_blocks = n_rows // stored_paths_per_eta
+    stop_blocks = (
+        (n_eta_blocks // etas_per_batch) * etas_per_batch
+        if drop_last else n_eta_blocks
+    )
+    try:
+        for block_start in range(0, stop_blocks, etas_per_batch):
+            block_end = min(block_start + etas_per_batch, stop_blocks)
+            row_start = block_start * stored_paths_per_eta
+            row_end = block_end * stored_paths_per_eta
+            group_size = block_end - block_start
+            x_group = x_chunk[row_start:row_end].reshape(
+                group_size, stored_paths_per_eta, 2
+            )
+            eta_group = eta_chunk[row_start:row_end].reshape(
+                group_size, stored_paths_per_eta, -1
+            )
+            for path_start in range(0, stored_paths_per_eta, paths_per_eta):
+                path_end = path_start + paths_per_eta
+                yield (
+                    x_group[:, path_start:path_end].reshape(-1, 2),
+                    eta_group[:, path_start:path_end].reshape(-1, eta_group.shape[-1]),
+                )
+    finally:
+        del x_chunk, eta_chunk
+
+
 def chunk_row_counts(paths):
     out = {}
     for path in paths:
@@ -661,6 +843,7 @@ def train_crealnvp_paper2022(
     *, save_path, chunk_dir=None, eta_path=None, model_type="hes", target_pair="XT_MIN",
     target_parameterization="mt",
     batch_size=16384, train_chunk_idxs=None, validation_chunk_idxs=None,
+    etas_per_batch=256, paths_per_eta=64, stored_paths_per_eta=2**10,
     shuffle_chunks=True, seed=1234, device=None, scale_clip=None,
     hidden_dim=100, n_hidden=4,
     bn_pretrain_fraction=0.05, drop_last=True, validate_data=True,
@@ -685,7 +868,21 @@ def train_crealnvp_paper2022(
     target_parameterization = _canonical_target_parameterization(
         target_parameterization
     )
+    for name, value in (
+        ("batch_size", batch_size),
+        ("etas_per_batch", etas_per_batch),
+        ("paths_per_eta", paths_per_eta),
+        ("stored_paths_per_eta", stored_paths_per_eta),
+    ):
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+            raise TypeError(f"{name} must be a positive integer")
     batch_size = int(batch_size)
+    etas_per_batch = int(etas_per_batch)
+    paths_per_eta = int(paths_per_eta)
+    stored_paths_per_eta = int(stored_paths_per_eta)
+    _validate_eta_balanced_batch_config(
+        batch_size, etas_per_batch, paths_per_eta, stored_paths_per_eta,
+    )
     if batch_size < 2:
         raise ValueError("batch_size must be >= 2 because BatchNorm is used during pretraining")
     if isinstance(hidden_dim, bool) or not isinstance(hidden_dim, (int, np.integer)):
@@ -826,6 +1023,17 @@ def train_crealnvp_paper2022(
             )
         scale_clip = checkpoint_scale_clip
 
+        for field, current_value in (
+            ("etas_per_batch", etas_per_batch),
+            ("paths_per_eta", paths_per_eta),
+            ("stored_paths_per_eta", stored_paths_per_eta),
+        ):
+            saved_value = resume_checkpoint.get(field)
+            if saved_value is not None and int(saved_value) != current_value:
+                raise ValueError(
+                    f"checkpoint {field}={saved_value}, current {field}={current_value}"
+                )
+
     chunk_dir, eta_path = resolve_dataset_paths(model_type, chunk_dir, eta_path)
 
     all_paths = list_chunk_paths(chunk_dir)
@@ -860,12 +1068,18 @@ def train_crealnvp_paper2022(
     selected_paths = [path_by_idx[i] for i in sorted(set(train_idxs) | val_idxs)]
     counts = chunk_row_counts(selected_paths)
     rows_per_epoch = sum(counts[path_by_idx[i]] for i in train_idxs)
-    if drop_last:
-        effective_rows_per_epoch = sum(
-            (counts[path_by_idx[i]] // batch_size) * batch_size for i in train_idxs
-        )
-    else:
-        effective_rows_per_epoch = rows_per_epoch
+    effective_rows_per_epoch = 0
+    for i in train_idxs:
+        n_rows = counts[path_by_idx[i]]
+        if n_rows % stored_paths_per_eta != 0:
+            raise ValueError(
+                f"{path_by_idx[i]}: rows={n_rows:,} is not divisible by "
+                f"stored_paths_per_eta={stored_paths_per_eta}"
+            )
+        n_eta_blocks = n_rows // stored_paths_per_eta
+        if drop_last:
+            n_eta_blocks = (n_eta_blocks // etas_per_batch) * etas_per_batch
+        effective_rows_per_epoch += n_eta_blocks * stored_paths_per_eta
     if effective_rows_per_epoch == 0:
         raise ValueError("No complete training batches are available")
     bn_freeze_after_rows = int(math.ceil(bn_pretrain_fraction * effective_rows_per_epoch))
@@ -1090,11 +1304,16 @@ def train_crealnvp_paper2022(
         f"tmp_save_every_chunks={tmp_save_every_chunks}, "
         f"memory_on_gpu={memory_on_gpu}"
     )
+    print(
+        f"balanced batches={etas_per_batch} etas x {paths_per_eta} paths/eta "
+        f"= {batch_size:,}; stored paths/eta={stored_paths_per_eta}"
+    )
     print(f"BN pretraining first {bn_pretrain_fraction:.1%} = {bn_freeze_after_rows:,} rows")
     print(f"run LR schedule={run_lr_schedule}")
 
     chunk_batch_iterator = (
-        iter_device_chunk_batches if memory_on_gpu else iter_chunk_batches
+        iter_eta_balanced_device_chunk_batches
+        if memory_on_gpu else iter_eta_balanced_chunk_batches
     )
 
     def chunk_order_for_epoch(epoch_idx):
@@ -1116,6 +1335,9 @@ def train_crealnvp_paper2022(
                     eta_max,
                     batch_size,
                     device,
+                    etas_per_batch=etas_per_batch,
+                    paths_per_eta=paths_per_eta,
+                    stored_paths_per_eta=stored_paths_per_eta,
                     drop_last=False,
                     validate=validate_data,
                 ):
@@ -1180,6 +1402,9 @@ def train_crealnvp_paper2022(
             "chunk_dir": chunk_dir,
             "eta_path": eta_path,
             "batch_size": batch_size,
+            "etas_per_batch": etas_per_batch,
+            "paths_per_eta": paths_per_eta,
+            "stored_paths_per_eta": stored_paths_per_eta,
             "drop_last": bool(drop_last),
             "memory_on_gpu": memory_on_gpu,
             "seed": seed,
@@ -1259,6 +1484,9 @@ def train_crealnvp_paper2022(
                 eta_max,
                 batch_size,
                 device,
+                etas_per_batch=etas_per_batch,
+                paths_per_eta=paths_per_eta,
+                stored_paths_per_eta=stored_paths_per_eta,
                 drop_last=drop_last,
                 validate=validate_data,
             ):
@@ -1427,9 +1655,15 @@ def train_crealnvp_paper2022(
     model.eval()
     return model, ckpt
 
-def plot_crealnvp_history(ckpt, window=None, figsize=(9, 7)):
-    """Plot available epoch, chunk, and chunk-validation NLL histories."""
+def plot_crealnvp_history(
+    ckpt, window=None, figsize=(9, 7), epoch_last_validation_only=False,
+):
+    """Plot NLL histories, optionally keeping only the last validation per epoch."""
     import matplotlib.pyplot as plt
+
+    if not isinstance(epoch_last_validation_only, (bool, np.bool_)):
+        raise TypeError("epoch_last_validation_only must be True or False")
+    epoch_last_validation_only = bool(epoch_last_validation_only)
 
     history = ckpt.get("history", {})
     train_nll = np.asarray(history.get("epoch_nll", []), dtype=float)
@@ -1516,13 +1750,34 @@ def plot_crealnvp_history(ckpt, window=None, figsize=(9, 7)):
                 label=f"Moving average (window={window})",
             )
         if chunk_val_nll.size:
+            validation_epochs = np.asarray(
+                validation_history.get("epoch", []), dtype=int
+            )
+            if epoch_last_validation_only:
+                if validation_epochs.size != chunk_val_nll.size:
+                    raise ValueError(
+                        "epoch_last_validation_only requires one epoch value "
+                        "per chunk validation record"
+                    )
+                last_indices = np.asarray([
+                    np.flatnonzero(validation_epochs == epoch_value)[-1]
+                    for epoch_value in np.unique(validation_epochs)
+                ], dtype=int)
+                plotted_val_steps = chunk_val_steps[last_indices]
+                plotted_val_nll = chunk_val_nll[last_indices]
+            else:
+                plotted_val_steps = chunk_val_steps
+                plotted_val_nll = chunk_val_nll
             chunk_axis.plot(
-                chunk_val_steps,
-                chunk_val_nll,
+                plotted_val_steps,
+                plotted_val_nll,
                 color="darkorange",
                 marker="o",
                 linewidth=1.5,
-                label="Validation NLL",
+                label=(
+                    "Epoch-last Validation NLL"
+                    if epoch_last_validation_only else "Validation NLL"
+                ),
             )
         chunk_axis.set_xlabel("Global Chunk")
         chunk_axis.set_ylabel("NLL")
@@ -1601,9 +1856,9 @@ def sample_crealnvp(
 def sample_valid_crealnvp(
     model, ckpt, eta_raw, n_samples=100_000, antithetic=False, seed=1234,
     *, allow_extrapolation=False, max_resample_rounds=100, valid_resample=True,
-    initial_samples=None,
+    initial_samples=None, validate_support=True, multiple=0,
 ):
-    """Validate physical support; UT is diagnostic-only and never resamples."""
+    """Reject invalid/support-tail samples and refill to ``n_samples`` rows."""
     n_samples = int(n_samples)
     if n_samples < 1:
         raise ValueError("n_samples must be >= 1")
@@ -1613,9 +1868,21 @@ def sample_valid_crealnvp(
     if not isinstance(valid_resample, (bool, np.bool_)):
         raise TypeError("valid_resample must be True or False")
     valid_resample = bool(valid_resample)
+    if not isinstance(validate_support, (bool, np.bool_)):
+        raise TypeError("validate_support must be True or False")
+    validate_support = bool(validate_support)
+    if isinstance(multiple, (bool, np.bool_)) or not isinstance(
+        multiple, (int, float, np.integer, np.floating)
+    ):
+        raise TypeError("multiple must be a real number")
+    multiple = float(multiple)
+    if not np.isfinite(multiple) or multiple < 0 or (0 < multiple <= 1):
+        raise ValueError("multiple must be 0 (disabled) or greater than 1")
+    tail_filter_applied = multiple > 0
+    xt_upper = math.log(multiple) if tail_filter_applied else None
     target_parameterization = _checkpoint_target_parameterization(ckpt)
 
-    if target_parameterization == "ut":
+    if target_parameterization == "ut" and not tail_filter_applied:
         samples = (
             sample_crealnvp(
                 model, ckpt, eta_raw, n_samples=n_samples,
@@ -1630,13 +1897,13 @@ def sample_valid_crealnvp(
                 f"initial/generated samples must have shape ({n_samples}, 2)."
             )
         invalid_count = int(_support_invalid_mask(samples).sum().item())
-        if invalid_count:
+        if validate_support and invalid_count:
             raise RuntimeError(
                 "UT NVP produced support-invalid samples: "
                 f"{invalid_count:,}/{n_samples:,}. No samples were rejected or resampled."
             )
         diagnostics = {
-            "validation_applied": True,
+            "validation_applied": validate_support,
             "target_parameterization": "ut",
             "valid_resample": False,
             "valid_resample_requested": valid_resample,
@@ -1653,6 +1920,12 @@ def sample_valid_crealnvp(
             "regenerated_sample_fraction": 0.0,
             "regenerated_sample_pct": 0.0,
             "support_invalid_count": 0,
+            "tail_filter_applied": False,
+            "multiple": multiple,
+            "X_T_upper": None,
+            "tail_rejected_sample_count": 0,
+            "tail_rejected_sample_fraction": 0.0,
+            "tail_rejected_sample_pct": 0.0,
         }
         return samples, diagnostics
 
@@ -1660,14 +1933,19 @@ def sample_valid_crealnvp(
     accepted_samples = 0
     attempted_samples = 0
     rejected_samples = 0
-    sampling_rounds = max_resample_rounds if valid_resample else 1
+    support_rejected_samples = 0
+    tail_rejected_samples = 0
+    must_refill = valid_resample or tail_filter_applied
+    sampling_rounds = max_resample_rounds if must_refill else 1
 
     for round_idx in range(sampling_rounds):
         remaining = n_samples - accepted_samples
         if remaining <= 0:
             break
         draw_count = remaining
-        round_seed = None if seed is None else int(seed) + round_idx
+        round_seed = (
+            None if seed is None else int(seed) + round_idx * 1_000_003
+        )
         if round_idx == 0 and initial_samples is not None:
             candidates = initial_samples
             if candidates.shape[0] != n_samples:
@@ -1685,23 +1963,38 @@ def sample_valid_crealnvp(
                 seed=round_seed,
                 allow_extrapolation=allow_extrapolation,
             )
-        invalid = _support_invalid_mask(candidates)
+        support_invalid = (
+            _support_invalid_mask(candidates)
+            if validate_support
+            else torch.zeros(
+                candidates.shape[0], dtype=torch.bool, device=candidates.device
+            )
+        )
+        tail_invalid = (
+            (~torch.isfinite(candidates).all(dim=1))
+            | (candidates[:, 0] >= xt_upper)
+            if tail_filter_applied
+            else torch.zeros_like(support_invalid)
+        )
+        invalid = support_invalid | tail_invalid
         valid = ~invalid
 
         attempted_samples += draw_count
         rejected_samples += int(invalid.sum().item())
+        support_rejected_samples += int(support_invalid.sum().item())
+        tail_rejected_samples += int(tail_invalid.sum().item())
         accepted = candidates[valid]
         if accepted.numel() > 0:
             accepted = accepted[:remaining]
             valid_batches.append(accepted)
             accepted_samples += int(accepted.shape[0])
-        del candidates, invalid, valid, accepted
+        del candidates, support_invalid, tail_invalid, invalid, valid, accepted
 
     if accepted_samples == 0:
         raise RuntimeError(
             f"No valid CRealNVP paths were found in {attempted_samples:,} draws."
         )
-    if valid_resample and accepted_samples < n_samples:
+    if must_refill and accepted_samples < n_samples:
         raise RuntimeError(
             f"Could obtain only {accepted_samples:,} valid paths after "
             f"{attempted_samples:,} draws. The model is producing too many "
@@ -1713,9 +2006,9 @@ def sample_valid_crealnvp(
     discarded_fraction = rejected_samples / attempted_samples
     regenerated_fraction = regenerated_samples / n_samples
     diagnostics = {
-        "validation_applied": True,
+        "validation_applied": validate_support,
         "target_parameterization": "mt",
-        "valid_resample": valid_resample,
+        "valid_resample": must_refill,
         "valid_resample_requested": valid_resample,
         "invalid_path_fraction": discarded_fraction,
         "rejected_path_count": rejected_samples,
@@ -1729,7 +2022,13 @@ def sample_valid_crealnvp(
         "regenerated_sample_count": regenerated_samples,
         "regenerated_sample_fraction": regenerated_fraction,
         "regenerated_sample_pct": 100.0 * regenerated_fraction,
-        "support_invalid_count": rejected_samples,
+        "support_invalid_count": support_rejected_samples,
+        "tail_filter_applied": tail_filter_applied,
+        "multiple": multiple,
+        "X_T_upper": xt_upper,
+        "tail_rejected_sample_count": tail_rejected_samples,
+        "tail_rejected_sample_fraction": tail_rejected_samples / attempted_samples,
+        "tail_rejected_sample_pct": 100.0 * tail_rejected_samples / attempted_samples,
     }
     return samples, diagnostics
 
@@ -1837,9 +2136,9 @@ def diagnose_crealnvp_samples(
 def price_current_options(
     model, ckpt, eta_raw, *, S0=1.0, K=1.0, B=0.8, r, T,
     n_samples=100_000, antithetic=True, seed=1234, allow_extrapolation=False,
-    validate_samples=True, valid_resample=True, mt_corr=False,
+    validate_samples=True, valid_resample=True, mt_corr=False, multiple=0,
 ):
-    """Price options; MT may filter invalid paths, while UT is diagnostic-only."""
+    """Price options, rejecting and refilling tails whenever ``multiple>0``."""
     eta_array = np.asarray(eta_raw)
     if eta_array.ndim != 1:
         raise ValueError("price_current_options expects one eta parameter vector")
@@ -1856,6 +2155,13 @@ def price_current_options(
         raise TypeError("valid_resample must be True or False")
     if not isinstance(mt_corr, (bool, np.bool_)):
         raise TypeError("mt_corr must be True or False")
+    if isinstance(multiple, (bool, np.bool_)) or not isinstance(
+        multiple, (int, float, np.integer, np.floating)
+    ):
+        raise TypeError("multiple must be a real number")
+    multiple = float(multiple)
+    if not np.isfinite(multiple) or multiple < 0 or (0 < multiple <= 1):
+        raise ValueError("multiple must be 0 (disabled) or greater than 1")
 
     raw_samples = sample_crealnvp(
         model,
@@ -1867,8 +2173,8 @@ def price_current_options(
         allow_extrapolation=allow_extrapolation,
     )
 
-    if validate_samples:
-        barrier_samples, diagnostics = sample_valid_crealnvp(
+    if validate_samples or multiple > 0:
+        pricing_samples, diagnostics = sample_valid_crealnvp(
             model,
             ckpt,
             eta_raw,
@@ -1878,9 +2184,11 @@ def price_current_options(
             allow_extrapolation=allow_extrapolation,
             valid_resample=valid_resample,
             initial_samples=raw_samples,
+            validate_support=validate_samples,
+            multiple=multiple,
         )
     else:
-        barrier_samples = raw_samples
+        pricing_samples = raw_samples
         diagnostics = {
             "validation_applied": False,
             "valid_resample": False,
@@ -1896,7 +2204,17 @@ def price_current_options(
             "regenerated_sample_count": 0,
             "regenerated_sample_fraction": 0.0,
             "regenerated_sample_pct": 0.0,
+            "support_invalid_count": None,
+            "tail_filter_applied": False,
+            "multiple": multiple,
+            "X_T_upper": None,
+            "tail_rejected_sample_count": 0,
+            "tail_rejected_sample_fraction": 0.0,
+            "tail_rejected_sample_pct": 0.0,
         }
+    # Vanilla and barrier prices use the same final accepted sample set.
+    raw_samples = pricing_samples
+    barrier_samples = pricing_samples
     vanilla_X_T = raw_samples[:, 0]
     vanilla_S_T = S0 * torch.exp(vanilla_X_T)
     barrier_X_T = barrier_samples[:, 0]

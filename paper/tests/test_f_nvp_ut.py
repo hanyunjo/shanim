@@ -2,6 +2,7 @@ import inspect
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -136,6 +137,35 @@ class NVPParameterizationTests(unittest.TestCase):
         self.assertEqual(diagnostics["regenerated_sample_count"], 0)
         self.assertFalse(diagnostics["valid_resample"])
         self.assertTrue(diagnostics["valid_resample_requested"])
+
+    def test_multiple_refills_tail_when_valid_resample_is_false(self):
+        model = self.make_model("ut")
+        ckpt = self.checkpoint(model)
+        eta_raw = np.array([0.1, 0.2, 0.5], dtype=np.float32)
+        initial = torch.tensor([
+            [np.log(20.0), -1.0],
+            [0.0, -1.0],
+        ], dtype=torch.float32)
+
+        replacement = torch.tensor([[0.0, -1.0]], dtype=torch.float32)
+        with patch("f_NVP.sample_crealnvp", return_value=replacement):
+            samples, diagnostics = sample_valid_crealnvp(
+                model,
+                ckpt,
+                eta_raw,
+                n_samples=2,
+                valid_resample=False,
+                initial_samples=initial,
+                validate_support=False,
+                multiple=10,
+            )
+
+        self.assertEqual(tuple(samples.shape), (2, 2))
+        self.assertTrue(torch.all(samples[:, 0] < np.log(10.0)))
+        self.assertTrue(diagnostics["tail_filter_applied"])
+        self.assertEqual(diagnostics["tail_rejected_sample_count"], 1)
+        self.assertEqual(diagnostics["total_drawn_samples"], 3)
+        self.assertEqual(diagnostics["multiple"], 10.0)
 
     def test_diagnostics_reports_zero_ut_support_violations(self):
         model = self.make_model("ut")

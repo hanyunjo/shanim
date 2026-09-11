@@ -22,7 +22,7 @@ ROBUSTNESS_VARIABLES_MAIN = {
     "bs": {
         "r": [0.0025, 0.0975],
         #"sigma": [0.05, 0.80], # < 0.812
-        "sigma": [0.05, 0.75],
+        "sigma": [0.05, 0.7],
         "T": [0.15, 2.85], # σ < root(T)
     },
     "hes": {
@@ -146,6 +146,8 @@ def _cvae_cases(
     validate_samples,
     valid_resample,
     mt_corr,
+    multiple=0,
+    dt=0.001,
 ):
     eta_raw = np.asarray(eta[2:], dtype=np.float32)
     eta_min = _as_numpy(checkpoint["eta_min"]).astype(np.float32)
@@ -159,9 +161,13 @@ def _cvae_cases(
 
     eta_scaled = (eta_raw - eta_min) / (eta_max - eta_min + 1e-8)
     eta_tensor = torch.as_tensor(eta_scaled, dtype=torch.float32, device=device)
+    model_for_pricing = cvae.module if hasattr(cvae, "module") else cvae
+    model_dim_x = int(model_for_pricing.dim_x)
+    has_running_minimum = model_dim_x >= 2
+    option_keys = OPTION_KEYS if has_running_minimum else ("van_call", "van_put")
     option_results = {
         key: {n: [] for n in n_samples_list}
-        for key in OPTION_KEYS
+        for key in option_keys
     }
     seconds = {n: [] for n in n_samples_list}
     sampling_diagnostics = {n: [] for n in n_samples_list}
@@ -176,13 +182,35 @@ def _cvae_cases(
         "mt_corrected_sample_count",
         "mt_corrected_sample_fraction",
         "mt_corrected_sample_pct",
+        "bbc_correction_applied",
+        "bbc_cross_probability_mean",
+        "bbc_expected_additional_knockout_count",
+        "bbc_survival_weight_mean",
+        "bbc_m_next_corrected_count",
+        "bbc_v_avg_corrected_count",
+        "tail_filter_applied",
+        "multiple",
+        "X_T_upper",
+        "tail_rejected_sample_count",
+        "tail_rejected_sample_fraction",
+        "tail_rejected_sample_pct",
     )
 
     for n_samples in n_samples_list:
         for _ in range(repeats):
+            bbc_kwargs = {}
+            if model_dim_x >= 3:
+                bbc_kwargs["dt"] = float(dt)
+                if model_dim_x == 3:
+                    if model_name != "bs":
+                        raise ValueError(
+                            "dim_x=3 BBC pricing is the BS layout and requires model_name='bs'."
+                        )
+                    bbc_kwargs["sigma"] = float(eta[3])
+
             _synchronize_torch(device)
             started = time.perf_counter()
-            prices = cvae.total_pricing(
+            prices = model_for_pricing.total_pricing(
                 eta_tensor,
                 float(barrier),
                 float(eta[1]),
@@ -192,6 +220,8 @@ def _cvae_cases(
                 validate_samples=validate_samples,
                 valid_resample=valid_resample,
                 mt_corr=mt_corr,
+                multiple=multiple,
+                **bbc_kwargs,
             )
             _synchronize_torch(device)
             seconds[n_samples].append(time.perf_counter() - started)
@@ -199,7 +229,7 @@ def _cvae_cases(
                 key: prices.get(key) for key in diagnostic_keys
             })
 
-            for key in OPTION_KEYS:
+            for key in option_keys:
                 option_results[key][n_samples].append(float(prices[key]))
 
         diagnostics_for_n = sampling_diagnostics[n_samples]
@@ -223,7 +253,8 @@ def _cvae_cases(
         else:
             validation_text = "discarded=not checked | regenerated=0.0000%"
         print(
-            f"[barrier samples] n={n_samples:,} | validation={validate_samples} "
+            f"[{'barrier' if has_running_minimum else 'vanilla'} samples] "
+            f"n={n_samples:,} | validation={validate_samples and has_running_minimum} "
             f"| resample={valid_resample} | mt_corr={mt_corr} "
             f"| used={used_mean:,.1f} | {validation_text} "
             f"| mt_corrected={corrected_pct_mean:.4f}%"
@@ -407,6 +438,7 @@ def run_robustness(
     validate_samples=True,
     valid_resample=True,
     mt_corr=False,
+    multiple=0,
 ):
     models = tuple(models)
     barr_types = tuple(barr_types)
@@ -418,6 +450,13 @@ def run_robustness(
         raise TypeError("valid_resample must be True or False")
     if not isinstance(mt_corr, (bool, np.bool_)):
         raise TypeError("mt_corr must be True or False")
+    if isinstance(multiple, (bool, np.bool_)) or not isinstance(
+        multiple, (int, float, np.integer, np.floating)
+    ):
+        raise TypeError("multiple must be a real number")
+    multiple = float(multiple)
+    if not np.isfinite(multiple) or multiple < 0 or (0 < multiple <= 1):
+        raise ValueError("multiple must be 0 (disabled) or greater than 1")
     validate_samples = bool(validate_samples)
     valid_resample = bool(valid_resample)
     mt_corr = bool(mt_corr)
@@ -480,6 +519,8 @@ def run_robustness(
                             validate_samples=validate_samples,
                             valid_resample=valid_resample,
                             mt_corr=mt_corr,
+                            multiple=multiple,
+                            dt=mc_dt,
                         )
                     except Exception as exc:
                         cvae_error = f"cvae={type(exc).__name__}: {exc}"
@@ -517,13 +558,20 @@ def run_robustness(
                             errors.append(cvae_error)
 
                         option_key = f"{barr_type}_{option_type}"
+                        if cvae_data is not None and option_key not in cvae_data["prices"]:
+                            errors.append(
+                                f"cvae=unsupported payoff {option_key}: "
+                                "model output has no running minimum (dim_x=1)"
+                            )
                         mc_results = (
                             mc_data["prices"][option_key]
                             if mc_data is not None
                             else {n: [] for n in n_samples_list}
                         )
                         cvae_results = (
-                            cvae_data["prices"][option_key]
+                            cvae_data["prices"].get(
+                                option_key, {n: [] for n in n_samples_list}
+                            )
                             if cvae_data is not None
                             else {n: [] for n in n_samples_list}
                         )
@@ -580,6 +628,10 @@ def run_robustness(
                                 item.get("mt_corrected_sample_pct")
                                 for item in largest_diagnostics
                             ])[0],
+                            "tail_rejected_sample_pct": _mean_std([
+                                item.get("tail_rejected_sample_pct")
+                                for item in largest_diagnostics
+                            ])[0],
                             "error": "; ".join(dict.fromkeys(errors)) if errors else None,
                         })
 
@@ -590,6 +642,7 @@ def run_robustness(
     results.attrs["validate_samples"] = validate_samples
     results.attrs["valid_resample"] = valid_resample
     results.attrs["mt_corr"] = mt_corr
+    results.attrs["multiple"] = multiple
     is_bs_backend = results["model"].map(lambda name: _model_backend(name) == "bs")
     results["reference"] = np.where(
         is_bs_backend, results["closed"], results["fdm"]
@@ -673,6 +726,18 @@ def build_sampling_summary(results):
                 "mt_corrected_sample_pct_mean": _mean_std([
                     item.get("mt_corrected_sample_pct") for item in diagnostics
                 ])[0],
+                "tail_rejected_sample_count_mean": _mean_std([
+                    item.get("tail_rejected_sample_count") for item in diagnostics
+                ])[0],
+                "tail_rejected_sample_pct_mean": _mean_std([
+                    item.get("tail_rejected_sample_pct") for item in diagnostics
+                ])[0],
+                "multiple": _mean_std([
+                    item.get("multiple") for item in diagnostics
+                ])[0],
+                "X_T_upper": _mean_std([
+                    item.get("X_T_upper") for item in diagnostics
+                ])[0],
                 "error": result["error"],
             })
 
@@ -709,6 +774,9 @@ def plot_sampling_comparison(results, model_name, variable, value):
             subset["barr_type"].eq(barr_type)
             & subset["option_type"].eq(option_type)
         ].sort_values("n_samples")
+        if option_data.empty:
+            ax.set_visible(False)
+            continue
         n_samples = option_data["n_samples"].to_numpy(dtype=int)
         x_positions = np.arange(len(n_samples))
 
@@ -754,11 +822,13 @@ def plot_sampling_comparison(results, model_name, variable, value):
         ax.grid(True, alpha=0.3)
         ax.legend()
 
-    if model_name == 'bs':
+    if _model_backend(model_name) == 'bs':
         fig_name = 'BS'
     elif model_name == 'hes' or model_name == 'hes_clip':
         fig_name = 'Heston'
 
+    if variable == 'Y0':
+        variable = 'v0'
     fig.suptitle(f"{fig_name} robustness | {variable}={value:g}")
     plt.tight_layout()
     plt.show()

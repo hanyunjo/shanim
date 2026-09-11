@@ -23,12 +23,61 @@ device = torch.device("cuda")
 CVAE = BaseCVAE
 BS_CHUNK_DIR  = "/mnt/d/bs_chunks_correction/"
 BS_ETA_PATH   = "/mnt/d/bs_eta_basic.h5"
+BS_BBC_CHUNK_DIR = "/mnt/d/bs_corr/"
 BS_CLIP_CHUNK_DIR  = "/mnt/d/bs_clip_chunks_correction/"
 BS_CLIP_ETA_PATH   = "/mnt/d/bs_eta_clip.h5"
 HES_CHUNK_DIR = "/mnt/d/heston_chunks_correction/"
 HES_ETA_PATH  = "/mnt/d/heston_eta_basic.h5"
+HES_BBC_CHUNK_DIR = "/mnt/d/hes_corr/"
 HES_CLIP_CHUNK_DIR = "/mnt/d/heston_clip_x2_chunks_correction/"
 HES_CLIP_ETA_PATH  = "/mnt/d/heston_eta_clip_x2.h5"
+
+TARGET_COORDINATES = {
+    1: ["X_T"],
+    2: ["X_T", "M_T"],
+    3: ["X_T", "M_T", "M_next"],
+    4: ["X_T", "M_T", "M_next", "v_avg"],
+}
+
+
+def _resolve_dim_x(dim_x=None, include_m=None):
+    """Resolve the new dim_x option while keeping include_m compatibility."""
+    if include_m is not None and not isinstance(include_m, (bool, np.bool_)):
+        raise TypeError("include_m must be True, False, or None.")
+
+    if dim_x is None:
+        # Previous default was include_m=True, hence dim_x=2 when both are omitted.
+        return 2 if include_m is None or bool(include_m) else 1
+
+    if not isinstance(dim_x, (int, np.integer)) or isinstance(dim_x, bool):
+        raise TypeError("dim_x must be an integer from 1 to 4.")
+    dim_x = int(dim_x)
+    if dim_x not in TARGET_COORDINATES:
+        raise ValueError("dim_x must be one of 1, 2, 3, or 4.")
+
+    expected_include_m = dim_x >= 2
+    if include_m is not None and bool(include_m) != expected_include_m:
+        raise ValueError(
+            f"dim_x={dim_x} conflicts with include_m={bool(include_m)}. "
+            f"Use include_m={expected_include_m} or omit include_m."
+        )
+    return dim_x
+
+
+def _target_coordinates(dim_x):
+    return list(TARGET_COORDINATES[_resolve_dim_x(dim_x=dim_x)])
+
+
+def _extract_path_targets(paths, dim_x, chunk_path):
+    dim_x = _resolve_dim_x(dim_x=dim_x)
+    required_columns = dim_x + 1  # eta index + target columns
+    if paths.ndim != 2 or paths.shape[1] < required_columns:
+        raise ValueError(
+            f"{chunk_path}: paths must have at least {required_columns} columns "
+            f"for dim_x={dim_x} ([eta_index, {', '.join(_target_coordinates(dim_x))}]), "
+            f"but shape is {paths.shape}."
+        )
+    return paths[:, 1:required_columns].astype(np.float32, copy=True)
 
 
 def alarm(message:str = "Jupyter 셀 실행 완료!"):
@@ -59,13 +108,15 @@ class GpuChunk:
         return self.x.shape[0]
 
 
-def load_chunk_file_to_gpu(chunk_path, etas, eta_min, eta_max, include_m=True):
+def load_chunk_file_to_gpu(
+    chunk_path, etas, eta_min, eta_max, include_m=None, dim_x=None
+):
+    dim_x = _resolve_dim_x(dim_x=dim_x, include_m=include_m)
     with h5py.File(chunk_path, 'r') as f:
-        paths = f['paths'][:] # (N, 3) : [ori_idx, X_T, M_T]
+        paths = f['paths'][:]
 
     ori_idx = paths[:, 0].astype(np.int64, copy=False)
-    x_stop = 3 if include_m else 2
-    x_np = paths[:, 1:x_stop].astype(np.float32, copy=True)
+    x_np = _extract_path_targets(paths, dim_x, chunk_path)
 
     eta_np = etas[ori_idx].astype(np.float32, copy=True)
     eta_np = (eta_np - eta_min) / (eta_max - eta_min + 1e-8)
@@ -81,19 +132,21 @@ def load_chunk_file_to_gpu(chunk_path, etas, eta_min, eta_max, include_m=True):
 
 
 class ChunkDataset(Dataset): # for Ram
-    def __init__(self, chunk_path, etas, eta_min, eta_max, include_m=True):
+    def __init__(
+        self, chunk_path, etas, eta_min, eta_max, include_m=None, dim_x=None
+    ):
+        dim_x = _resolve_dim_x(dim_x=dim_x, include_m=include_m)
 
         with h5py.File(chunk_path, 'r') as f:
-            paths = f['paths'][:] # (N, 3) : [ori_idx, X_T, M_T]
+            paths = f['paths'][:]
 
         ori_idx = paths[:, 0].astype(int)
-        x_stop = 3 if include_m else 2
-        x_np = paths[:, 1:x_stop].astype(np.float32, copy=True)
+        x_np = _extract_path_targets(paths, dim_x, chunk_path)
 
         eta_matched = etas[ori_idx].astype(np.float32)
         eta_matched = (eta_matched - eta_min) / (eta_max - eta_min + 1e-8)
 
-        self.x = torch.from_numpy(x_np)  # include_m=False: (N, 1), True: (N, 2)
+        self.x = torch.from_numpy(x_np)  # (N, dim_x)
         self.eta = torch.from_numpy(eta_matched)   # (N, dim_eta)
 
     def __len__(self):
@@ -167,7 +220,7 @@ def _checkpoint_target_parameterization(checkpoint):
         extra_state = model_state.get("_extra_state", {})
         model_coordinates = extra_state.get("model_coordinates")
 
-    if model_coordinates is None or list(model_coordinates) in (["X_T"], ["X_T", "M_T"]):
+    if model_coordinates is None or list(model_coordinates) in TARGET_COORDINATES.values():
         return "mt"
     if list(model_coordinates) == ["X_T", "U_T"]:
         return "ut"
@@ -233,7 +286,8 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
                 weight_mode="barrier_put", weight_alpha=3.0, weight_mode2=None,
                 weight_alpha2=0.0, weight_h=0.05, weight_normalize=True,
                 S0=1.0, K=1.0, B=0.8, tmp_save_every_chunks=10,
-                include_m=True, residual_blocks=0):
+                include_m=None, residual_blocks=0, dim_x=None,
+                chunk_dir=None, eta_path=None):
     
     def chunk_order_for_epoch(epoch):
         chunk_indices = np.array(trainable_chunk_idxs, dtype=int)
@@ -252,14 +306,14 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
     def load_chunk(ci):
         dataset = ChunkDataset(
             chunk_path_by_idx[int(ci)], etas, eta_min, eta_max,
-            include_m=include_m,
+            dim_x=dim_x,
         )
         return dataset
 
     def load_chunk_gpu(ci):
         return load_chunk_file_to_gpu(
             chunk_path_by_idx[int(ci)], etas, eta_min, eta_max,
-            include_m=include_m,
+            dim_x=dim_x,
         )
 
     def apply_bn_mode(global_chunk):
@@ -493,10 +547,12 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
             payload.update(cvae.checkpoint_metadata())
         else:
             payload.update({
-                "model_coordinates": ["X_T", "M_T"] if include_m else ["X_T"],
-                "physical_coordinates": ["X_T", "M_T"] if include_m else ["X_T"],
-                "support_parameterization": "model output M_T" if include_m else None,
-                "path_statistic": "running_minimum" if include_m else None,
+                "model_coordinates": _target_coordinates(dim_x),
+                "physical_coordinates": _target_coordinates(dim_x),
+                "support_parameterization": "direct decoder output",
+                "path_statistic": "running_minimum_with_BBC_features" if dim_x >= 3 else (
+                    "running_minimum" if dim_x >= 2 else None
+                ),
             })
         return payload
 
@@ -615,17 +671,29 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
     if residual_blocks < 0:
         raise ValueError("residual_blocks must be >= 0.")
 
-    if not isinstance(include_m, (bool, np.bool_)):
-        raise TypeError("include_m must be True or False.")
-    include_m = bool(include_m)
+    bbc_dim_x = {"bs_bbc": 3, "hes_bbc": 4}.get(model_type)
+    if bbc_dim_x is not None and dim_x is None:
+        if include_m is False:
+            raise ValueError(
+                f"model_type='{model_type}' requires dim_x={bbc_dim_x} and include_m=True."
+            )
+        dim_x = bbc_dim_x
+
+    dim_x = _resolve_dim_x(dim_x=dim_x, include_m=include_m)
+    if bbc_dim_x is not None and dim_x != bbc_dim_x:
+        raise ValueError(
+            f"model_type='{model_type}' requires dim_x={bbc_dim_x}, got dim_x={dim_x}."
+        )
+    include_m = dim_x >= 2
+    target_coordinates = _target_coordinates(dim_x)
 
     target_parameterization = _normalize_target_parameterization(
         target_parameterization
     )
-    if target_parameterization == "ut" and not include_m:
+    if target_parameterization == "ut" and dim_x != 2:
         raise ValueError(
-            "target_parameterization='ut' requires include_m=True because the raw "
-            "training batch must contain [X_T, M_T]."
+            "target_parameterization='ut' supports only dim_x=2 ([X_T, M_T]). "
+            "Use target_parameterization='mt' for dim_x=1, 3, or 4."
         )
 
     cvae_type = _normalize_cvae_type(cvae_type)
@@ -663,26 +731,46 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
     weight_alpha_changed_on_resume = False
 
     if model_type == 'hes':
-        chunk_dir = HES_CHUNK_DIR
-        eta_path  = HES_ETA_PATH
+        default_chunk_dir = HES_CHUNK_DIR
+        default_eta_path  = HES_ETA_PATH
+    elif model_type == 'hes_bbc':
+        default_chunk_dir = HES_BBC_CHUNK_DIR
+        default_eta_path  = HES_ETA_PATH
     elif model_type == 'bs':
-        chunk_dir = BS_CHUNK_DIR
-        eta_path  = BS_ETA_PATH
+        default_chunk_dir = BS_CHUNK_DIR
+        default_eta_path  = BS_ETA_PATH
+    elif model_type == 'bs_bbc':
+        default_chunk_dir = BS_BBC_CHUNK_DIR
+        default_eta_path  = BS_ETA_PATH
     elif model_type == 'bs_clip':
-        chunk_dir = BS_CLIP_CHUNK_DIR
-        eta_path  = BS_CLIP_ETA_PATH
+        default_chunk_dir = BS_CLIP_CHUNK_DIR
+        default_eta_path  = BS_CLIP_ETA_PATH
     elif model_type == 'hes_clip':
-        chunk_dir = HES_CLIP_CHUNK_DIR
-        eta_path  = HES_CLIP_ETA_PATH
+        default_chunk_dir = HES_CLIP_CHUNK_DIR
+        default_eta_path  = HES_CLIP_ETA_PATH
     else:
-        raise ValueError("model_type must be 'hes' or 'bs'")
+        raise ValueError(
+            "model_type must be 'hes', 'hes_bbc', 'bs', 'bs_bbc', "
+            "'hes_clip', or 'bs_clip'"
+        )
 
-    dim_x = 2 if include_m else 1  # True: (X_T, M_T), False: (X_T,)
+    chunk_dir = default_chunk_dir if chunk_dir is None else os.fspath(chunk_dir)
+    eta_path = default_eta_path if eta_path is None else os.fspath(eta_path)
 
     chunk_paths = sorted(glob.glob(os.path.join(chunk_dir, "*.h5")), key=_chunk_sort_file_idx)
     num_all_chunks = len(chunk_paths)
     if num_all_chunks == 0:
         raise FileNotFoundError(f"No chunk files found in {chunk_dir}")
+
+    with h5py.File(chunk_paths[0], 'r') as first_chunk:
+        first_shape = first_chunk['paths'].shape
+    required_columns = dim_x + 1
+    if len(first_shape) != 2 or first_shape[1] < required_columns:
+        raise ValueError(
+            f"{chunk_paths[0]}: paths shape {first_shape} cannot provide dim_x={dim_x}. "
+            f"Expected at least {required_columns} columns: "
+            f"[eta_index, {', '.join(target_coordinates)}]."
+        )
 
     all_chunk_idxs = [_chunk_sort_file_idx(path) for path in chunk_paths]
     if len(set(all_chunk_idxs)) != len(all_chunk_idxs):
@@ -795,7 +883,7 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
             raise ValueError(f"checkpoint dim_x={checkpoint_dim_x}, current dim_x={dim_x}")
 
         checkpoint_include_m = bool(
-            resume_checkpoint.get('include_m', checkpoint_dim_x == 2)
+            resume_checkpoint.get('include_m', checkpoint_dim_x >= 2)
         )
         if checkpoint_include_m != include_m:
             raise ValueError(
@@ -991,6 +1079,7 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
         f"excluded={sorted(exclude_chunk_idxs)} | validation={sorted(validation_chunk_idxs)} | "
         f"val_every_chunks={val_every_chunks} | bn_chunks={bn_chunks} | warmup_chunks={warmup_chunks} | "
         f"memory_on_gpu={memory_on_gpu} | cvae_type={cvae_type} | "
+        f"dim_x={dim_x} ({target_coordinates}) | "
         f"target_parameterization={target_parameterization} | "
         f"tmp_save_every_chunks={tmp_save_every_chunks}"
     )

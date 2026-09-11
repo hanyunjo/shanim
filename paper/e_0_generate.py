@@ -10,6 +10,162 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 import math
 import re
+import errno
+
+
+HDF5_WRITE_ATTEMPTS = 6
+HDF5_WRITE_RETRY_SECONDS = 5.0
+
+
+def _guarded_mount_path(path):
+    """Return the /mnt/<drive> mount containing path, when applicable."""
+    parts = Path(path).parts
+    if len(parts) >= 3 and parts[0] == os.sep and parts[1] == "mnt":
+        return Path(os.sep, "mnt", parts[2])
+    return None
+
+
+def _prepare_chunk_directory(chunk_dir):
+    """Create the output directory once and remember its filesystem identity."""
+    chunk_dir = Path(chunk_dir).expanduser().resolve(strict=False)
+    mount_path = _guarded_mount_path(chunk_dir)
+
+    # Do not accidentally create /mnt/<drive>/... on the Linux root filesystem
+    # while a Windows/WSL drive is unavailable.
+    if mount_path is not None and not mount_path.is_mount():
+        raise FileNotFoundError(
+            errno.ENOENT,
+            f"output drive is not mounted: {mount_path}",
+            str(mount_path),
+        )
+
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    directory_stat = chunk_dir.stat()
+    mount_device = mount_path.stat().st_dev if mount_path is not None else None
+    return str(chunk_dir), {
+        "path": str(chunk_dir),
+        "directory_device": directory_stat.st_dev,
+        "directory_inode": directory_stat.st_ino,
+        "mount_path": str(mount_path) if mount_path is not None else None,
+        "mount_device": mount_device,
+    }
+
+
+def _validate_chunk_directory(directory_guard):
+    """Fail instead of writing elsewhere if the output mount disappears."""
+    chunk_dir = Path(directory_guard["path"])
+    mount_value = directory_guard["mount_path"]
+
+    if mount_value is not None:
+        mount_path = Path(mount_value)
+        if not mount_path.is_mount():
+            raise FileNotFoundError(
+                errno.ENOENT,
+                f"output drive is no longer mounted: {mount_path}",
+                str(mount_path),
+            )
+        if mount_path.stat().st_dev != directory_guard["mount_device"]:
+            raise OSError(
+                errno.ESTALE,
+                f"output drive changed while generating chunks: {mount_path}",
+                str(mount_path),
+            )
+
+    try:
+        directory_stat = chunk_dir.stat()
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            errno.ENOENT,
+            f"chunk output directory disappeared: {chunk_dir}",
+            str(chunk_dir),
+        ) from exc
+
+    if not chunk_dir.is_dir():
+        raise NotADirectoryError(
+            errno.ENOTDIR,
+            "chunk output path is not a directory",
+            str(chunk_dir),
+        )
+    if (
+        directory_stat.st_dev != directory_guard["directory_device"]
+        or directory_stat.st_ino != directory_guard["directory_inode"]
+    ):
+        raise OSError(
+            errno.ESTALE,
+            f"chunk output directory changed while generating: {chunk_dir}",
+            str(chunk_dir),
+        )
+
+
+def _validate_written_chunk(path, expected_shape):
+    """Check HDF5 metadata and sample the first/last compressed blocks."""
+    with h5py.File(path, "r") as h5:
+        if "paths" not in h5:
+            raise KeyError(f"{path} does not contain a 'paths' dataset")
+        dataset = h5["paths"]
+        if dataset.shape != expected_shape:
+            raise ValueError(
+                f"{path}: expected paths shape {expected_shape}, got {dataset.shape}"
+            )
+        if dataset.shape[0] > 0:
+            block_rows = min(dataset.chunks[0] if dataset.chunks else 1, dataset.shape[0])
+            dataset[:block_rows]
+            dataset[-block_rows:]
+
+
+def _write_chunk_atomic(
+    chunk,
+    save_path,
+    dataset_chunks,
+    directory_guard,
+    attempts=HDF5_WRITE_ATTEMPTS,
+    retry_seconds=HDF5_WRITE_RETRY_SECONDS,
+):
+    """Write and verify a chunk before atomically publishing its final name."""
+    save_path = Path(save_path)
+    writing_path = save_path.with_name(f"{save_path.name}.writing")
+    last_error = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            _validate_chunk_directory(directory_guard)
+            if writing_path.exists():
+                writing_path.unlink()
+
+            with h5py.File(writing_path, "w") as h5:
+                h5.create_dataset(
+                    "paths",
+                    data=chunk,
+                    chunks=dataset_chunks,
+                    compression="gzip",
+                )
+                h5.flush()
+
+            _validate_chunk_directory(directory_guard)
+            _validate_written_chunk(writing_path, chunk.shape)
+            os.replace(writing_path, save_path)
+            return
+        except OSError as exc:
+            last_error = exc
+            try:
+                _validate_chunk_directory(directory_guard)
+                if writing_path.exists():
+                    writing_path.unlink()
+            except OSError:
+                pass
+
+            if attempt == attempts:
+                break
+            print(
+                f"  HDF5 저장 실패 ({attempt}/{attempts}): {exc}. "
+                f"{retry_seconds:.0f}초 후 재시도합니다.",
+                flush=True,
+            )
+            time.sleep(retry_seconds)
+
+    raise OSError(
+        f"HDF5 chunk 저장을 {attempts}번 시도했지만 실패했습니다: {save_path}"
+    ) from last_error
 
 
 
@@ -208,17 +364,22 @@ def filter_paths(XT, T):
 
 
 
-def _flush_buffer(buffer, chunk_dir, prefix, chunk_idx):
+def _flush_buffer(buffer, chunk_dir, prefix, chunk_idx, directory_guard=None):
     chunk     = np.concatenate(buffer, axis=0)
+    if directory_guard is None:
+        chunk_dir, directory_guard = _prepare_chunk_directory(chunk_dir)
     save_path = os.path.join(chunk_dir, f"{prefix}_chunk_{chunk_idx:03d}.h5")
  
     while os.path.exists(save_path):
         chunk_idx += 1
         save_path = os.path.join(chunk_dir, f"{prefix}_chunk_{chunk_idx:03d}.h5")
 
-    with h5py.File(save_path, 'w') as f:
-        f.create_dataset('paths', data=chunk,
-                          chunks=(10240, 3), compression='gzip')
+    _write_chunk_atomic(
+        chunk,
+        save_path,
+        dataset_chunks=(10240, 3),
+        directory_guard=directory_guard,
+    )
 
     print(f"  청크 저장: {save_path} ({len(chunk):,}행)")
     return chunk_idx + 1, [] 
@@ -244,7 +405,7 @@ def generate_dataset(eta_path, chunk_dir, model_type='hes', S0=1.0, B=0,
     buf_size   = 0    # 현재 버퍼 행 수
     chunk_idx  = 0    # 청크 파일 번호
 
-    os.makedirs(chunk_dir, exist_ok=True)
+    chunk_dir, directory_guard = _prepare_chunk_directory(chunk_dir)
 
     _worker = _heston_worker if model_type == 'hes' else _bs_worker
 
@@ -283,7 +444,7 @@ def generate_dataset(eta_path, chunk_dir, model_type='hes', S0=1.0, B=0,
 
                         if true % (chunk_size) == 0:
                             chunk_idx, buffer = _flush_buffer(
-                                buffer, chunk_dir, prefix, chunk_idx)
+                                buffer, chunk_dir, prefix, chunk_idx, directory_guard)
                             buf_size = 0
 
                         if true % 20000 == 0:
@@ -332,7 +493,7 @@ def generate_dataset(eta_path, chunk_dir, model_type='hes', S0=1.0, B=0,
 
                             if true % (chunk_size) == 0 and true > 0:
                                 chunk_idx, buffer = _flush_buffer(
-                                    buffer, chunk_dir, prefix, chunk_idx)
+                                    buffer, chunk_dir, prefix, chunk_idx, directory_guard)
                                 buf_size = 0
                                 print(f"{time.time()-start}s")
 
@@ -350,6 +511,232 @@ def generate_dataset(eta_path, chunk_dir, model_type='hes', S0=1.0, B=0,
 
 
 
+
+
+# BBC: 기존 생성/필터/보충/청크 로직을 그대로 사용하고 저장 열만 확장한다.
+# 사후 베리어 보정을 위해 경로 값에는 사전 베리어 보정을 적용하지 않는다.
+# BS:     [eta_index, X_T, M_t, M_next]
+# Heston: [eta_index, X_T, M_t, M_next, v_avg], v_avg = (v_t + v_next) / 2
+# 기본값: 10 rounds x 10 chunks = 100 files; 청크당 2**16 eta x 2**10 paths.
+# 파일명은 기존과 동일하므로 BBC 데이터는 별도 chunk_dir에 저장한다.
+# 최솟값 주변 한 구간의 정보이며 전체 경로의 bridge 생존확률을 담지는 않는다.
+
+
+def gen_bs_paths_BBC(eta, S0=1.0, B=0.0, n_paths=2**10, dt=0.001):
+    """기존 BS 경로에 최솟값 다음 점을 추가: X_T, M_t, M_next, mask.
+
+    B는 기존 호출 형식과의 호환용이며, 사후 보정용 원자료에는 보정을 적용하지 않는다.
+    최솟값의 첫 발생 시점을 사용하고, 마지막 점이면 다음 점 대신 직전 점을 사용한다.
+    """
+    r, sigma, T = eta
+    n_steps = int(T / dt)
+
+    W = np.random.randn(n_paths, n_steps)
+    X = np.zeros((n_paths, n_steps + 1))  # X_t = log(S_t/S0), X_0=0
+
+    for i in range(n_steps):
+        X[:, i+1] = X[:, i] + (r - 0.5*sigma**2)*dt + sigma*np.sqrt(dt)*W[:, i]
+
+    X_T = X[:, -1]
+    M_T = X.min(axis=1)
+    mask = filter_paths(X_T, T)
+
+    min_idx = X.argmin(axis=1)
+    next_idx = np.where(min_idx < n_steps, min_idx + 1, np.maximum(min_idx - 1, 0))
+    M_next = X[np.arange(n_paths), next_idx]
+
+    return X_T, M_T, M_next, mask
+
+
+def gen_heston_paths_BBC(eta, S0=1.0, B=0, n_paths=2**10, dt=0.001):
+    """기존 Heston 경로에 다음 점과 평균 분산을 추가: XT, M_t, M_next, v_avg, mask.
+
+    B는 기존 호출 형식과의 호환용이며, 사후 보정용 원자료에는 보정을 적용하지 않는다.
+    최솟값의 첫 발생 시점을 사용하고, 마지막 점이면 다음 점 대신 직전 점을 사용한다.
+    v_avg는 선택한 두 점에서 각각 max(Y, 0)을 적용한 분산의 산술평균이다.
+    """
+    r, kappa, theta, xi, rho, Y0, T = eta
+    n_steps = int(T / dt)
+
+    W1 = np.random.randn(n_paths, n_steps)
+    W2 = np.random.randn(n_paths, n_steps)
+    dWx = np.sqrt(dt) * W1
+    dWy = np.sqrt(dt) * (rho * W1 + np.sqrt(1 - rho**2) * W2)
+
+    X = np.zeros((n_paths, n_steps + 1))
+    Y = np.zeros((n_paths, n_steps + 1))
+    X[:, 0] = 0.0
+    Y[:, 0] = Y0
+
+    for i in range(n_steps):
+        Y_t = np.maximum(Y[:, i], 0)
+        # X = ln(S_t/S0)
+        X[:, i+1] = X[:, i] + (r - 0.5 * Y_t) * dt + np.sqrt(Y_t) * dWx[:, i]
+        Y[:, i+1] = (Y_t
+                     + kappa * (theta - Y_t) * dt
+                     + xi * np.sqrt(Y_t) * dWy[:, i]
+                     + 0.25 * xi**2 * (dWy[:, i]**2 - dt))
+
+    XT = X[:, -1]
+    M_T = X.min(axis=1)
+    mask = filter_paths(XT, T)
+
+    min_idx = X.argmin(axis=1)
+    next_idx = np.where(min_idx < n_steps, min_idx + 1, np.maximum(min_idx - 1, 0))
+    path_idx = np.arange(n_paths)
+    M_next = X[path_idx, next_idx]
+    v_avg = 0.5 * (np.maximum(Y[path_idx, min_idx], 0)
+                   + np.maximum(Y[path_idx, next_idx], 0))
+
+    return XT, M_T, M_next, v_avg, mask
+
+
+def _flush_buffer_BBC(buffer, chunk_dir, prefix, chunk_idx, directory_guard=None):
+    chunk     = np.concatenate(buffer, axis=0)
+    if directory_guard is None:
+        chunk_dir, directory_guard = _prepare_chunk_directory(chunk_dir)
+    save_path = os.path.join(chunk_dir, f"{prefix}_chunk_{chunk_idx:03d}.h5")
+ 
+    while os.path.exists(save_path):
+        chunk_idx += 1
+        save_path = os.path.join(chunk_dir, f"{prefix}_chunk_{chunk_idx:03d}.h5")
+
+    _write_chunk_atomic(
+        chunk,
+        save_path,
+        dataset_chunks=(10240, chunk.shape[1]),
+        directory_guard=directory_guard,
+    )
+
+    print(f"  청크 저장: {save_path} ({len(chunk):,}행)")
+    return chunk_idx + 1, []
+
+
+def _bs_worker_BBC(args):
+    eta, S0, B, n_paths, dt = args
+    return gen_bs_paths_BBC(eta, S0, B, n_paths, dt)
+
+
+def _heston_worker_BBC(args):
+    eta, S0, B, n_paths, dt = args
+    return gen_heston_paths_BBC(eta, S0, B, n_paths, dt)
+
+
+def generate_dataset_BBC(eta_path, chunk_dir, model_type='hes', S0=1.0, B=0, 
+                     chunk_size=2**16, n_workers=14):
+    
+    # target=100*(2**16)
+    target_per_round = (2**16) * 10 # 3.6h 걸림, eta 개수, 1eta : 2**10 paths
+    BATCH_SIZE       = n_workers * 10
+    prefix           = 'heston' if model_type == 'hes' else 'bs'
+    
+    buffer     = []   # path 저장 버퍼
+    buf_size   = 0    # 현재 버퍼 행 수
+    chunk_idx  = 0    # 청크 파일 번호
+
+    chunk_dir, directory_guard = _prepare_chunk_directory(chunk_dir)
+
+    _worker = _heston_worker_BBC if model_type == 'hes' else _bs_worker_BBC
+
+    with h5py.File(eta_path, "r") as f1:
+        paras = f1["etas"][:] # (2**16)*100 x 7 or 3
+
+    for i in range(9,10):
+        print(f'round:{i}')
+        true  = 0
+        fail  = 0 # bs : 1,743,655 / hes: 11,111
+        buffer   = []
+        buf_size = 0 
+        start = time.time()
+        eta_offset = i * target_per_round
+
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            for batch_start in range(0, target_per_round, BATCH_SIZE):
+                eta_batch = paras[eta_offset + batch_start : eta_offset + batch_start + BATCH_SIZE]
+                        
+                futures = {
+                    executor.submit(_worker, (eta, S0, B, 2**10, 0.001)): 
+                    (eta_offset + batch_start + k, eta) for k, eta in enumerate(eta_batch)
+                    }
+
+                for future in as_completed(futures):
+                    ori_idx, eta = futures[future]
+                    XT, MT, *bbc_values, mask = future.result()
+
+                    if mask:
+                        rows = np.column_stack([
+                            np.full(len(XT), ori_idx), XT, MT, *bbc_values
+                        ])
+                        buffer.append(rows)
+                        buf_size += len(rows)
+                        true += 1
+
+                        if true % (chunk_size) == 0:
+                            chunk_idx, buffer = _flush_buffer_BBC(
+                                buffer, chunk_dir, prefix, chunk_idx, directory_guard)
+                            buf_size = 0
+
+                        if true % 20000 == 0:
+                            print(f"[{true}/{target_per_round}] fail: {fail}")
+                    else:
+                        fail += 1
+
+                    if target_per_round <= true:
+                        break
+                else:
+                    continue
+                break
+            
+            while true < target_per_round:
+                shortage     = target_per_round - true
+                extra_paras = generate_BS_params(n_sets=int(shortage * 1.3)) if model_type == 'bs' \
+                    else generate_hes_valid_params(n_sets=int(shortage * 1))
+                
+                with h5py.File(eta_path, "a") as f2:
+                    old_size = f2["etas"].shape[0] # append 전 크기
+                    f2["etas"].resize(old_size + len(extra_paras), axis=0)
+                    f2["etas"][-len(extra_paras):] = extra_paras
+
+                for batch_start in range(0, len(extra_paras), BATCH_SIZE):
+                    eta_batch = extra_paras[batch_start : batch_start + BATCH_SIZE]
+
+                    if true >= target_per_round:
+                        break
+
+                    extra_futures = {
+                        executor.submit(_worker, (eta, S0, B, 2**10, 0.001)):
+                        (old_size + batch_start + j, eta) for j, eta in enumerate(eta_batch)
+                    }
+
+                    for future in as_completed(extra_futures):
+                        ori_idx, eta = extra_futures[future]
+                        XT, MT, *bbc_values, mask = future.result()
+
+                        if mask:
+                            rows = np.column_stack([
+                                np.full(len(XT), ori_idx), XT, MT, *bbc_values
+                            ])
+                            buffer.append(rows)
+                            buf_size += len(rows)
+                            true += 1
+
+                            if true % (chunk_size) == 0 and true > 0:
+                                chunk_idx, buffer = _flush_buffer_BBC(
+                                    buffer, chunk_dir, prefix, chunk_idx, directory_guard)
+                                buf_size = 0
+                                print(f"{time.time()-start}s")
+
+                            if true % 20000 == 0:
+                                print(f"[{true}/{target_per_round}] fail: {fail}")
+                        else:
+                            fail += 1
+                        
+                        if target_per_round <= true:
+                            break
+
+        elapsed = time.time() - start
+        print(f"done. true: {true}, fail: {fail}")
+        print(f"elapsed: {elapsed:.1f}s ({elapsed/3600:.2f}h)")
 
 
 #------------------
