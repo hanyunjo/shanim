@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import secrets
 from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
@@ -7,6 +8,17 @@ import torch
 
 
 OPTION_KEYS = ("van_call", "van_put", "barr_call", "barr_put")
+
+
+def _normalize_tail_multiple(multiple):
+    if isinstance(multiple, (bool, np.bool_)) or not isinstance(
+        multiple, (int, float, np.integer, np.floating)
+    ):
+        raise TypeError("multiple must be a real number")
+    multiple = float(multiple)
+    if not np.isfinite(multiple) or multiple < 0 or (0 < multiple <= 1):
+        raise ValueError("multiple must be 0 (disabled) or greater than 1")
+    return multiple
 
 
 def _as_numpy(value) -> np.ndarray:
@@ -66,7 +78,9 @@ def _make_common_noise(
 
     device, dtype = _model_device_dtype(cvae)
     generator = torch.Generator(device=device)
-    if seed is not None:
+    if seed is None:
+        generator.seed()
+    else:
         generator.manual_seed(int(seed))
 
     if antithetic:
@@ -165,6 +179,168 @@ def sample_cvae_with_noise(
         outputs.append(x.cpu())
 
     return torch.cat(outputs, dim=0)
+
+
+@torch.no_grad()
+def sample_cvae_with_tail_resampling(
+    cvae,
+    eta_scaled,
+    eps_z,
+    eps_x,
+    validate_samples=False,
+    valid_resample=False,
+    multiple=0,
+    batch_size=65536,
+    antithetic=True,
+    seed=1234,
+    max_resample_rounds=100,
+):
+    """Validate/refill samples and optionally apply the X_T tail cutoff."""
+    if not isinstance(validate_samples, (bool, np.bool_)):
+        raise TypeError("validate_samples must be True or False")
+    if not isinstance(valid_resample, (bool, np.bool_)):
+        raise TypeError("valid_resample must be True or False")
+
+    validation_applied = bool(validate_samples and valid_resample)
+    multiple = _normalize_tail_multiple(multiple)
+    tail_filter_applied = multiple > 0
+    effective_seed = secrets.randbits(63) if seed is None else int(seed)
+    max_resample_rounds = int(max_resample_rounds)
+    if max_resample_rounds < 1:
+        raise ValueError("max_resample_rounds must be at least 1")
+
+    requested = int(eps_z.shape[0])
+    if not validation_applied and not tail_filter_applied:
+        samples = sample_cvae_with_noise(
+            cvae, eta_scaled, eps_z, eps_x, batch_size=batch_size
+        )
+        return samples, {
+            "validation_applied": False,
+            "valid_resample": False,
+            "valid_resample_requested": bool(valid_resample),
+            "support_invalid_count": None,
+            "invalid_path_fraction": None,
+            "rejected_sample_count": 0,
+            "seed": effective_seed,
+            "draw_count_by_round": [requested],
+            "antithetic_input": bool(antithetic),
+            "antithetic_retained": bool(antithetic),
+            "tail_filter_applied": False,
+            "multiple": multiple,
+            "X_T_upper": None,
+            "requested_sample_count": requested,
+            "used_sample_count": requested,
+            "total_drawn_sample_count": requested,
+            "tail_rejected_sample_count": 0,
+            "tail_rejected_sample_fraction": 0.0,
+            "resample_round_count": 0,
+        }
+
+    xt_upper = float(np.log(multiple)) if tail_filter_applied else None
+    accepted_batches = []
+    accepted_count = 0
+    total_drawn = 0
+    rejected = 0
+    support_invalid_count = 0
+    tail_rejected = 0
+    rounds_used = 0
+    draw_count_by_round = []
+
+    for round_index in range(max_resample_rounds):
+        remaining = requested - accepted_count
+        if remaining <= 0:
+            break
+        rounds_used = round_index + 1
+
+        if round_index == 0:
+            round_eps_z, round_eps_x = eps_z, eps_x
+        else:
+            # A condition-independent draw size keeps the refill noise stream
+            # common across the base and every bumped parameter value.
+            draw_count = requested
+            round_seed = effective_seed + round_index * 1_000_003
+            round_eps_z, round_eps_x = _make_common_noise(
+                cvae,
+                draw_count,
+                antithetic=bool(antithetic),
+                seed=round_seed,
+            )
+
+        candidates = sample_cvae_with_noise(
+            cvae,
+            eta_scaled,
+            round_eps_z,
+            round_eps_x,
+            batch_size=batch_size,
+        )
+        draw_count_by_round.append(int(candidates.shape[0]))
+        finite = torch.isfinite(candidates).all(dim=1)
+        if validation_applied:
+            if candidates.shape[1] >= 2:
+                X_T = candidates[:, 0]
+                M_T = candidates[:, 1]
+                support_invalid = (~finite) | (
+                    M_T > torch.minimum(torch.zeros_like(X_T), X_T) + 1e-6
+                )
+            else:
+                support_invalid = ~finite
+        else:
+            support_invalid = torch.zeros_like(finite)
+
+        if tail_filter_applied:
+            X_T = candidates[:, 0]
+            tail_invalid = (~torch.isfinite(X_T)) | (X_T >= xt_upper)
+        else:
+            tail_invalid = torch.zeros_like(finite)
+
+        invalid = support_invalid | tail_invalid
+        valid = ~invalid
+        accepted = candidates[valid][:remaining]
+
+        total_drawn += int(candidates.shape[0])
+        rejected += int(invalid.sum().item())
+        support_invalid_count += int(support_invalid.sum().item())
+        tail_rejected += int(tail_invalid.sum().item())
+        if accepted.shape[0]:
+            accepted_batches.append(accepted)
+            accepted_count += int(accepted.shape[0])
+
+    if accepted_count < requested:
+        criteria = []
+        if validation_applied:
+            criteria.append("valid CVAE support")
+        if tail_filter_applied:
+            criteria.append(f"X_T < log({multiple:g})")
+        raise RuntimeError(
+            f"Could obtain only {accepted_count:,}/{requested:,} samples "
+            f"satisfying {' and '.join(criteria)} after "
+            f"{max_resample_rounds} rounds."
+        )
+
+    samples = torch.cat(accepted_batches, dim=0)[:requested]
+    return samples, {
+        "validation_applied": validation_applied,
+        "valid_resample": validation_applied,
+        "valid_resample_requested": bool(valid_resample),
+        "support_invalid_count": (
+            support_invalid_count if validation_applied else None
+        ),
+        "invalid_path_fraction": rejected / total_drawn,
+        "rejected_sample_count": rejected,
+        "seed": effective_seed,
+        "draw_count_by_round": draw_count_by_round,
+        "antithetic_input": bool(antithetic),
+        "antithetic_retained": bool(antithetic and rejected == 0),
+        "tail_filter_applied": tail_filter_applied,
+        "multiple": multiple,
+        "X_T_upper": xt_upper,
+        "requested_sample_count": requested,
+        "used_sample_count": int(samples.shape[0]),
+        "total_drawn_sample_count": total_drawn,
+        "tail_rejected_sample_count": tail_rejected,
+        "tail_rejected_sample_fraction": tail_rejected / total_drawn,
+        "resample_round_count": max(rounds_used - 1, 0),
+    }
 
 
 def prices_from_cvae_samples(
@@ -316,6 +492,26 @@ def _parameter_spec(model_type):
     }
 
 
+def _resolve_model_type(model_type):
+    aliases = {
+        "bs": "bs",
+        "bs_clip": "bs",
+        "bs_bbc": "bs",
+        "bs_ori": "bs",
+        "hes": "hes",
+        "heston": "hes",
+        "hes_clip": "hes",
+        "hes_bbc": "hes",
+        "hes_ori": "hes",
+    }
+    try:
+        return aliases[model_type]
+    except KeyError as exc:
+        raise ValueError(
+            f"model_type must be one of {sorted(aliases)}."
+        ) from exc
+
+
 @torch.no_grad()
 def CVAE_greeks(
     cvae,
@@ -334,22 +530,14 @@ def CVAE_greeks(
     dt = 0.001,
     bbc_correction = True,
     mt_corr = False,
+    validate_samples = False,
+    valid_resample = False,
+    multiple = 0,
+    max_resample_rounds = 100,
 ):
-    aliases = {
-        "bs": "bs",
-        "bs_clip": "bs",
-        "bs_bbc": "bs",
-        "hes": "hes",
-        "heston": "hes",
-        "hes_clip": "hes",
-        "hes_bbc": "hes",
-    }
-    if model_type not in aliases:
-        raise ValueError(
-            "model_type must be 'bs', 'bs_clip', 'bs_bbc', 'hes', "
-            "'heston', 'hes_clip', or 'hes_bbc'."
-        )
-    backend = aliases[model_type]
+    backend = _resolve_model_type(model_type)
+    requested_seed = seed
+    seed = secrets.randbits(63) if seed is None else int(seed)
     expected_bbc_dims = {"bs_bbc": 3, "hes_bbc": 4}
     if model_type in expected_bbc_dims and cvae.dim_x != expected_bbc_dims[model_type]:
         raise ValueError(
@@ -364,6 +552,7 @@ def CVAE_greeks(
             f"{backend} eta must contain {expected_length} values, "
             f"got shape {eta.shape}."
         )
+    multiple = _normalize_tail_multiple(multiple)
 
     eta_min = _as_numpy(checkpoint["eta_min"]).astype(np.float64)
     eta_max = _as_numpy(checkpoint["eta_max"]).astype(np.float64)
@@ -411,8 +600,18 @@ def CVAE_greeks(
         seed=seed,
     )
 
-    base_samples = sample_cvae_with_noise(
-        cvae, eta_scaled, eps_z, eps_x, batch_size=batch_size,
+    base_samples, base_sampling_diagnostics = sample_cvae_with_tail_resampling(
+        cvae,
+        eta_scaled,
+        eps_z,
+        eps_x,
+        validate_samples=validate_samples,
+        valid_resample=valid_resample,
+        multiple=multiple,
+        batch_size=batch_size,
+        antithetic=bool(antithetic),
+        seed=seed,
+        max_resample_rounds=max_resample_rounds,
     )
     base_prices = prices_from_cvae_samples(
         base_samples,
@@ -430,6 +629,9 @@ def CVAE_greeks(
     sample_cache: dict[tuple[float, ...], torch.Tensor] = {
         tuple(eta[2:].tolist()): base_samples,
     }
+    sampling_diagnostics_cache: dict[tuple[float, ...], dict[str, Any]] = {
+        tuple(eta[2:].tolist()): base_sampling_diagnostics,
+    }
 
     def prices_for(current_eta):
         condition_key = tuple(current_eta[2:].tolist())
@@ -441,8 +643,21 @@ def CVAE_greeks(
                 check_bounds=check_training_bounds,
                 parameter_name="bump",
             )
-            sample_cache[condition_key] = sample_cvae_with_noise(
-                cvae, scaled, eps_z, eps_x, batch_size=batch_size
+            (
+                sample_cache[condition_key],
+                sampling_diagnostics_cache[condition_key],
+            ) = sample_cvae_with_tail_resampling(
+                cvae,
+                scaled,
+                eps_z,
+                eps_x,
+                validate_samples=validate_samples,
+                valid_resample=valid_resample,
+                multiple=multiple,
+                batch_size=batch_size,
+                antithetic=bool(antithetic),
+                seed=seed,
+                max_resample_rounds=max_resample_rounds,
             )
         return prices_from_cvae_samples(
             sample_cache[condition_key],
@@ -499,6 +714,9 @@ def CVAE_greeks(
             "h": step,
             "scheme": "forward",
             "parameter": greek_name,
+            "sampling_diagnostics": sampling_diagnostics_cache[
+                tuple(eta_up[2:].tolist())
+            ],
         }
 
     return {
@@ -507,9 +725,15 @@ def CVAE_greeks(
         "antithetic": bool(antithetic),
         "n_samples": int(n_samples),
         "seed": seed,
+        "requested_seed": requested_seed,
         "bbc_correction": bool(bbc_correction),
         "bbc_dt": float(dt) if B is not None and cvae.dim_x >= 3 else None,
         "mt_corr": bool(mt_corr),
+        "validate_samples": bool(validate_samples),
+        "valid_resample": bool(valid_resample),
+        "multiple": multiple,
+        "X_T_upper": base_sampling_diagnostics["X_T_upper"],
+        "sampling_diagnostics": base_sampling_diagnostics,
         "base_eta": eta.copy(),
         "base_prices": base_prices,
         "h": {name: steps[name] for name in greeks},

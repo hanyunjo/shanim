@@ -63,13 +63,17 @@ OPTION_LABELS = {
 MODEL_BACKEND = {
     "bs": "bs",
     "bs_clip": "bs",
+    "bs_ori": "bs",
     "hes": "hes",
     "hes_clip": "hes",
+    "hes_ori": "hes",
 }
 
 # clip 모델은 CVAE checkpoint/결과 라벨만 다르고 closed/FDM/MC 계산식은 원 모델과 같다.
 ROBUSTNESS_VARIABLES_MAIN.setdefault("bs_clip", ROBUSTNESS_VARIABLES_MAIN["bs"])
 ROBUSTNESS_VARIABLES_MAIN.setdefault("hes_clip", ROBUSTNESS_VARIABLES_MAIN["hes"])
+ROBUSTNESS_VARIABLES_MAIN.setdefault("bs_ori", ROBUSTNESS_VARIABLES_MAIN["bs"])
+ROBUSTNESS_VARIABLES_MAIN.setdefault("hes_ori", ROBUSTNESS_VARIABLES_MAIN["hes"])
 
 
 def _model_backend(model_name):
@@ -133,6 +137,61 @@ def _mean_std(values):
     return mean, std
 
 
+def _format_sampling_rejection_text(
+    diagnostics,
+    *,
+    validate_samples,
+    multiple,
+):
+    regenerated_count_mean = _mean_std([
+        item.get("regenerated_sample_count") for item in diagnostics
+    ])[0]
+    regenerated_pct_mean = _mean_std([
+        item.get("regenerated_sample_pct") for item in diagnostics
+    ])[0]
+
+    if validate_samples:
+        validation_rejected_count_mean = _mean_std([
+            item.get("support_invalid_count") for item in diagnostics
+        ])[0]
+        validation_rejected_pct_mean = _mean_std([
+            (
+                100.0 * item.get("support_invalid_count")
+                / item.get("total_drawn_samples")
+            )
+            if item.get("support_invalid_count") is not None
+            and item.get("total_drawn_samples")
+            else np.nan
+            for item in diagnostics
+        ])[0]
+        validation_text = (
+            f"validation_rejected={validation_rejected_count_mean:,.1f} "
+            f"({validation_rejected_pct_mean:.4f}%)"
+        )
+    else:
+        validation_text = "validation_rejected=not checked"
+
+    if multiple > 0:
+        multiple_rejected_count_mean = _mean_std([
+            item.get("tail_rejected_sample_count") for item in diagnostics
+        ])[0]
+        multiple_rejected_pct_mean = _mean_std([
+            item.get("tail_rejected_sample_pct") for item in diagnostics
+        ])[0]
+        multiple_text = (
+            f"multiple_rejected={multiple_rejected_count_mean:,.1f} "
+            f"({multiple_rejected_pct_mean:.4f}%)"
+        )
+    else:
+        multiple_text = "multiple_rejected=disabled"
+
+    return (
+        f"{validation_text} | {multiple_text} "
+        f"| regenerated={regenerated_count_mean:,.1f} "
+        f"({regenerated_pct_mean:.4f}%)"
+    )
+
+
 def _cvae_cases(
     cvae,
     checkpoint,
@@ -164,6 +223,7 @@ def _cvae_cases(
     model_for_pricing = cvae.module if hasattr(cvae, "module") else cvae
     model_dim_x = int(model_for_pricing.dim_x)
     has_running_minimum = model_dim_x >= 2
+    validation_applied = validate_samples and has_running_minimum
     option_keys = OPTION_KEYS if has_running_minimum else ("van_call", "van_put")
     option_results = {
         key: {n: [] for n in n_samples_list}
@@ -172,6 +232,7 @@ def _cvae_cases(
     seconds = {n: [] for n in n_samples_list}
     sampling_diagnostics = {n: [] for n in n_samples_list}
     diagnostic_keys = (
+        "total_drawn_samples",
         "used_sample_count",
         "discarded_sample_count",
         "discarded_sample_fraction",
@@ -179,6 +240,7 @@ def _cvae_cases(
         "regenerated_sample_count",
         "regenerated_sample_fraction",
         "regenerated_sample_pct",
+        "support_invalid_count",
         "mt_corrected_sample_count",
         "mt_corrected_sample_fraction",
         "mt_corrected_sample_pct",
@@ -236,27 +298,19 @@ def _cvae_cases(
         used_mean = _mean_std([
             item.get("used_sample_count") for item in diagnostics_for_n
         ])[0]
-        regenerated_pct_mean = _mean_std([
-            item.get("regenerated_sample_pct") for item in diagnostics_for_n
-        ])[0]
         corrected_pct_mean = _mean_std([
             item.get("mt_corrected_sample_pct") for item in diagnostics_for_n
         ])[0]
-        if validate_samples:
-            discarded_pct_mean = _mean_std([
-                item.get("discarded_sample_pct") for item in diagnostics_for_n
-            ])[0]
-            validation_text = (
-                f"discarded={discarded_pct_mean:.4f}% "
-                f"| regenerated={regenerated_pct_mean:.4f}%"
-            )
-        else:
-            validation_text = "discarded=not checked | regenerated=0.0000%"
+        rejection_text = _format_sampling_rejection_text(
+            diagnostics_for_n,
+            validate_samples=validation_applied,
+            multiple=multiple,
+        )
         print(
             f"[{'barrier' if has_running_minimum else 'vanilla'} samples] "
-            f"n={n_samples:,} | validation={validate_samples and has_running_minimum} "
+            f"n={n_samples:,} | validation={validation_applied} "
             f"| resample={valid_resample} | mt_corr={mt_corr} "
-            f"| used={used_mean:,.1f} | {validation_text} "
+            f"| used={used_mean:,.1f} | {rejection_text} "
             f"| mt_corrected={corrected_pct_mean:.4f}%"
         )
 
@@ -822,10 +876,7 @@ def plot_sampling_comparison(results, model_name, variable, value):
         ax.grid(True, alpha=0.3)
         ax.legend()
 
-    if _model_backend(model_name) == 'bs':
-        fig_name = 'BS'
-    elif model_name == 'hes' or model_name == 'hes_clip':
-        fig_name = 'Heston'
+    fig_name = "BS" if _model_backend(model_name) == "bs" else "Heston"
 
     if variable == 'Y0':
         variable = 'v0'

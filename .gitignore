@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 *.pt
+credentials.json
+token.json
+*.env

@@ -24,11 +24,13 @@ CVAE = BaseCVAE
 BS_CHUNK_DIR  = "/mnt/d/bs_chunks_correction/"
 BS_ETA_PATH   = "/mnt/d/bs_eta_basic.h5"
 BS_BBC_CHUNK_DIR = "/mnt/d/bs_corr/"
+BS_ORI_CHUNK_DIR = "/mnt/d/bs_ori/"
 BS_CLIP_CHUNK_DIR  = "/mnt/d/bs_clip_chunks_correction/"
 BS_CLIP_ETA_PATH   = "/mnt/d/bs_eta_clip.h5"
 HES_CHUNK_DIR = "/mnt/d/heston_chunks_correction/"
 HES_ETA_PATH  = "/mnt/d/heston_eta_basic.h5"
 HES_BBC_CHUNK_DIR = "/mnt/d/hes_corr/"
+HES_ORI_CHUNK_DIR = "/mnt/d/hes_ori/"
 HES_CLIP_CHUNK_DIR = "/mnt/d/heston_clip_x2_chunks_correction/"
 HES_CLIP_ETA_PATH  = "/mnt/d/heston_eta_clip_x2.h5"
 
@@ -38,6 +40,27 @@ TARGET_COORDINATES = {
     3: ["X_T", "M_T", "M_next"],
     4: ["X_T", "M_T", "M_next", "v_avg"],
 }
+
+
+MODEL_CONFIG = {
+    "hes": (HES_CHUNK_DIR, HES_ETA_PATH, None),
+    "hes_bbc": (HES_BBC_CHUNK_DIR, HES_ETA_PATH, 4),
+    "hes_ori": (HES_ORI_CHUNK_DIR, HES_ETA_PATH, 2),
+    "bs": (BS_CHUNK_DIR, BS_ETA_PATH, None),
+    "bs_bbc": (BS_BBC_CHUNK_DIR, BS_ETA_PATH, 3),
+    "bs_ori": (BS_ORI_CHUNK_DIR, BS_ETA_PATH, 2),
+    "bs_clip": (BS_CLIP_CHUNK_DIR, BS_CLIP_ETA_PATH, None),
+    "hes_clip": (HES_CLIP_CHUNK_DIR, HES_CLIP_ETA_PATH, None),
+}
+
+
+def _resolve_model_config(model_type):
+    try:
+        return MODEL_CONFIG[model_type]
+    except KeyError as exc:
+        raise ValueError(
+            f"model_type must be one of {sorted(MODEL_CONFIG)}"
+        ) from exc
 
 
 def _resolve_dim_x(dim_x=None, include_m=None):
@@ -671,18 +694,22 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
     if residual_blocks < 0:
         raise ValueError("residual_blocks must be >= 0.")
 
-    bbc_dim_x = {"bs_bbc": 3, "hes_bbc": 4}.get(model_type)
-    if bbc_dim_x is not None and dim_x is None:
+    default_chunk_dir, default_eta_path, required_dim_x = _resolve_model_config(
+        model_type
+    )
+    if required_dim_x is not None and dim_x is None:
         if include_m is False:
             raise ValueError(
-                f"model_type='{model_type}' requires dim_x={bbc_dim_x} and include_m=True."
+                f"model_type='{model_type}' requires dim_x={required_dim_x} "
+                "and include_m=True."
             )
-        dim_x = bbc_dim_x
+        dim_x = required_dim_x
 
     dim_x = _resolve_dim_x(dim_x=dim_x, include_m=include_m)
-    if bbc_dim_x is not None and dim_x != bbc_dim_x:
+    if required_dim_x is not None and dim_x != required_dim_x:
         raise ValueError(
-            f"model_type='{model_type}' requires dim_x={bbc_dim_x}, got dim_x={dim_x}."
+            f"model_type='{model_type}' requires dim_x={required_dim_x}, "
+            f"got dim_x={dim_x}."
         )
     include_m = dim_x >= 2
     target_coordinates = _target_coordinates(dim_x)
@@ -729,30 +756,6 @@ def train_chunk(model_type = 'hes', dim_z=8, hidden_dims=None, batch_size=1024,
     }
     weight_config_history = [{'trained_chunks': 0, 'weight_config': weight_config.copy()}]
     weight_alpha_changed_on_resume = False
-
-    if model_type == 'hes':
-        default_chunk_dir = HES_CHUNK_DIR
-        default_eta_path  = HES_ETA_PATH
-    elif model_type == 'hes_bbc':
-        default_chunk_dir = HES_BBC_CHUNK_DIR
-        default_eta_path  = HES_ETA_PATH
-    elif model_type == 'bs':
-        default_chunk_dir = BS_CHUNK_DIR
-        default_eta_path  = BS_ETA_PATH
-    elif model_type == 'bs_bbc':
-        default_chunk_dir = BS_BBC_CHUNK_DIR
-        default_eta_path  = BS_ETA_PATH
-    elif model_type == 'bs_clip':
-        default_chunk_dir = BS_CLIP_CHUNK_DIR
-        default_eta_path  = BS_CLIP_ETA_PATH
-    elif model_type == 'hes_clip':
-        default_chunk_dir = HES_CLIP_CHUNK_DIR
-        default_eta_path  = HES_CLIP_ETA_PATH
-    else:
-        raise ValueError(
-            "model_type must be 'hes', 'hes_bbc', 'bs', 'bs_bbc', "
-            "'hes_clip', or 'bs_clip'"
-        )
 
     chunk_dir = default_chunk_dir if chunk_dir is None else os.fspath(chunk_dir)
     eta_path = default_eta_path if eta_path is None else os.fspath(eta_path)
